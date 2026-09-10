@@ -1,0 +1,13 @@
+node_modules/
+dist/
+runtime-data/
+artifacts/
+.env
+.env.*
+!.env.example
+*.log
+*.memory-card.json
+*.tmp
+*.temp
+*.swp
+*~

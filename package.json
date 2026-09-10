@@ -1,0 +1,36 @@
+{
+  "name": "wechat-ai-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Wechaty group AI assistant",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test:contract": "npm run build && node dist/message-contract.test.js",
+    "test:reasoning": "npm run build && node dist/reasoning-boundary.test.js",
+    "test:identity-observe": "npm run build && node dist/identity-observer.test.js",
+    "test:requester-identity": "npm run build && node dist/group-requester-identity.test.js",
+    "test:owner-resolution": "npm run build && node dist/owner-requester-resolution.test.js",
+    "test:memory": "npm run build && node dist/memory-scope.test.js",
+    "test:memory-acceptance": "npm run build && node dist/memory-acceptance.test.js",
+    "test:memory-retrieval-gap": "npm run build && node dist/memory-retrieval-gap.test.js",
+    "test:grounding": "npm run build && node dist/answer-grounding.test.js",
+    "test:persistent-log": "npm run build && node dist/persistent-runtime-log.test.js",
+    "test:memory-runtime-log": "npm run build && node dist/memory-runtime-log.test.js",
+    "test:memory-log-persist": "npm run build && node dist/memory-log-persist.test.js",
+    "test": "npm run build && node dist/message-contract.test.js && node dist/reasoning-boundary.test.js && node dist/identity-observer.test.js && node dist/group-requester-identity.test.js && node dist/owner-requester-resolution.test.js && node dist/memory-scope.test.js && node dist/memory-acceptance.test.js && node dist/memory-retrieval-gap.test.js && node dist/memory-runtime-log.test.js && node dist/answer-grounding.test.js && node dist/persistent-runtime-log.test.js && node dist/memory-log-persist.test.js",
+    "start:production-agent": "node dist/production-agent-receiver.js",
+    "dev": "tsx src/main.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "wechaty": "^1.20.2",
+    "wechaty-puppet-xp": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}
