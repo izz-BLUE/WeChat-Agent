@@ -51,6 +51,14 @@ export const config = {
   contextMessageLimit: positiveInteger('CONTEXT_MESSAGE_LIMIT', 50),
   maxContextMessages: positiveInteger('MAX_CONTEXT_MESSAGES', 100),
   maxContextChars: positiveInteger('MAX_CONTEXT_CHARS', 12_000),
+  /**
+   * Group ambient context budget. `maxEntries` and the TTL both apply, and the
+   * character budget bounds the final render so 30 long messages cannot blow up
+   * the prompt. The most recent lines always win.
+   */
+  ambientMaxEntries: positiveInteger('GROUP_AMBIENT_MAX_ENTRIES', 30),
+  ambientTtlMs: positiveInteger('GROUP_AMBIENT_TTL_MINUTES', 30) * 60_000,
+  ambientMaxChars: positiveInteger('GROUP_AMBIENT_MAX_CHARS', 4_000),
   /** Persistent memory is on by default; `WECHAT_MEMORY_ENABLED=0` disables it. */
   memoryEnabled: (process.env.WECHAT_MEMORY_ENABLED ?? '1').trim() !== '0',
   memoryFilePath: memoryPath.filePath,

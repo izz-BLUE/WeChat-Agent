@@ -1,7 +1,9 @@
 import { ChatService, type ChatMentionFact } from './chat.js'
+import { canonicalUserText, describeUserText, ABSENT_BOT_MENTION_SPANS } from './canonical-user-text.js'
 import { GroupContext, type GroupMessage } from './context.js'
+import { GroupAmbientContext } from './group-ambient-context.js'
 import { config, validateChatConfig } from './config.js'
-import type { AgentExecutor, AgentRequest } from './agent-adapter.js'
+import type { AgentExecutor, AgentPassiveContext, AgentRequest } from './agent-adapter.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { MemoryExtractor } from './memory-extractor.js'
 import { MemoryService } from './memory-service.js'
@@ -40,6 +42,11 @@ export interface ProductionChatAgentOptions {
   memory?: MemoryService | null
   speakerLabels?: SpeakerLabelRegistry
   /**
+   * Group ambient context (passive group chatter). Injectable so a test can pin
+   * the clock or the bounds; production gets the configured singleton per Agent.
+   */
+  ambientContext?: GroupAmbientContext
+  /**
    * Optional persistent runtime log. When absent the agent falls back to a
    * silent no-op sink so the call sites stay identical for tests.
    */
@@ -48,6 +55,7 @@ export interface ProductionChatAgentOptions {
 
 export class ProductionChatAgent implements AgentExecutor {
   private readonly context: GroupContext
+  private readonly ambient: GroupAmbientContext
   private readonly speakerLabels: SpeakerLabelRegistry
   private readonly memory: MemoryService | null
   private readonly persistentLog: PersistentRuntimeLog | null
@@ -63,6 +71,38 @@ export class ProductionChatAgent implements AgentExecutor {
       config.maxContextMessages,
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
     )
+    this.ambient = options.ambientContext ?? new GroupAmbientContext({
+      maxEntries: config.ambientMaxEntries,
+      ttlMs: config.ambientTtlMs,
+      maxChars: config.ambientMaxChars,
+      sink: this.persistentLog
+        ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver')
+        : undefined,
+    })
+  }
+
+  /**
+   * Passive ambient capture. A group message that did not address the bot is
+   * stored as group context and nothing else happens here:
+   *
+   *  - no provider call (the whole point of the passive path);
+   *  - no memory read, no memory write, no extraction and no automatic-threshold
+   *    buffer (three ordinary messages must never look like a remember request);
+   *  - no requester context, so ambient chatter cannot be attributed to whoever
+   *    asks next;
+   *  - no outbound: this method cannot return anything.
+   *
+   * The method is synchronous on purpose. Ambience is best-effort, so there is
+   * nothing to await and no failure mode that could delay or fail a chat turn.
+   */
+  public observePassiveContext(passive: AgentPassiveContext): void {
+    this.ambient.append(passive.conversationId, {
+      messageId: passive.messageId,
+      speakerId: passive.senderId,
+      speakerType: 'MEMBER',
+      text: passive.text,
+      timestamp: passive.timestamp,
+    })
   }
 
   public async complete(request: AgentRequest): Promise<string> {
@@ -76,30 +116,80 @@ export class ProductionChatAgent implements AgentExecutor {
       senderId: request.senderId,
     })
 
+    const spanFacts = request.botMentionSpans ?? ABSENT_BOT_MENTION_SPANS
+    // Spans are UTF-16 offsets into the WIRE body, so the projection starts there;
+    // `request.text` is the trimmed view and would shift every offset.
+    const wireBody = request.rawText ?? request.text
     const question: GroupMessage = {
       senderId: request.senderId,
       // Never the raw runtime identity: the label is role/pseudonym based.
       senderName: label,
-      text: request.text,
+      // ONE canonical projection of the contract body, computed once and reused by
+      // every consumer below: the memory admission gate, the extractor, the
+      // retrieval query, the transcript and the final current request. It removes
+      // exactly the spans the runtime identified as the BOT's tokens, so a mention
+      // of another member stays in the sentence as real user text.
+      text: canonicalUserText(wireBody, spanFacts),
       timestamp: request.timestamp,
     }
-    const recent = this.context.recent(
+    const textShape = describeUserText(wireBody, spanFacts)
+    // The transcript window and the event ids it covers come from ONE selection
+    // pass, so the ids used for cross-context de-duplication always describe the
+    // messages that are about to be rendered.
+    const window = this.context.window(
       request.conversationId,
       config.contextMessageLimit,
       config.maxContextChars,
       request.messageId,
     )
+
+    // Ambient is read before this message is appended, and the message id is
+    // excluded as well: the request being answered right now is the active
+    // request, and it must never be rendered a second time as ambience.
+    //
+    // Earlier @-messages ARE in both stores; they are excluded here by event id so
+    // the ambient section complements the transcript instead of duplicating it.
+    const ambient = request.conversationType === 'GROUP'
+      ? this.ambient.select(request.conversationId, {
+          // The store's own clock decides expiry: TTL is wall-clock time, not a
+          // value the wire can influence.
+          currentRequesterId: request.requesterId,
+          excludeMessageId: request.messageId,
+          excludeEventIds: window.eventIds,
+        }).lines
+      : []
+
+    // A real mention is group history too: the next member to ask needs to see
+    // that the question was already asked and what was answered.
+    if (request.conversationType === 'GROUP') {
+      this.ambient.append(request.conversationId, {
+        messageId: request.messageId,
+        speakerId: request.senderId,
+        speakerType: 'MEMBER',
+        text: question.text,
+        timestamp: request.timestamp,
+      })
+    }
+
     this.context.append(request.conversationId, question, request.messageId)
 
     if (this.memory) {
       // Historical order: explicit memory intent short-circuits the chat turn,
-      // then the message feeds the automatic extractor, then retrieval.
+      // then the message feeds the automatic extractor, then retrieval. All three
+      // see the SAME canonical text the chat turn will see.
       const explicit = await this.memory.tryHandleExplicit({
         conversationType: request.conversationType,
         conversationId: request.conversationId,
         requesterId: request.requesterId,
         requesterRole: request.requesterRole,
-        question: request.text,
+        question: question.text,
+        textShape,
+        // The side-effect gate needs the runtime's own mention verdict: a persistent
+        // memory write may only be admitted when this message really carries a
+        // trusted bot mention token.
+        mentionState: request.mentionState,
+        botMentionSpanTrust: spanFacts.trust,
+        botMentionSpanCount: spanFacts.spans.length,
       })
       if (explicit.handled) {
         return explicit.reply
@@ -112,7 +202,7 @@ export class ProductionChatAgent implements AgentExecutor {
         requesterId: request.requesterId,
         requesterRole: request.requesterRole,
         speakerLabel: label,
-        text: request.text,
+        text: question.text,
         timestamp: request.timestamp,
         chatTriggered: true,
       })
@@ -124,12 +214,12 @@ export class ProductionChatAgent implements AgentExecutor {
           conversationId: request.conversationId,
           requesterId: request.requesterId,
           requesterRole: request.requesterRole,
-          question: request.text,
+          question: question.text,
         })
       : []
 
-    return this.chatService.reply(
-      recent,
+    const answer = await this.chatService.reply(
+      window.messages,
       question,
       {
         botDisplayName: config.botDisplayName,
@@ -137,6 +227,7 @@ export class ProductionChatAgent implements AgentExecutor {
         requesterRole: request.requesterRole,
         ownerConfigured: request.ownerConfigured,
         memory,
+        ambient,
         currentSpeakerLabel: request.conversationType === 'GROUP' ? label : undefined,
         // A disabled or absent store is a runtime fact: the model may not claim a
         // long-term memory that this process does not have.
@@ -146,6 +237,23 @@ export class ProductionChatAgent implements AgentExecutor {
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-chat') : undefined,
       request.messageId,
     )
+
+    // The bot's own line joins the ambient transcript so the next member to ask
+    // sees the whole exchange. This is GENERATED, not DELIVERY_ACKNOWLEDGED: the
+    // Agent forms the answer, the runtime delivers it, and the send ACK is not on
+    // this side of the boundary. A reply that passes the guard enters the
+    // transcript; a blocked or failed one throws above and enters nothing.
+    if (request.conversationType === 'GROUP') {
+      this.ambient.append(request.conversationId, {
+        messageId: `assistant:${request.messageId}`,
+        speakerId: 'ASSISTANT',
+        speakerType: 'ASSISTANT',
+        text: answer,
+        timestamp: request.timestamp,
+      })
+    }
+
+    return answer
   }
 }
 
@@ -200,6 +308,12 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
  * The same persistent sink the receiver, transport and chat already use is
  * injected here, so every memory decision is durable as well as visible on
  * stdout: one sink, one component (`agent-memory`), no second logger.
+ *
+ * Retrieval makes NO provider call. `MemoryService.retrieveForChat` authorizes,
+ * budgets and returns the working set; the final chat turn is the only model
+ * call an active request makes. The two remaining structured completions here
+ * are the automatic extractor and the explicit "记住" mutation parser, both of
+ * which are write-path and unchanged.
  */
 export function createMemoryService(
   chatService: ChatService,

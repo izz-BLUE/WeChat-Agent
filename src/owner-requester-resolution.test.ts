@@ -280,9 +280,10 @@ async function testRawOwnerIdNeverReachesProvider(): Promise<void> {
   const call = chat.calls[0]
   const prompt = buildUserPrompt(call.context, call.question, call.request)
   assert(!prompt.includes('owner-sig'), 'the raw owner identity reached the provider prompt')
-  assert(call.question.senderName === 'Boss', 'the owner display name was not used as a label')
+  assert(call.question.senderName === 'SPEAKER_1', 'the owner did not receive a neutral speaker label')
   assert(call.request.requesterRole === 'OWNER', 'the trusted role was not passed to the chat service')
   assert(call.request.ownerConfigured === true, 'the owner-configured fact was not passed to the chat service')
+  assert(!prompt.includes('Boss'), 'the owner display metadata reached the provider prompt')
   assert(!JSON.stringify(call.request).includes('owner-sig'), 'the raw owner identity reached the chat context')
 }
 
@@ -330,7 +331,7 @@ async function testTranscriptLabelsStayRoleBased(): Promise<void> {
   assert(chat.calls.length === 2, 'the production agent did not handle both turns')
   const second = chat.calls[1]
   const labels = [second.question.senderName, ...second.context.map((item) => item.senderName)]
-  assert(labels.includes('OWNER'), 'the earlier owner turn lost its role label')
+  assert(labels.includes('SPEAKER_1'), 'the earlier owner turn lost its neutral speaker label')
   assert(
     labels.some((label) => isPseudonymousMemberLabel(label)),
     'the current member turn has no pseudonymous member label',
@@ -358,8 +359,8 @@ async function testDisplayLabelContract(): Promise<void> {
       ownerDisplayName: null,
       senderName: null,
       senderId: 'owner-sig',
-    }) === 'OWNER',
-    'an owner without a display name must fall back to the role label',
+    }) === 'SPEAKER_1',
+    'an owner must use a neutral speaker label',
   )
   assert(
     requesterDisplayLabel({
@@ -376,13 +377,13 @@ async function testDisplayLabelContract(): Promise<void> {
 async function testPromptStatesRoleAsFact(): Promise<void> {
   const { chat } = await runProductionAgent(ownerRaw({ signature: 'owner-sig', isMentioned: true }))
   const prompt = buildUserPrompt(chat.calls[0].context, chat.calls[0].question, chat.calls[0].request)
-  assert(prompt.includes('CurrentRequesterRole=OWNER'), 'the prompt does not state the owner role')
-  assert(prompt.includes('OwnerConfigured=true'), 'the prompt does not state the owner-configured fact')
+  assert(!prompt.includes('CurrentRequesterRole=OWNER'), 'the final-answer prompt exposed the owner role')
+  assert(!prompt.includes('OwnerConfigured=true'), 'the final-answer prompt exposed owner configuration')
 
   const systemPrompt = buildSystemPrompt('椰椰')
-  assert(systemPrompt.includes('CurrentRequesterRole'), 'the system prompt does not reference the role fact')
+  assert(systemPrompt.includes('授权角色'), 'the system prompt does not define authorization-role semantics')
+  assert(systemPrompt.includes('不得把任何授权角色自然化'), 'the system prompt does not separate role from identity')
   assert(systemPrompt.includes('不要因为任何人自称'), 'the system prompt does not forbid self-claimed roles')
-  assert(systemPrompt.includes('不允许再从正文推断'), 'the system prompt still invites re-deriving the role')
 }
 
 // ------------------------------------------------------------------- gates

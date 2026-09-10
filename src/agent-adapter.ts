@@ -1,9 +1,13 @@
 import { sanitizeFinalAnswer } from './final-answer.js'
+import type { BotMentionSpanFacts } from './canonical-user-text.js'
 import {
+  normalizePassiveContextMessage,
   normalizeRawHookMessage,
   type ConversationType,
   type InboundMessage,
   type NormalizationResult,
+  type PassiveContextMessage,
+  type PassiveNormalizationResult,
   type RawHookMessage,
   type RequesterRole,
 } from './message-contract.js'
@@ -27,8 +31,18 @@ export interface AgentRequest {
   ownerDisplayName: string | null
   senderName: string | null
   text: string
+  /**
+   * The wire body before the trim applied to `text`. Bot mention spans index this
+   * value, so canonicalization starts from it rather than from `text`.
+   */
+  rawText?: string
   timestamp: number
   mentionState: MentionState
+  /**
+   * The runtime's bot mention span claim for this message, already validated
+   * against the raw body. Absent means an older runtime that makes no claim.
+   */
+  botMentionSpans?: BotMentionSpanFacts
   metadata: {
     rawMessageType: number
   }
@@ -49,8 +63,33 @@ export type AgentResult =
   | { kind: 'NO_REPLY' }
   | { kind: 'ERROR' }
 
+/**
+ * A group message admitted as ambience only. It carries no authorization fact and
+ * no destination: there is nothing here that a reply could be sent to.
+ */
+export interface AgentPassiveContext {
+  conversationKey: string
+  messageId: string
+  conversationType: 'GROUP'
+  conversationId: string
+  senderId: string
+  requesterId: string
+  text: string
+  timestamp: number
+}
+
 export interface AgentExecutor {
   complete(request: AgentRequest): Promise<string | null | undefined>
+
+  /**
+   * Ambience only: a group message that did not address the bot.
+   *
+   * Optional, and its absence is fail-safe — an executor that does not implement
+   * it simply drops the ambience. An implementation of this method may not read
+   * or write memory, call a provider, touch requester context or produce a reply;
+   * the return value is deliberately `void` so none can be smuggled out.
+   */
+  observePassiveContext?(context: AgentPassiveContext): Promise<void> | void
 }
 
 export type AgentPipelineResult =
@@ -74,6 +113,19 @@ export type AgentPipelineResult =
 
 export function conversationKey(message: Pick<InboundMessage, 'conversationType' | 'conversationId'>): string {
   return `${message.conversationType.toLowerCase()}:${message.conversationId}`
+}
+
+export function toPassiveContext(message: PassiveContextMessage): AgentPassiveContext {
+  return {
+    conversationKey: `group:${message.conversationId}`,
+    messageId: message.messageId,
+    conversationType: 'GROUP',
+    conversationId: message.conversationId,
+    senderId: message.senderId,
+    requesterId: message.requesterId,
+    text: message.text,
+    timestamp: message.timestamp,
+  }
 }
 
 /**
@@ -120,8 +172,10 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     ownerDisplayName: message.ownerDisplayName,
     senderName: message.senderName,
     text: message.text,
+    rawText: message.rawText,
     timestamp: message.timestamp,
     mentionState: toMentionState(message),
+    botMentionSpans: message.botMentionSpans,
     metadata: {
       rawMessageType: message.rawMessageType,
     },
@@ -203,4 +257,58 @@ export async function runRawAgentPipeline(
     agentResult,
     outboundCommand: toOutboundCommand(normalization.message, agentResult),
   }
+}
+
+/**
+ * Outcome of one passive ambient event.
+ *
+ * There is no outbound member in any variant, by construction: this pipeline has
+ * no path that can produce one, which is what makes "no mention never replies"
+ * a structural property instead of a checked one.
+ */
+export type PassivePipelineResult =
+  | {
+      status: 'INVALID' | 'UNSUPPORTED'
+      normalization: Extract<PassiveNormalizationResult, { status: 'INVALID' | 'UNSUPPORTED' }>
+    }
+  | {
+      status: 'PASSIVE_CONTEXT' | 'PASSIVE_CONTEXT_UNSUPPORTED' | 'PASSIVE_CONTEXT_ERROR'
+      normalization: Extract<PassiveNormalizationResult, { status: 'VALID' }>
+      context: AgentPassiveContext
+    }
+
+/**
+ * Passive pipeline: normalize an ambient group message and hand it to the
+ * executor's ambience sink.
+ *
+ * Deliberately NOT the active pipeline. It never applies the mention policy (the
+ * runtime already decided this message is not a mention), never builds an
+ * `AgentRequest`, never maps an answer and never builds an outbound command. An
+ * executor that throws loses the ambience and nothing else.
+ */
+export async function runRawPassiveContextPipeline(
+  raw: RawHookMessage,
+  agent: AgentExecutor,
+): Promise<PassivePipelineResult> {
+  const normalization = normalizePassiveContextMessage(raw)
+  if (normalization.status !== 'VALID') {
+    return { status: normalization.status, normalization }
+  }
+
+  const context = toPassiveContext(normalization.message)
+  if (agent.observePassiveContext === undefined) {
+    // A delivered event nobody consumes is reported as such: the transport must
+    // not claim the ambience was captured when it was dropped on the floor.
+    return { status: 'PASSIVE_CONTEXT_UNSUPPORTED', normalization, context }
+  }
+
+  try {
+    await agent.observePassiveContext(context)
+  } catch {
+    // Ambience is best-effort by contract: a failed append is reported, never
+    // retried and never allowed to become a reply or an error the user can see.
+    return { status: 'PASSIVE_CONTEXT_ERROR', normalization, context }
+  }
+
+  return { status: 'PASSIVE_CONTEXT', normalization, context }
 }

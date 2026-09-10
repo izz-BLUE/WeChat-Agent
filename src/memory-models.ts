@@ -98,6 +98,20 @@ export type MemoryCandidateRejection =
 export const MEMORY_TEXT_MARKER = 'wxid_'
 export const MEMORY_MAX_CONTENT_CHARS = 500
 export const MEMORY_NORMALIZE_MAX_CHARS = 512
+const RAW_IDENTITY_MARKERS = [
+  MEMORY_TEXT_MARKER,
+  'wxid=',
+  'Wxid=',
+  'Signature=',
+  'signature=',
+  'senderId=',
+  'SenderId=',
+  'sourceSenderId=',
+  'requesterId=',
+  'RequesterId=',
+  'conversationId=',
+  'ConversationId=',
+] as const
 
 export const MemoryText = {
   /** Historical `MemoryText.Normalize`: trim + collapse whitespace. */
@@ -142,7 +156,38 @@ export const MemoryText = {
   },
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^\${}()|[\]\\]/gu, '\\$&')
+}
+
+/**
+ * Converts only a current requester's exact identity-led self fact into a
+ * provider/storage-safe first-person form. Other text is returned unchanged so
+ * the write guard can reject it instead of guessing what it means.
+ */
+export function normalizeCurrentRequesterSelfReference(content: string, requesterId: string): string {
+  const normalized = MemoryText.normalize(content)
+  const identity = requesterId.trim()
+  if (normalized.length === 0 || identity.length === 0) {
+    return normalized
+  }
+
+  const identityPrefix = '(?:(?:wxid|Signature|senderId|requesterId|conversationId|ConversationId)=)?'
+  const pattern = new RegExp(
+    '^' + identityPrefix + escapeRegExp(identity) +
+      '(?:\\s*的)?(?:代号|名字|姓名|昵称|称呼)?\\s*(?:是|叫|为)\\s*(.+)$',
+    'u',
+  )
+  const match = pattern.exec(normalized)
+  if (!match) {
+    return normalized
+  }
+
+  const fact = MemoryText.normalize(match[1] ?? '')
+  return fact.length > 0 ? '我叫' + fact : normalized
+}
+
 /** True when the text carries a raw identity marker that must not be persisted. */
 export function containsRawIdentityMarker(content: string): boolean {
-  return content.includes(MEMORY_TEXT_MARKER)
+  return RAW_IDENTITY_MARKERS.some((marker) => content.includes(marker))
 }

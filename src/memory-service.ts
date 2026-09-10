@@ -23,7 +23,12 @@
  *    conversation, so a batch can never attribute one requester's facts to
  *    another (historical buffers used the last speaker for the whole batch);
  *  - each admitted message is consumed at most once (duplicate MsgId is skipped);
- *  - write validation also rejects over-long content and raw identity markers.
+ *  - write validation also rejects over-long content and raw identity markers;
+ *  - GROUP retrieval returns the authorize-then-budget WORKING SET
+ *    (`authorized-memory-working-set.ts`). The lexical rule is no longer a
+ *    visibility gate: `MEMORY_FINAL_LIMIT` bounds the historical explicit
+ *    candidate list, while the provider budget is
+ *    `MAX_WORKING_MEMORIES` / `MAX_WORKING_MEMORY_CHARS`.
  */
 import { randomUUID } from 'node:crypto'
 import { sanitizeFinalAnswer } from './final-answer.js'
@@ -34,6 +39,7 @@ import {
   MEMORY_SCOPE_MEMBER,
   MEMORY_SCOPE_OWNER,
   MemoryText,
+  normalizeCurrentRequesterSelfReference,
   type MemoryAccessRule,
   type MemoryCandidate,
   type MemoryCandidateRejection,
@@ -41,8 +47,17 @@ import {
   type MemoryInputMessage,
   type MemoryRecord,
   type MemoryScopeType,
+  type MemoryWriteStatus,
 } from './memory-models.js'
-import { filterAndRank } from './memory-relevance.js'
+import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
+import type { BotMentionSpanTrust, UserTextShape } from './canonical-user-text.js'
+import type { MentionState } from './agent-adapter.js'
+import {
+  buildAuthorizedMemoryWorkingSet,
+  emitMemoryWorkingSet,
+  scopeClassOf,
+  type AuthorizedMemoryWorkingSet,
+} from './authorized-memory-working-set.js'
 import { MemoryExtractor, type StructuredCompletion } from './memory-extractor.js'
 import type { MemoryStore } from './memory-store.js'
 import type { ConversationType, RequesterRole } from './message-contract.js'
@@ -60,17 +75,124 @@ export const MEMORY_MAX_PENDING_MESSAGES = 32
 export const MEMORY_TIMER_INTERVAL_MS = 5 * 60 * 1000
 export const MEMORY_SEEN_MESSAGE_LIMIT = 512
 
-/** Historical `MemoryService.IsExplicitMemoryIntent` keyword list. */
-export const EXPLICIT_MEMORY_KEYWORDS = [
-  '记住',
-  '记一下',
-  '记得',
-  '忘掉',
-  '忘记',
-  '删掉这条记忆',
-  '改成',
-  '修改记忆',
-] as const
+/**
+ * Admission diagnostic. It is the one line that answers "did this message enter
+ * the persistent-memory write entry, and if not, why" — the question the field
+ * could not answer when a real `@bot 记住…` message silently became ordinary chat.
+ */
+export const MEMORY_ADMISSION_EVENT = 'MEMORY_ADMISSION'
+
+/**
+ * Why an explicit-memory entry ended the way it did.
+ *
+ * Every one of these used to be reported as the same line — `explicitCommand=false
+ * reason=NOT_AN_EXPLICIT_COMMAND result=CHAT` — so "the runtime never confirmed a
+ * bot mention", "the sentence is not a command", and "there is another line in
+ * front of the command" were indistinguishable in the field. They have completely
+ * different owners and fixes:
+ *
+ *  - `ROLE_NOT_OWNER` — authorization, nothing to do with the text;
+ *  - `BOT_MENTION_SPAN_UNTRUSTED` — the runtime's mention verdict is missing or
+ *    invalid; the side effect is refused on purpose;
+ *  - `BODY_PREFIX_PRESENT` — the command is not the first line of the canonical
+ *    body, so something precedes it. The blocker name says "a line precedes the
+ *    command"; whether that line is runtime transport framing or genuine user
+ *    content (a quoted message, a line the user typed) is NOT decided here, and the
+ *    shape facts in the same log line are what settles it;
+ *  - `GRAMMAR_MISS` — a single-line body that is simply not a memory command shape;
+ *  - `SHAPE_UNKNOWN` — the caller supplied no structural facts, so no finer answer
+ *    is claimed.
+ */
+export type MemoryAdmissionBlocker =
+  | 'NONE'
+  | 'ROLE_NOT_OWNER'
+  | 'BOT_MENTION_SPAN_UNTRUSTED'
+  | 'BODY_PREFIX_PRESENT'
+  | 'GRAMMAR_MISS'
+  | 'SHAPE_UNKNOWN'
+
+/**
+ * EXPLICIT MEMORY ADMISSION — a high-precision side-effect gate.
+ *
+ * Persistent memory writes, updates and deletes are side effects, and admission
+ * to them is the only thing this grammar decides. It is NOT conversation
+ * understanding: nothing here decides what a sentence means, and a sentence that
+ * fails the gate is not "not a memory command" — it is simply handled as ordinary
+ * chat, where the contextual working set already gives the final model what it
+ * needs.
+ *
+ * The asymmetry is deliberate: a missed command becomes a normal chat turn,
+ * while a false admission swallows a normal chat turn into a memory write that
+ * then fails closed ("这条记忆没有保存成功。"). So the gate requires a verb in
+ * COMMAND POSITION and, for updates, an explicit memory object.
+ *
+ * What each pattern rejects, and why it matters:
+ *  - `我忘记带钥匙了` / `我忘记密码了` / `他忘掉带文件了`: the verb is not in command
+ *    position, so a statement about one's own forgetfulness never becomes a
+ *    memory delete;
+ *  - `这个文件删掉了吗`: same, and a yes/no question never becomes a delete;
+ *  - `把按钮改成蓝色` / `把接口改成 POST` / `这个字段改成 varchar`: no first-person
+ *    memory attribute is being changed, so ordinary edit requests stay chat;
+ *  - `记住了吗` / `记住吧`: a verb followed by a perfective or modal particle is a
+ *    statement or a recall question, not an imperative.
+ *
+ * TRANSPORT FRAMING IS NOT THIS LAYER'S BUSINESS. The body arrives here as the
+ * CANONICAL USER TEXT (`canonical-user-text.ts`): the mention envelope has
+ * already been removed at the Agent ingress, by the contract's own token rule.
+ * This gate therefore anchors on the first character of real user content and
+ * never re-parses `@name`, separators or line structure. The previous revision
+ * did strip an envelope here, and assuming the envelope was at the start of the
+ * raw body is exactly how a real "@bot 记住…" message silently failed admission
+ * in the field.
+ *
+ * Kept out on purpose (each would be a step toward a natural-language rule
+ * library): any-position keyword matching, fuzzy "sounds like a command" forms,
+ * `把…删掉` verb-final phrasing, tolerating an arbitrary prefix, and synonyms
+ * beyond the closed sets below. If the verb or object lists start growing, the
+ * answer is to let the sentence fall through to chat, not to add words.
+ */
+
+/** Optional politeness marker; the command verb still has to follow it. */
+const POLITE_PREFIX = '(?:请|麻烦|帮我|替我|给我)'
+/** A trailing particle turns an imperative into a statement or a question. */
+const NOT_STATEMENT_OR_QUESTION = '(?!了|吗|没|不|吧|呢|？|\\?|$)'
+/**
+ * The closed set of first-person attributes the runtime can actually store. It is
+ * what keeps `把我的代号改成…` (a memory update) apart from `把我的头像改成…`
+ * (a client-side edit) without any sentence parsing.
+ */
+const MEMORY_ATTRIBUTE_OBJECT = '(?:记忆|代号|名字|称呼|昵称|姓名|资料)'
+const UPDATE_VERB = '(?:改成|改为|换成|更新成|更新为)'
+
+const EXPLICIT_MEMORY_COMMAND_PATTERNS: readonly RegExp[] = [
+  // ADD: the imperative verb opens the sentence.
+  new RegExp(`^${POLITE_PREFIX}?(?:记住|记一下|记下来|记着)${NOT_STATEMENT_OR_QUESTION}`, 'u'),
+  // DELETE / FORGET: same shape, so the object is whatever follows the verb.
+  new RegExp(`^${POLITE_PREFIX}?(?:忘记|忘掉|删掉|删除)${NOT_STATEMENT_OR_QUESTION}`, 'u'),
+  // UPDATE of the memory itself.
+  new RegExp(`^${POLITE_PREFIX}?(?:修改|更新|改一下)(?:一下)?记忆`, 'u'),
+  // UPDATE of a first-person attribute, in the 把-construction.
+  new RegExp(`^把(?:我|咱)(?:的)?${MEMORY_ATTRIBUTE_OBJECT}${UPDATE_VERB}`, 'u'),
+  // UPDATE of something explicitly remembered earlier; the object noun is free
+  // because `之前记的` already names a stored item.
+  new RegExp(`^把(?:之前|上次|原来|以前|刚刚)(?:记|说|存|提)(?:的|过)[^，,。！!？?\\s]{0,16}${UPDATE_VERB}`, 'u'),
+]
+
+/**
+ * True when the text is an explicit, unambiguous memory side-effect command.
+ *
+ * Anchored, deterministic and cheap: no provider call, no state, no scoring. It
+ * runs before the mutation structured completion and is the only thing that can
+ * let a message reach it. The input is the canonical user text, so the command
+ * must open the sentence.
+ */
+export function isExplicitMemoryCommand(text: string): boolean {
+  const command = text.trim()
+  if (command.length === 0) {
+    return false
+  }
+  return EXPLICIT_MEMORY_COMMAND_PATTERNS.some((pattern) => pattern.test(command))
+}
 
 /** Historical GROUP keywords that route an explicit add to the group scope. */
 export const GROUP_SCOPE_KEYWORDS = ['这个群', '本群', '群里', '以后这个群'] as const
@@ -95,6 +217,28 @@ export interface MemoryReadRequest {
   requesterId: string
   requesterRole: RequesterRole
   question: string
+  /**
+   * Structural facts about the canonical user text, when the caller produced one.
+   *
+   * Counts and booleans only. They exist so the admission decision is answerable
+   * from one log line: "the framing was still attached" and "the requester was not
+   * the owner" are different bugs with the same field symptom (an explicit memory
+   * command that silently became ordinary chat), and the previous silence could
+   * not tell them apart.
+   */
+  textShape?: UserTextShape
+  /**
+   * The runtime's own mention verdict for this message.
+   *
+   * A persistent memory side effect may only be admitted when the message really
+   * carries a trusted bot mention token: the runtime decides that, the Agent may not
+   * infer it. Absent or invalid facts refuse the side effect (the turn continues as
+   * ordinary chat), which is the difference between "a command I could not parse"
+   * and "a sentence that was never addressed to me at all".
+   */
+  mentionState?: MentionState
+  botMentionSpanTrust?: BotMentionSpanTrust
+  botMentionSpanCount?: number
 }
 
 export interface ExplicitMemoryRequest extends MemoryReadRequest {}
@@ -109,6 +253,21 @@ export interface MemoryMutation {
   target: string | null
   content: string | null
   scope: string | null
+}
+
+export type MutationParseResult =
+  | 'EMPTY_RESPONSE'
+  | 'INVALID_JSON'
+  | 'SCHEMA_INVALID'
+  | 'MODEL_NONE'
+  | 'PARSED'
+
+export interface MemoryMutationParseDiagnostics {
+  mutation: MemoryMutation
+  mutationParseResult: MutationParseResult
+  schemaValid: boolean
+  contentPresent: boolean
+  contentChars: number
 }
 
 export interface MemoryServiceOptions {
@@ -229,8 +388,99 @@ export class MemoryService {
     return this.store.liveRecordCount
   }
 
+  /**
+   * Historical `MemoryService.IsExplicitMemoryIntent`, now a high-precision
+   * side-effect gate: OWNER-only AND an anchored memory command (see
+   * `isExplicitMemoryCommand`). A recall question, a statement about forgetting
+   * something, or an ordinary "改成" request is not admitted and follows the
+   * normal chat path.
+   */
   public isExplicitMemoryIntent(role: RequesterRole, text: string): boolean {
-    return role === 'OWNER' && EXPLICIT_MEMORY_KEYWORDS.some((keyword) => text.includes(keyword))
+    return role === 'OWNER' && isExplicitMemoryCommand(text)
+  }
+
+  /**
+   * Whether the runtime confirmed that this message carries the bot's own mention
+   * token.
+   *
+   * All three facts are required, and the span count must be positive: a claim of
+   * "mentioned, but here are zero tokens" is internally contradictory, so it is
+   * treated exactly like a missing claim rather than as permission. This is a safety
+   * boundary over a runtime fact, not a language rule — nothing here looks at the
+   * text.
+   */
+  private hasTrustedBotMention(request: ExplicitMemoryRequest): boolean {
+    return request.mentionState === 'MENTIONED' &&
+      request.botMentionSpanTrust === 'VALID' &&
+      (request.botMentionSpanCount ?? 0) > 0
+  }
+
+  /**
+   * Why this entry did not admit a side effect, derived from structural facts only.
+   *
+   * No text is inspected beyond the anchored command test that already ran: this
+   * classifies the SITUATION (role, runtime mention verdict, body shape) so the field
+   * log names the owner of the problem. `BODY_PREFIX_PRESENT` deliberately claims
+   * only that a line precedes the command — not that the line is transport framing.
+   */
+  private admissionBlocker(request: ExplicitMemoryRequest, admitted: boolean): MemoryAdmissionBlocker {
+    if (admitted) {
+      return 'NONE'
+    }
+    if (request.requesterRole !== 'OWNER') {
+      return 'ROLE_NOT_OWNER'
+    }
+    if (!this.hasTrustedBotMention(request)) {
+      return 'BOT_MENTION_SPAN_UNTRUSTED'
+    }
+    const canonicalLineCount = request.textShape?.canonicalLineCount
+    if (canonicalLineCount === undefined) {
+      return 'SHAPE_UNKNOWN'
+    }
+    // The gate is anchored at the start of the canonical text, so a first line that
+    // opened a command would have matched; a multi-line body that did not match means
+    // something else is in front of the command.
+    return canonicalLineCount >= 2 ? 'BODY_PREFIX_PRESENT' : 'GRAMMAR_MISS'
+  }
+
+  /**
+   * One admission decision per explicit-memory entry point.
+   *
+   * Fields are enums, counts and booleans only: the role fact, the conversation
+   * class, the blocker, the shape of the canonical text (line counts, leading-line
+   * class, trust of the runtime's span claim) and the verdict. Never the text, never
+   * a mention name, never an id, never an exact offset.
+   */
+  private emitAdmission(
+    request: ExplicitMemoryRequest,
+    result: 'ADMITTED' | 'CHAT' | 'SKIPPED',
+    reason: string,
+  ): void {
+    const admitted = result === 'ADMITTED'
+    const fields: DiagnosticFields = {
+      role: request.requesterRole,
+      conversationType: request.conversationType,
+      explicitCommand: admitted,
+      blocker: this.admissionBlocker(request, admitted),
+      result,
+      reason,
+    }
+    if (request.textShape !== undefined) {
+      fields.canonicalized = request.textShape.canonicalized
+      fields.botMentionSpanCount = request.textShape.botMentionSpanCount
+      fields.botMentionSpanValid = request.textShape.botMentionSpanValid
+      fields.botMentionSpanAbsent = request.textShape.botMentionSpanAbsent
+      fields.invisibleCharacterCount = request.textShape.invisibleCharacterCount
+      fields.lineCount = request.textShape.lineCount
+      fields.canonicalLineCount = request.textShape.canonicalLineCount
+      fields.leadingLineClass = request.textShape.leadingLineClass
+      fields.leadingLineLengthBucket = request.textShape.leadingLineLengthBucket
+      fields.canonicalBodyPresent = request.textShape.canonicalBodyPresent
+    }
+    if (request.mentionState !== undefined) {
+      fields.mentionState = request.mentionState
+    }
+    emitDiagnostic(this.log, this.sink, MEMORY_ADMISSION_EVENT, fields)
   }
 
   /** Admission + buffering. Never writes memory by itself. */
@@ -294,69 +544,135 @@ export class MemoryService {
     this.scheduleFlush(slot, batch, trigger)
   }
 
-  /** Historical `RetrieveForChatAsync`, GROUP contract only. */
+  /**
+   * Historical `RetrieveForChatAsync`, GROUP contract only, now returning the
+   * CONTEXTUAL MEMORY WORKING SET.
+   *
+   * Order is the whole security argument and it never inverts:
+   *  1. the store resolves which records this requester, this conversation and
+   *     the visibility rules allow (`groupRetrievalRules` -> `MemoryStore.retrieve`).
+   *     A record that is not authorized does not exist downstream;
+   *  2. the budget only orders and bounds that authorized set. It does not decide
+   *     relevance: there is no second model call and no lexical gate, so a memory
+   *     a human would call obviously relevant cannot be filtered out by a rule;
+   *  3. the final model receives ambient context, the recent conversation and this
+   *     working set together, and decides which memories help answer.
+   *
+   * The deterministic lexical rule (`memory-relevance.ts`) is still the same rule
+   * and still classifies these records for the budget ordering, but nothing in
+   * this path uses it as a visibility gate any more.
+   */
   public async retrieveForChat(request: MemoryReadRequest): Promise<MemoryContextItem[]> {
     // The personal scope the request would read (OWNER for an owner, MEMBER
     // otherwise); it is an enum so it is safe for both log channels.
     const scope = this.personalScope(request.requesterRole)
+    const selfIdentityQuery = isCurrentSelfIdentityQuery(request.question)
     if (!this.store.isEnabled) {
-      this.emit('MEMORY_READ', { scope, personalCount: 0, groupCount: 0, candidateCount: 0, selectedCount: 0, result: 'FAIL', reason: 'STORE_UNAVAILABLE' })
+      this.emit('MEMORY_READ', { scope, selfIdentityQuery, personalCount: 0, groupCount: 0, candidateCount: 0, selectedCount: 0, result: 'FAIL', reason: 'STORE_UNAVAILABLE' })
       return []
     }
     if (request.conversationType !== 'GROUP') {
-      this.emit('MEMORY_READ', { scope, personalCount: 0, groupCount: 0, candidateCount: 0, selectedCount: 0, result: 'PASS', reason: 'DIRECT_MEMORY_DISABLED' })
+      this.emit('MEMORY_READ', { scope, selfIdentityQuery, personalCount: 0, groupCount: 0, candidateCount: 0, selectedCount: 0, result: 'PASS', reason: 'DIRECT_MEMORY_DISABLED' })
       return []
     }
 
+    const identityContext = { requesterId: request.requesterId, personalScopeType: scope }
+    // Step 1: deterministic authorization/scope/visibility filtering. Everything
+    // downstream of this line can only ever see records this request may read.
     const eligible = this.store.retrieve(this.groupRetrievalRules(request), MEMORY_ELIGIBLE_LIMIT)
-    const personalCount = eligible.filter((record) => record.scopeType !== MEMORY_SCOPE_GROUP).length
+    const personalCount = eligible.filter((record) => scopeClassOf(record) === 'PERSONAL').length
     const groupCount = eligible.length - personalCount
-    const ranked = filterAndRank(request.question, eligible, MEMORY_FINAL_LIMIT, {
-      requesterId: request.requesterId,
-      personalScopeType: scope,
+
+    // Step 2: the budget. Small stores provide everything authorized.
+    const workingSet: AuthorizedMemoryWorkingSet = buildAuthorizedMemoryWorkingSet({
+      query: request.question,
+      eligible,
+      identityContext,
     })
-    const items = ranked.map<MemoryContextItem>((record) => ({
-      scope: record.scopeType === MEMORY_SCOPE_GROUP ? 'GROUP' : 'PERSONAL',
-      content: MemoryText.forModel(record.content),
-    }))
+    emitMemoryWorkingSet(this.log, this.sink, workingSet)
 
     this.emit('MEMORY_READ', {
       scope,
+      selfIdentityQuery,
       personalCount,
       groupCount,
-      candidateCount: eligible.length,
-      selectedCount: items.length,
+      candidateCount: workingSet.eligibleCount,
+      selectedCount: workingSet.includedCount,
       result: 'PASS',
     })
-    return items
+    return [...workingSet.items]
   }
 
   /** Historical `TryHandleExplicitAsync`, OWNER-only through the trusted role. */
   public async tryHandleExplicit(request: ExplicitMemoryRequest): Promise<ExplicitMemoryResult> {
     if (!this.store.isEnabled) {
+      this.emitAdmission(request, 'SKIPPED', 'STORE_UNAVAILABLE')
       this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: 'SKIPPED', reason: 'STORE_UNAVAILABLE' })
       return { handled: false, reply: '' }
     }
     if (request.conversationType !== 'GROUP') {
+      this.emitAdmission(request, 'SKIPPED', 'DIRECT_IDENTITY_UNVERIFIED')
       this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: 'SKIPPED', reason: 'DIRECT_IDENTITY_UNVERIFIED' })
       return { handled: false, reply: '' }
     }
     if (!this.isExplicitMemoryIntent(request.requesterRole, request.question)) {
+      // The previously SILENT branch. A non-owner requester and a sentence that is
+      // not a command both land here, and until now neither left a trace — which is
+      // why "the explicit memory command became ordinary chat" could not be
+      // diagnosed from the field log at all. It now states the role, the blocker and
+      // the shape of the text it judged, without the text.
+      this.emitAdmission(request, 'CHAT', 'NOT_AN_EXPLICIT_COMMAND')
       return { handled: false, reply: '' }
     }
+    if (!this.hasTrustedBotMention(request)) {
+      // A command-shaped sentence that the runtime did not confirm as a bot mention
+      // is not a command. Without this check a sentence addressed to another member
+      // could be read as one: the only reason "@张三 记住我不吃香菜" is not a
+      // command is that its framing belongs to someone else, and the Agent cannot
+      // know that on its own.
+      this.emitAdmission(request, 'CHAT', 'UNTRUSTED_BOT_MENTION_SPAN')
+      this.emit('MEMORY_TRIGGER', {
+        trigger: 'EXPLICIT_REMEMBER',
+        role: request.requesterRole,
+        result: 'SKIPPED',
+        reason: 'UNTRUSTED_BOT_MENTION_SPAN',
+      })
+      return { handled: false, reply: '' }
+    }
+    this.emitAdmission(request, 'ADMITTED', 'EXPLICIT_COMMAND')
 
     const candidates = this.store.retrieve(this.explicitCandidateRules(request), MEMORY_FINAL_LIMIT)
-    let mutation: MemoryMutation
+    let parsedMutation: MemoryMutationParseDiagnostics
     try {
-      mutation = parseMemoryMutation(await this.mutate(mutationSystemPrompt(), mutationUserPrompt(request.question, candidates)))
+      parsedMutation = parseMemoryMutationDetailed(await this.mutate(mutationSystemPrompt(), mutationUserPrompt(request.question, candidates)))
     } catch {
       this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: 'FAIL', reason: 'MUTATION_UNAVAILABLE' })
-      return { handled: true, reply: '先不改。' }
+      return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
     }
 
+    const mutation = parsedMutation.mutation
     if (mutation.operation === 'NONE') {
-      this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: 'FAIL', reason: 'MUTATION_NONE' })
-      return { handled: true, reply: '先不改。' }
+      this.emit('MEMORY_TRIGGER', {
+        trigger: 'EXPLICIT_REMEMBER',
+        role: request.requesterRole,
+        result: 'FAIL',
+        reason: 'MUTATION_NONE',
+        mutationParseResult: parsedMutation.mutationParseResult,
+        mutationType: mutation.operation,
+        schemaValid: parsedMutation.schemaValid,
+        contentPresent: parsedMutation.contentPresent,
+        contentChars: parsedMutation.contentChars,
+      })
+      // A NONE that reached this line came from a message that DID look like a
+      // write command, so "no memory change" means the command could not be
+      // resolved: the fail-closed reply is the historical behaviour and it stays.
+      //
+      // There is deliberately no parse-time "was this really a command?" test
+      // here. Admission (`EXPLICIT_MEMORY_KEYWORDS`) is the boundary, and a
+      // second pattern would be an untestable duplicate of the same list that can
+      // only drift away from it — that is how "你记得不？" ended up paying for a
+      // mutation call in the first place.
+      return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
     }
 
     const now = this.now()
@@ -367,17 +683,18 @@ export class MemoryService {
       const groupScoped = GROUP_SCOPE_KEYWORDS.some((keyword) => request.question.includes(keyword))
       const scopeType: MemoryScopeType = groupScoped ? MEMORY_SCOPE_GROUP : this.personalScope(request.requesterRole)
       const scopeId = groupScoped ? request.conversationId : request.requesterId
-      const rejection = validateContent(mutation.content ?? '')
+      const content = normalizeContentForWrite(mutation.content ?? '', scopeType, request.requesterId)
+      const rejection = validateContent(content, [request.requesterId, request.conversationId])
       if (rejection !== null) {
         this.emit('MEMORY_WRITE', { scope: scopeType, visibility: 'SHARED', result: 'FAIL', reason: rejection })
-        return { handled: true, reply: '先不改。' }
+        return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
       }
 
       const status = this.store.add({
         memoryId: this.idFactory(),
         scopeType,
         scopeId,
-        content: MemoryText.normalize(mutation.content ?? ''),
+        content,
         contentHash: '',
         visibility: 'SHARED',
         origin: 'EXPLICIT_OWNER',
@@ -394,7 +711,7 @@ export class MemoryService {
         role: request.requesterRole,
         result: status === 'WRITTEN' || status === 'SKIPPED' ? 'PASS' : 'FAIL',
       })
-      return { handled: true, reply: status === 'WRITTEN' || status === 'SKIPPED' ? '记住了。' : '先不改。' }
+      return { handled: true, reply: explicitAddReply(status) }
     }
 
     const candidate = resolveMutationTarget(mutation.target, candidates)
@@ -404,21 +721,22 @@ export class MemoryService {
     }
 
     if (mutation.operation === 'UPDATE') {
-      const rejection = validateContent(mutation.content ?? '')
+      const content = normalizeContentForWrite(mutation.content ?? '', candidate.scopeType, request.requesterId)
+      const rejection = validateContent(content, [request.requesterId, request.conversationId])
       if (rejection !== null) {
         this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: 'FAIL', reason: rejection })
-        return { handled: true, reply: '先不改。' }
+        return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
       }
-      const updated = this.store.update(candidate.memoryId, mutation.content ?? '', now)
+      const updated = this.store.update(candidate.memoryId, content, now)
       this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: updated ? 'WRITTEN' : 'FAILED' })
       this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: updated ? 'PASS' : 'FAIL' })
-      return { handled: true, reply: updated ? '改好了。' : '先不改。' }
+      return { handled: true, reply: updated ? '改好了。' : '这条记忆没有更新成功。' }
     }
 
     const deleted = this.store.delete(candidate.memoryId, now)
     this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: deleted ? 'WRITTEN' : 'FAILED' })
     this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: deleted ? 'PASS' : 'FAIL' })
-    return { handled: true, reply: deleted ? '忘掉了。' : '先不改。' }
+    return { handled: true, reply: deleted ? '忘掉了。' : '这条记忆没有删除成功。' }
   }
 
   /** Historical 5-minute timer body: flush every buffer with >= 3 messages. */
@@ -514,12 +832,12 @@ export class MemoryService {
       return { rejection: 'SCOPE_IDENTITY_MISSING' }
     }
 
-    const rejection = validateContent(candidate.content)
+    const content = normalizeContentForWrite(candidate.content, scopeType, slot.requesterId)
+    const rejection = validateContent(content, [slot.requesterId, slot.conversationId])
     if (rejection !== null) {
       return { rejection }
     }
 
-    const content = MemoryText.normalize(candidate.content)
     const now = this.now()
     return {
       record: {
@@ -576,7 +894,7 @@ export class MemoryService {
 }
 
 /** Write-time validation shared by automatic and explicit writes. */
-export function validateContent(content: string): MemoryCandidateRejection | null {
+export function validateContent(content: string, protectedRawIdentities: readonly string[] = []): MemoryCandidateRejection | null {
   const normalized = MemoryText.normalize(content)
   if (normalized.length === 0) {
     return 'EMPTY_FACT'
@@ -584,17 +902,46 @@ export function validateContent(content: string): MemoryCandidateRejection | nul
   if (normalized.length > MEMORY_MAX_CONTENT_CHARS) {
     return 'CONTENT_TOO_LONG'
   }
-  if (containsRawIdentityMarker(normalized)) {
+  if (
+    containsRawIdentityMarker(normalized) ||
+    protectedRawIdentities.some((identity) => {
+      const normalizedIdentity = identity.trim()
+      return normalizedIdentity.length > 0 && normalized.includes(normalizedIdentity)
+    })
+  ) {
     return 'RAW_IDENTITY_IN_CONTENT'
   }
   return null
 }
 
+const MEMORY_WRITE_FAILURE_REPLY = '这条记忆没有保存成功。'
+
+function normalizeContentForWrite(content: string, scopeType: MemoryScopeType, requesterId: string): string {
+  const normalized = MemoryText.normalize(content)
+  return scopeType === MEMORY_SCOPE_GROUP
+    ? normalized
+    : normalizeCurrentRequesterSelfReference(normalized, requesterId)
+}
+
+function explicitAddReply(status: MemoryWriteStatus): string {
+  if (status === 'WRITTEN') {
+    return '记住了。'
+  }
+  if (status === 'SKIPPED') {
+    return '已经记得了。'
+  }
+  return MEMORY_WRITE_FAILURE_REPLY
+}
+
 export function mutationSystemPrompt(): string {
   return (
-    '你是长期记忆变更解析器。只输出严格 JSON，不要解释，不要输出思考过程。格式：'
-    + '{"operation":"ADD|UPDATE|DELETE|NONE","target":"M1","content":"...","scope":"OWNER|GROUP"}。'
-    + '只能理解用户明确的记忆变更意图，无法确定时输出 NONE。'
+    '你是长期记忆变更解析器。只输出一个严格 JSON 对象，不要 Markdown，不要解释，不要输出思考过程。'
+    + '格式必须是：{"operation":"ADD|UPDATE|DELETE|NONE","target":"M1","content":"...","scope":"OWNER|GROUP"}；target 可为 M1 或 null。'
+    + '当 userRequest 明确要求记住一个当前请求者自己的事实时，operation 必须是 ADD，target 必须是 null；'
+    + '“记住我叫某个名字”“记住我是某个名字”“记住我的代号是某个代号”都属于 ADD，'
+    + '此时输出示例为 {"operation":"ADD","target":null,"content":"我叫某个名字","scope":"OWNER"}；'
+    + 'content 只写无身份标识的自然事实，例如“我叫某个名字”，不要写 wxid、Signature、requesterId、senderId、conversationId 或其他内部 ID。'
+    + '没有候选记忆不会阻止 ADD。只有无法确定是何种记忆变更时才输出 operation=NONE。'
   )
 }
 
@@ -607,34 +954,103 @@ export function mutationUserPrompt(question: string, candidates: readonly Memory
             `M${index + 1}: scope=${candidate.scopeType} visibility=${candidate.visibility} content=${MemoryText.forModel(candidate.content)}`,
         )
         .join('\n')
-  return `conversationType=GROUP\ncandidates:\n${candidateText}\n\nuserRequest:\n${question}`
+  return `conversationType=GROUP\ntrigger=EXPLICIT_REMEMBER\ncandidates:\n${candidateText}\n\nuserRequest:\n${question}`
 }
 
-/** Historical `ParseMutation`: strict JSON object, unknown operations -> NONE. */
+/** Historical `ParseMutation`: strict JSON object, with narrow provider-shape normalization. */
 export function parseMemoryMutation(response: string): MemoryMutation {
+  return parseMemoryMutationDetailed(response).mutation
+}
+
+/**
+ * Parses only a JSON object (or one complete JSON markdown fence). Known
+ * provider field aliases are normalized at this boundary; free-form prose and
+ * reasoning are never interpreted as a mutation.
+ */
+export function parseMemoryMutationDetailed(response: string): MemoryMutationParseDiagnostics {
   const boundary = sanitizeMutationText(response)
+  const contentPresent = boundary.length > 0
+  const contentChars = boundary.length
+  if (!contentPresent) {
+    return {
+      mutation: noneMutation(),
+      mutationParseResult: 'EMPTY_RESPONSE',
+      schemaValid: false,
+      contentPresent,
+      contentChars,
+    }
+  }
+
   let document: unknown
   try {
     document = JSON.parse(boundary) as unknown
   } catch {
-    return { operation: 'NONE', target: null, content: null, scope: null }
+    return {
+      mutation: noneMutation(),
+      mutationParseResult: 'INVALID_JSON',
+      schemaValid: false,
+      contentPresent,
+      contentChars,
+    }
   }
 
   if (typeof document !== 'object' || document === null || Array.isArray(document)) {
-    return { operation: 'NONE', target: null, content: null, scope: null }
+    return {
+      mutation: noneMutation(),
+      mutationParseResult: 'SCHEMA_INVALID',
+      schemaValid: false,
+      contentPresent,
+      contentChars,
+    }
   }
 
-  const record = document as Record<string, unknown>
-  const operation = typeof record.operation === 'string' ? record.operation.toUpperCase() : ''
+  const record = unwrapMutationDocument(document as Record<string, unknown>)
+  if (record === null) {
+    return {
+      mutation: noneMutation(),
+      mutationParseResult: 'SCHEMA_INVALID',
+      schemaValid: false,
+      contentPresent,
+      contentChars,
+    }
+  }
+
+  const operationValue = record.operation ?? record.type
+  const operation = typeof operationValue === 'string' ? operationValue.trim().toUpperCase() : ''
   if (operation !== 'ADD' && operation !== 'UPDATE' && operation !== 'DELETE' && operation !== 'NONE') {
-    return { operation: 'NONE', target: null, content: null, scope: null }
+    return {
+      mutation: noneMutation(),
+      mutationParseResult: 'SCHEMA_INVALID',
+      schemaValid: false,
+      contentPresent,
+      contentChars,
+    }
   }
 
-  return {
+  if (!hasValidMutationFieldTypes(record) ||
+      ((operation === 'ADD' || operation === 'UPDATE') && typeof record.content !== 'string') ||
+      ((operation === 'UPDATE' || operation === 'DELETE') && typeof record.target !== 'string')) {
+    return {
+      mutation: noneMutation(),
+      mutationParseResult: 'SCHEMA_INVALID',
+      schemaValid: false,
+      contentPresent,
+      contentChars,
+    }
+  }
+
+  const mutation: MemoryMutation = {
     operation,
     target: typeof record.target === 'string' ? record.target : null,
     content: typeof record.content === 'string' ? record.content : null,
     scope: typeof record.scope === 'string' ? record.scope : null,
+  }
+  return {
+    mutation,
+    mutationParseResult: operation === 'NONE' ? 'MODEL_NONE' : 'PARSED',
+    schemaValid: true,
+    contentPresent,
+    contentChars,
   }
 }
 
@@ -645,10 +1061,34 @@ function sanitizeMutationText(response: string): string {
   if (boundary.unterminatedTag) {
     return ''
   }
-  const text = boundary.text
-  const start = text.indexOf('{')
-  const end = text.lastIndexOf('}')
-  return start >= 0 && end > start ? text.slice(start, end + 1) : text
+  const text = boundary.text.trim()
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(text)
+  return (fenced?.[1] ?? text).trim()
+}
+
+function noneMutation(): MemoryMutation {
+  return { operation: 'NONE', target: null, content: null, scope: null }
+}
+
+function hasValidMutationFieldTypes(record: Record<string, unknown>): boolean {
+  return ['target', 'content', 'scope'].every((field) => {
+    if (!(field in record)) {
+      return true
+    }
+    const value = record[field]
+    return value === null || typeof value === 'string'
+  })
+}
+
+/** Only a single documented wrapper is accepted; arbitrary prose is rejected. */
+function unwrapMutationDocument(document: Record<string, unknown>): Record<string, unknown> | null {
+  if ('operation' in document || 'type' in document) {
+    return document
+  }
+  const nested = document.mutation
+  return typeof nested === 'object' && nested !== null && !Array.isArray(nested)
+    ? nested as Record<string, unknown>
+    : null
 }
 
 /** Historical `TryResolveCandidate`: only `M<n>` referring to a loaded candidate. */

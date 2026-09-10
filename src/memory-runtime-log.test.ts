@@ -393,6 +393,9 @@ async function testTriggerAndWriteEventsAreDurable(): Promise<void> {
  * `MEMORY_READ` is durable with the requester's scope enum, the eligible
  * candidate count and the selected count — the three values a field RCA needs,
  * and the ones the field log carries in `personalCount` / `selectedCount`.
+ *
+ * Under the contextual working set every authorized record is provided, so the
+ * two counts agree; the personal/group split still comes from the store.
  */
 async function testReadEventCarriesScopeAndCounts(): Promise<void> {
   const harness = createMemoryHarness()
@@ -406,7 +409,8 @@ async function testReadEventCarriesScopeAndCounts(): Promise<void> {
     requesterRole: 'MEMBER',
     question: '我的代号是什么',
   })
-  assert(items.length === 1, `the personal fact was not selected: ${items.length}`)
+  assert(items.length === 2, `the authorized records were not all provided: ${items.length}`)
+  assert(items.some((item) => item.content === FACT), 'the personal fact is missing from the working set')
 
   const reads = ofEvent(harness.durable(), 'MEMORY_READ')
   assert(reads.length === 1, `expected exactly one MEMORY_READ event, got ${reads.length}`)
@@ -415,7 +419,7 @@ async function testReadEventCarriesScopeAndCounts(): Promise<void> {
   assert(fieldOf(read, 'personalCount') === '1', `personalCount is wrong: ${read.raw}`)
   assert(fieldOf(read, 'groupCount') === '1', `groupCount is wrong: ${read.raw}`)
   assert(fieldOf(read, 'candidateCount') === '2', `candidateCount is wrong: ${read.raw}`)
-  assert(fieldOf(read, 'selectedCount') === '1', `selectedCount is wrong: ${read.raw}`)
+  assert(fieldOf(read, 'selectedCount') === '2', `selectedCount is wrong: ${read.raw}`)
   assert(fieldOf(read, 'result') === 'PASS', `the read result is wrong: ${read.raw}`)
 
   // The personal scope enum follows the trusted requester role.

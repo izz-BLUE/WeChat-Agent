@@ -205,14 +205,14 @@ async function testRuntimeMentionFactReachesContext(): Promise<void> {
     ownerConfigured: request.ownerConfigured,
   })
   assert(prompt.includes('CurrentBotMentioned=true'), 'user prompt does not state the mention fact')
-  assert(prompt.includes('CurrentRequesterRole=MEMBER'), 'user prompt does not state the trusted role fact')
-  assert(prompt.includes('OwnerConfigured=false'), 'user prompt does not state the owner-configured fact')
+  assert(!prompt.includes('CurrentRequesterRole=MEMBER'), 'user prompt exposed the trusted role fact')
+  assert(!prompt.includes('OwnerConfigured=false'), 'user prompt exposed the owner-configured fact')
   assert(prompt.includes('@椰椰 你好'), 'user prompt lost the question text')
 
   const systemPrompt = buildSystemPrompt('椰椰')
   assert(systemPrompt.includes('椰椰'), 'system prompt does not state the bot display name')
   assert(systemPrompt.includes('CurrentBotMentioned'), 'system prompt does not reference the mention fact')
-  assert(systemPrompt.includes('CurrentRequesterRole'), 'system prompt does not reference the role fact')
+  assert(systemPrompt.includes('授权角色'), 'system prompt does not define authorization-role semantics')
 }
 
 /** Case 6: the Agent must not re-decide whether the message mentioned it. */

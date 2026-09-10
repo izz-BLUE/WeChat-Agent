@@ -4,21 +4,29 @@
  *   the synthetic persistent store already held "MEMBER_1 的代号是 AlphaTest", but the answer to
  *   "我的代号是什么？" was selectedCount=0 although personalCount=1.
  *
- * The suite reproduces the real production retrieval path
- * (`MemoryService.retrieveForChat` -> `MemoryStore.retrieve` -> `filterAndRank`
- * -> `evaluateRelevance`) against a JSON store on disk. It records, for every
- * query, the eligible record count, the selected record count, the same
- * `[MEMORY_READ]` diagnostic line the field log carries, and — for the queries
- * that select nothing — a rule-level breakdown that shows which clause of the
- * historical relevance rule failed.
+ * The historical cause was a retrieval GATE: the lexical rule was applied as
+ * "visible or not" (`filterAndRank`), so one stored wording reached the prompt
+ * and another wording of the same fact did not. That function is gone; the
+ * classification it used is not.
  *
- * The breakdown helpers below are a *diagnostic reproduction* of
+ * Under the CONTEXTUAL MEMORY WORKING SET the gate is gone. Authorization
+ * decides what the model may see; the budget only bounds and orders it; the
+ * final model judges relevance. This suite keeps exactly what is still true and
+ * measurable:
+ *
+ *  - the lexical rule and the bounded self-identity bridge are still the
+ *    deterministic RELEVANCE RULE, and `evaluateMemoryRelevance` still reports
+ *    the same reasons and scores for every query/wording pair;
+ *  - every wording of the same fact is now readable through the production
+ *    retrieval path, including the one the lexical rule has no trigger for;
+ *  - a store that IS unavailable stays a distinct, explicit failure that
+ *    injects nothing, and a soft-deleted record stays out of the working set.
+ *
+ * The rule-level breakdown helpers below are a *diagnostic reproduction* of
  * `memory-relevance.ts` (same normalization, same stop words, same n-gram and
- * token extraction). They are only used to attribute the zero result to a rule;
- * the pass/fail decision of every case always comes from the real implementation.
- *
- * The original cases preserve the pre-fix lexical breakdown, while the final
- * contract cases assert the bounded self-identity convergence.
+ * token extraction). They are only used to attribute the lexical verdict to a
+ * clause; the pass/fail decision of every case always comes from the real
+ * implementation.
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -32,7 +40,6 @@ import {
 } from './memory-relevance.js'
 import { MemoryService } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
-import { normalizeRawHookMessage, type InboundMessage, type RawHookMessage } from './message-contract.js'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -71,15 +78,9 @@ function sequentialIds(): () => string {
 /**
  * Synthetic codename fact that preserves the shape of the field symptom without
  * retaining identifiers copied from the runtime store.
- *
- * Retrieval behavior still depends on the stored content wording; scope and
- * conversation identifiers are deliberately obvious test-only values.
  */
-const CODENAME = "AlphaTest"
-const FIELD_RECORD_CONTENT = "MEMBER_1 的代号是 AlphaTest"
-const FIELD_RECORD_SCOPE_ID = "requester-alpha"
-const FIELD_RECORD_ROOM = "room-alpha@chatroom"
-/** A second wording the extractor could plausibly have produced for the same fact. */
+const CODENAME = 'AlphaTest'
+const FIELD_RECORD_CONTENT = 'MEMBER_1 的代号是 AlphaTest'
 const PARAPHRASED_FACT = '用户代号是 AlphaTest'
 const REQUESTER_A = 'sig-gap-a'
 const ROOM_A = 'room-gap-a@chatroom'
@@ -139,9 +140,10 @@ function seed(
 }
 
 interface Retrieval {
-  /** Eligible records the store handed to the relevance filter (`personalCount`). */
+  /** Records the store authorized for this request. */
   personalCount: number
   groupCount: number
+  /** Records the working set carries into the prompt. */
   selectedCount: number
   items: Array<{ scope: string; content: string }>
   /** The exact production `[MEMORY_READ]` diagnostic line. */
@@ -280,7 +282,7 @@ interface RelevanceBreakdown {
   unmatchedLongestPhrases: string[]
 }
 
-/** Attributes a zero retrieval result to a specific clause of the historical rule. */
+/** Attributes a lexical verdict to a specific clause of the rule. */
 function breakdown(question: string, content: string): RelevanceBreakdown {
   const normalizedQuestion = normalize(question)
   const normalizedContent = normalize(content)
@@ -316,15 +318,15 @@ function breakdown(question: string, content: string): RelevanceBreakdown {
     normalizedContent,
     exactPhrase,
     tokenOverlap: sharedTokens.length,
+    sharedChinesePhrases,
     sharedTokens,
     maxChineseOverlap,
     chineseTwoGramMatches,
-    sharedChinesePhrases,
     unmatchedLongestPhrases: unmatched.sort((left, right) => right.length - left.length).slice(0, 4),
   }
 }
 
-/** The query would be relevant under the historical rule. */
+/** The query would be lexically relevant under the historical rule. */
 function breakdownIsRelevant(input: RelevanceBreakdown): boolean {
   return input.exactPhrase || input.tokenOverlap > 0 || input.maxChineseOverlap >= 3 || input.chineseTwoGramMatches >= 2
 }
@@ -373,7 +375,7 @@ function report(probeResult: Probe, label: string): void {
   console.log(
     `[RETRIEVAL_GAP] case=${label} query="${probeResult.query}" memory="${probeResult.memory}"` +
     ` eligible=${probeResult.eligible} selected=${probeResult.selected}` +
-    ` rule=${breakdownIsRelevant(probeResult.rules) ? 'RELEVANT' : 'NOT_RELEVANT'}`,
+    ` lexical=${breakdownIsRelevant(probeResult.rules) ? 'RELEVANT' : 'NOT_RELEVANT'}`,
   )
   console.log(`[RETRIEVAL_GAP] case=${label} ${formatBreakdown(probeResult.rules)}`)
 }
@@ -392,7 +394,7 @@ const EXTRA_QUERIES = [
 
 const ALL_QUERIES = [...REQUIRED_QUERIES, ...EXTRA_QUERIES]
 
-/** Closed current-requester identity questions accepted by this convergence. */
+/** Closed current-requester identity questions accepted by the convergence. */
 const SELF_IDENTITY_QUERIES = [
   '我的代号是什么？',
   '我叫什么代号？',
@@ -402,6 +404,9 @@ const SELF_IDENTITY_QUERIES = [
   '我的昵称是什么？',
   '你怎么称呼我？',
   '你还记得我叫什么吗？',
+  '我是谁',
+  '我是谁？',
+  '你知道我是谁吗',
 ] as const
 
 /** Stored self-fact surface forms seen in the runtime or allowed by the extractor. */
@@ -418,9 +423,8 @@ const SELF_IDENTITY_MEMORIES = [
  * A synthetic record with the same field shape, replayed through the production
  * retrieval path with every question the acceptance contract requires.
  *
- * The stored wording is the variable that decides the outcome: the same fact
- * written with the explicit codename shares the n-grams 代号/号是 with the pronoun
- * question, so it is retrieved; a wording that shares nothing is not.
+ * The wording is no longer the variable that decides visibility: one authorized
+ * record is one working-set entry, whatever the question says.
  */
 async function testSyntheticFieldShapeAgainstRequiredQueries(): Promise<void> {
   const results: Probe[] = []
@@ -435,23 +439,24 @@ async function testSyntheticFieldShapeAgainstRequiredQueries(): Promise<void> {
     if (result.eligible !== 1) {
       failures.push(`"${result.query}": eligible=${result.eligible}, expected the single stored record`)
     }
-    if (result.selected > 0 && result.selectedContent === null) {
-      failures.push(`"${result.query}": selected ${result.selected} but injected nothing`)
+    if (result.selected !== 1 || result.selectedContent === null) {
+      failures.push(`"${result.query}": selected=${result.selected}, expected the authorized record in the working set`)
     }
   }
-  assert(failures.length === 0, `retrieval did not follow the relevance rule: ${failures.join('; ')}`)
+  assert(failures.length === 0, `the authorized fact did not reach the working set: ${failures.join('; ')}`)
 
   for (const field of results.slice(0, REQUIRED_QUERIES.length)) {
-    assert(field.selected === 1, `"${field.query}" no longer retrieves the synthetic field-shape fixture`)
-    assert(field.selectedContent?.includes(CODENAME) === true, 'the injected item lost the codename content')
+    assert(field.selected === 1, `"${field.query}" no longer carries the synthetic field-shape fixture`)
+    assert(field.selectedContent?.includes(CODENAME) === true, 'the working-set item lost the codename content')
   }
 }
 
 /**
- * The same fact, a different stored wording. It still fails the historical
- * lexical clauses, but the bounded self-identity bridge now selects it.
+ * The wording the lexical rule has no trigger for is still readable, and the
+ * lexical verdict itself is unchanged. That is the whole point: relevance is no
+ * longer the gate, the rule is still the rule.
  */
-async function testPreviouslyUnreachableWordingUsesTheBridge(): Promise<void> {
+async function testLexicallyUnreachableWordingIsStillProvided(): Promise<void> {
   const unreachable = '我叫 AlphaTest'
   const result = await probe('我的代号是什么？', unreachable)
   report(result, 'unreachable-wording')
@@ -464,22 +469,30 @@ async function testPreviouslyUnreachableWordingUsesTheBridge(): Promise<void> {
     !breakdownIsRelevant(result.rules),
     `the wording now shares a rule trigger with the question: ${formatBreakdown(result.rules)}`,
   )
-  assert(result.selected === 1, `the self-identity bridge did not select the fact: selected=${result.selected}`)
-  assert(result.selectedContent?.includes(CODENAME) === true, 'the bridge lost the codename content')
+  assert(
+    result.selected === 1 && result.selectedContent?.includes(CODENAME) === true,
+    `a lexically unreachable wording did not reach the working set: selected=${result.selected}`,
+  )
+  const effective = evaluateMemoryRelevance('我的代号是什么？', relevanceRecord(unreachable), {
+    requesterId: REQUESTER_A,
+    personalScopeType: 'MEMBER',
+  })
+  assert(
+    effective.reason === 'SELF_IDENTITY_ATTRIBUTE_BRIDGE',
+    `the self-identity bridge no longer recognises the wording: reason=${effective.reason}`,
+  )
 
-  // The very same record and query do retrieve once the stored wording carries a
-  // shared term, which pins the cause to the lexical rule rather than to the store.
   const reachable = await probe('我的代号是什么？', PARAPHRASED_FACT)
   report(reachable, 'reachable-wording')
   assert(
     reachable.selected === 1 && reachable.selectedContent?.includes(CODENAME) === true,
-    `the same fact did not retrieve with a shared-term wording: selected=${reachable.selected}`,
+    `the shared-term wording did not reach the working set: selected=${reachable.selected}`,
   )
 }
 
 /**
- * Every required question against both real wordings converges even where the
- * historical lexical-only rule has no trigger.
+ * Every required question against both real wordings converges: authorization
+ * and the budget do not depend on the wording at all.
  */
 async function testRequiredQueriesAcrossStoredWordings(): Promise<void> {
   const wordings = [FIELD_RECORD_CONTENT, PARAPHRASED_FACT]
@@ -492,7 +505,7 @@ async function testRequiredQueriesAcrossStoredWordings(): Promise<void> {
       report(result, 'wording-matrix')
       rows.push(
         `query="${query}" memory="${memory}" eligible=${result.eligible}` +
-        ` selected=${result.selected} rule=${breakdownIsRelevant(result.rules) ? 'RELEVANT' : 'NOT_RELEVANT'}`,
+        ` selected=${result.selected} lexical=${breakdownIsRelevant(result.rules) ? 'RELEVANT' : 'NOT_RELEVANT'}`,
       )
       if (result.eligible !== 1) {
         failures.push(`"${query}" / "${memory}": eligible=${result.eligible}`)
@@ -503,15 +516,16 @@ async function testRequiredQueriesAcrossStoredWordings(): Promise<void> {
     }
   }
 
-  assert(failures.length === 0, `the wording matrix disagreed with the rule: ${failures.join('; ')}`)
+  assert(failures.length === 0, `the wording matrix disagreed with the working set: ${failures.join('; ')}`)
   console.log(`[RETRIEVAL_GAP] wordingMatrixRows=${rows.length}`)
 }
 
 /**
- * The historical lexical miss is still measurable, and every such self-identity
- * miss is recovered by the bounded record-aware bridge.
+ * The historical lexical miss is still measurable — it just no longer hides the
+ * record. `evaluateMemoryRelevance` reports the bridge for exactly those pairs,
+ * and every one of them is provided to the final model.
  */
-async function testHistoricalLexicalMissesUseTheBridge(): Promise<void> {
+async function testHistoricalLexicalMissesAreNoLongerAGate(): Promise<void> {
   const unreachable = '我叫 AlphaTest'
   const sharedTerm: string[] = []
   const noSharedTerm: string[] = []
@@ -523,12 +537,8 @@ async function testHistoricalLexicalMissesUseTheBridge(): Promise<void> {
       sharedTerm.push(query)
     } else {
       noSharedTerm.push(query)
-      assert(result.selected === 1, `"${query}" was not recovered by the self-identity bridge`)
-      assert(
-        result.rules.tokenOverlap === 0 && result.rules.maxChineseOverlap < 3 && result.rules.chineseTwoGramMatches < 2,
-        `"${query}" has a rule trigger that was not accounted for: ${formatBreakdown(result.rules)}`,
-      )
     }
+    assert(result.selected === 1, `"${query}" did not carry the authorized record into the working set`)
   }
 
   console.log(
@@ -542,10 +552,10 @@ async function testHistoricalLexicalMissesUseTheBridge(): Promise<void> {
 }
 
 /**
- * Not a capacity effect: the same one eligible record is now selected without
- * changing either eligibility (30) or final injection (4) limits.
+ * Not a capacity effect: the eligible count and the working-set count are both
+ * reported, and the historical explicit candidate limit is untouched.
  */
-async function testBridgeDoesNotChangeCapacityLimits(): Promise<void> {
+async function testWorkingSetDoesNotChangeCapacityLimits(): Promise<void> {
   const harness = createHarness()
   seed(harness.store, {
     memoryId: 'gap-codename',
@@ -563,8 +573,8 @@ async function testBridgeDoesNotChangeCapacityLimits(): Promise<void> {
   const result = await retrieve(harness, '我的代号是什么？')
   assert(result.personalCount === 1, `eligible count changed: ${result.personalCount}`)
   assert(result.groupCount === 0, `an unexpected group record was eligible: ${result.groupCount}`)
-  assert(result.selectedCount === 1, `the bridged fact was not selected: selectedCount=${result.selectedCount}`)
-  assert(result.items[0]?.content.includes(CODENAME) === true, 'the selected fact lost its content')
+  assert(result.selectedCount === 1, `the bridged fact was not provided: selectedCount=${result.selectedCount}`)
+  assert(result.items[0]?.content.includes(CODENAME) === true, 'the provided fact lost its content')
   assert(
     result.diagnostic.includes('result=PASS'),
     'a retrieval outcome was reported as a store failure',
@@ -572,9 +582,9 @@ async function testBridgeDoesNotChangeCapacityLimits(): Promise<void> {
 }
 
 /**
- * Retrieval is the only stage that drops the fact: the record stays persisted,
- * enabled and readable through a scope query, and a corrupt store is a different,
- * explicitly reported failure mode that injects nothing.
+ * Retrieval no longer drops a fact for wording, so the remaining drop reasons are
+ * the ones that must stay: a corrupt store fails closed and injects nothing, and
+ * a soft-deleted record leaves the working set.
  */
 async function testTheFactIsPersistedAndScopeReadableThroughout(): Promise<void> {
   const harness = createHarness()
@@ -587,8 +597,8 @@ async function testTheFactIsPersistedAndScopeReadableThroughout(): Promise<void>
 
   await retrieve(harness, '我的代号是什么？')
 
-  assert(harness.store.isEnabled, 'the store disabled itself during a bridged read')
-  assert(harness.store.liveRecordCount === 1, 'the bridged read changed the stored record count')
+  assert(harness.store.isEnabled, 'the store disabled itself during a working-set read')
+  assert(harness.store.liveRecordCount === 1, 'the working-set read changed the stored record count')
 
   const document = JSON.parse(readFileSync(memoryFileIn(harness.directory), 'utf8')) as {
     records: Array<{ content: string; isDeleted: boolean }>
@@ -597,8 +607,13 @@ async function testTheFactIsPersistedAndScopeReadableThroughout(): Promise<void>
   assert(stored !== undefined, 'the codename fact is no longer on disk')
   assert(stored.isDeleted === false, 'the codename fact was soft deleted by a read')
 
-  // A corrupted store is a different failure mode and must not be confused with
-  // the retrieval gap: it injects nothing and reports the store as unavailable.
+  // A soft-deleted record is not authorized, so it cannot be in the working set.
+  assert(harness.store.delete('gap-codename', 2), 'the soft delete failed')
+  const afterDelete = await retrieve(harness, '我的代号是什么？')
+  assert(afterDelete.selectedCount === 0, 'a soft-deleted record entered the working set')
+
+  // A corrupted store is a different failure mode: it injects nothing and
+  // reports the store as unavailable instead of degrading into "no memory".
   const corruptDirectory = tempDir()
   writeFileSync(memoryFileIn(corruptDirectory), '{ "version": 1, "records": [ { broken', 'utf8')
   const corruptLogs: string[] = []
@@ -646,8 +661,10 @@ function relevanceRecord(content: string, scopeType: MemoryScopeType = 'MEMBER',
 }
 
 /**
- * Target contract: only a current-requester self-identity question may bridge
- * the narrow lexical gap, and only to a current-requester self-identity record.
+ * Target contract, unchanged: only a current-requester self-identity question
+ * may bridge the narrow lexical gap, and only to a current-requester
+ * self-identity record. The rule is still exact — it is simply no longer what
+ * decides whether the model may read the record.
  */
 async function testSelfIdentityLexicalConvergenceContract(): Promise<void> {
   const failures: string[] = []
@@ -683,8 +700,15 @@ async function testSelfIdentityLexicalConvergenceContract(): Promise<void> {
   const nonSelfQueries = ['这个项目叫什么？', '服务器代号是什么？', '这个接口叫什么名字？'] as const
   for (const query of nonSelfQueries) {
     const result = await probe(query, PARAPHRASED_FACT)
-    if (result.selected !== 0) {
-      failures.push(`non-self query="${query}" selected=${result.selected}`)
+    if (result.selected !== 1) {
+      failures.push(`authorized record was withheld for a non-self query="${query}" selected=${result.selected}`)
+    }
+    const effective = evaluateMemoryRelevance(query, relevanceRecord(PARAPHRASED_FACT), {
+      requesterId: REQUESTER_A,
+      personalScopeType: 'MEMBER',
+    })
+    if (effective.reason === 'SELF_IDENTITY_ATTRIBUTE_BRIDGE') {
+      failures.push(`the bridge fired for a non-self query="${query}"`)
     }
   }
   const serverMismatch = evaluateMemoryRelevance(
@@ -702,11 +726,20 @@ async function testSelfIdentityLexicalConvergenceContract(): Promise<void> {
     ['服务器名称是 DB-PROD-01', '我的名字是什么？'],
   ] as const) {
     const result = await probe(query, memory)
-    if (result.selected !== 0) {
+    if (result.selected !== 1 || result.selectedContent !== memory) {
       failures.push(`non-self memory="${memory}" query="${query}" selected=${result.selected}`)
+    }
+    const effective = evaluateMemoryRelevance(query, relevanceRecord(memory), {
+      requesterId: REQUESTER_A,
+      personalScopeType: 'MEMBER',
+    })
+    if (effective.reason === 'SELF_IDENTITY_ATTRIBUTE_BRIDGE') {
+      failures.push(`the bridge fired for a non-self memory="${memory}" query="${query}"`)
     }
   }
 
+  // Authorization is still the gate that matters: another requester's personal
+  // memory is not eligible and therefore cannot be provided either.
   const isolated = createHarness()
   seed(isolated.store, {
     memoryId: 'other-requester',
@@ -723,7 +756,7 @@ async function testSelfIdentityLexicalConvergenceContract(): Promise<void> {
 
   const conflict = createHarness()
   seed(conflict.store, {
-    memoryId: "memory-test-alpha",
+    memoryId: 'memory-test-alpha',
     scopeType: 'MEMBER',
     scopeId: REQUESTER_A,
     content: PARAPHRASED_FACT,
@@ -736,27 +769,27 @@ async function testSelfIdentityLexicalConvergenceContract(): Promise<void> {
   })
   const conflictResult = await retrieve(conflict, '我叫什么？')
   if (
-    conflictResult.selectedCount !== 1 ||
-    conflictResult.items[0]?.content.includes(CODENAME) !== true ||
-    conflictResult.items.some((item) => item.content.includes('Apollo'))
+    conflictResult.selectedCount !== 2 ||
+    conflictResult.items.some((item) => item.content.includes(CODENAME)) !== true ||
+    conflictResult.items.some((item) => item.content.includes('Apollo')) !== true
   ) {
     failures.push(
-      `mixed-candidates selected=${conflictResult.selectedCount}` +
+      `authorized working set selected=${conflictResult.selectedCount}` +
       ` contents=${conflictResult.items.map((item) => item.content).join('|') || 'NONE'}`,
     )
   }
 
-  assert(failures.length === 0, `self-identity convergence failed: ${failures.join('; ')}`)
+  assert(failures.length === 0, `self-identity lexical convergence failed: ${failures.join('; ')}`)
 }
 
 // ------------------------------------------------------------------ execution
 
 const CASES: Array<[string, () => Promise<void>]> = [
   ['synthetic-field-shape-against-required-queries', testSyntheticFieldShapeAgainstRequiredQueries],
-  ['previously-unreachable-wording-uses-the-bridge', testPreviouslyUnreachableWordingUsesTheBridge],
+  ['lexically-unreachable-wording-is-still-provided', testLexicallyUnreachableWordingIsStillProvided],
   ['required-queries-across-stored-wordings', testRequiredQueriesAcrossStoredWordings],
-  ['historical-lexical-misses-use-the-bridge', testHistoricalLexicalMissesUseTheBridge],
-  ['bridge-does-not-change-capacity-limits', testBridgeDoesNotChangeCapacityLimits],
+  ['lexical-misses-are-no-longer-a-gate', testHistoricalLexicalMissesAreNoLongerAGate],
+  ['working-set-does-not-change-capacity-limits', testWorkingSetDoesNotChangeCapacityLimits],
   ['fact-stays-persisted-and-scope-readable', testTheFactIsPersistedAndScopeReadableThroughout],
   ['self-identity-lexical-convergence', testSelfIdentityLexicalConvergenceContract],
 ]

@@ -5,10 +5,21 @@
  * embeddings, no vector store. A candidate is relevant when the question is an
  * exact substring of the memory, or an ASCII token overlaps, or a Chinese
  * 3+ gram overlaps, or two Chinese 2-grams overlap; ranking is score desc, then
- * `updatedAt` desc, then `memoryId` asc, truncated to `topK`.
+ * `updatedAt` desc, then `memoryId` asc.
  *
  * The port keeps the same constants, stop words, weights and tie-breaking so the
  * retrieval decision is reproducible across both implementations.
+ *
+ * CURRENT_MIGRATION_DECISION: this rule is no longer a visibility gate. The
+ * historical `filterAndRank` — score, rank and drop everything below the rule —
+ * was removed when retrieval became the contextual working set
+ * (`authorized-memory-working-set.ts`), where authorization decides what the
+ * model may read and the final model decides what is relevant. What remains here
+ * is the rule as a pure classification (`evaluateRelevance` /
+ * `evaluateMemoryRelevance`), used as a deterministic BUDGET tiebreaker, plus
+ * the narrow self-identity bridge that the same budget ordering scores.
+ * Reintroducing a threshold that hides an authorized memory from the model is a
+ * regression, not an optimisation.
  */
 import type { MemoryRecord } from './memory-models.js'
 
@@ -195,9 +206,18 @@ function compact(text: string): string {
   return normalize(text).replace(/[^\p{L}\p{N}]+/gu, '')
 }
 
+/** Remove only the allowed sentence-ending question punctuation/particles. */
+function normalizeSelfIdentityQuery(question: string): string {
+  let text = question.trim()
+  while (/[?？]$/u.test(text) || /[呀啊呢嘛]$/u.test(text)) {
+    text = text.slice(0, -1).trim()
+  }
+  return text
+}
+
 /** Closed detection for questions about the current speaker's own name/codename. */
 export function isCurrentSelfIdentityQuery(question: string): boolean {
-  const text = compact(question)
+  const text = compact(normalizeSelfIdentityQuery(question))
   if (text.length === 0) {
     return false
   }
@@ -205,7 +225,9 @@ export function isCurrentSelfIdentityQuery(question: string): boolean {
     /我的(?:代号|名字|姓名|昵称|称呼)/u.test(text) ||
     /我叫什么(?:代号|名字|姓名|昵称|称呼)?(?:吗|呢|来着)?$/u.test(text) ||
     /(?:怎么|如何)称呼我(?:吗|呢)?$/u.test(text) ||
-    /(?:叫我什么|称呼我什么)(?:代号|名字|姓名|昵称|称呼)?(?:吗|呢)?$/u.test(text)
+    /(?:叫我什么|称呼我什么)(?:代号|名字|姓名|昵称|称呼)?(?:吗|呢)?$/u.test(text) ||
+    /我是谁(?:吗|呢)?$/u.test(text) ||
+    /(?:你知道|你还记得|你了解|你清楚)我是谁(?:吗|呢)?$/u.test(text)
   )
 }
 
@@ -291,35 +313,4 @@ export function evaluateMemoryRelevance(
   return bridge.matched
     ? { score: lexical.score + bridge.bonus, isRelevant: true, reason: bridge.reason }
     : lexical
-}
-
-export function filterAndRank(
-  question: string,
-  eligible: readonly MemoryRecord[],
-  topK: number,
-  identityContext?: MemoryRetrievalIdentityContext,
-): MemoryRecord[] {
-  if (topK <= 0 || eligible.length === 0) {
-    return []
-  }
-
-  return eligible
-    .map((record) => ({
-      record,
-      relevance: identityContext === undefined
-        ? evaluateRelevance(question, record.content)
-        : evaluateMemoryRelevance(question, record, identityContext),
-    }))
-    .filter((item) => item.relevance.isRelevant && item.relevance.score > 0)
-    .sort((left, right) => {
-      if (right.relevance.score !== left.relevance.score) {
-        return right.relevance.score - left.relevance.score
-      }
-      if (right.record.updatedAt !== left.record.updatedAt) {
-        return right.record.updatedAt - left.record.updatedAt
-      }
-      return left.record.memoryId < right.record.memoryId ? -1 : left.record.memoryId > right.record.memoryId ? 1 : 0
-    })
-    .slice(0, topK)
-    .map((item) => item.record)
 }

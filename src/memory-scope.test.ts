@@ -16,6 +16,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { runRawAgentPipeline, toAgentRequest, type AgentRequest } from './agent-adapter.js'
+import { MENTION_SEPARATOR } from './canonical-user-text.js'
 import { buildUserPrompt, type ChatRequestContext } from './chat.js'
 import { normalizeRawHookMessage, type InboundMessage, type RawHookMessage } from './message-contract.js'
 import type { GroupMessage } from './context.js'
@@ -56,6 +57,20 @@ function cleanup(): void {
     }
   }
 }
+
+/**
+ * The runtime facts a real GROUP request carries into the explicit-memory entry.
+ *
+ * A persistent memory side effect is only admitted when the runtime confirmed a
+ * trusted bot mention token for this message, so a direct service call in a test has
+ * to state the same facts the Agent would (see `bot-mention-span.test.ts` for the
+ * boundary itself, including the absent and invalid cases).
+ */
+const TRUSTED_BOT_MENTION = {
+  mentionState: 'MENTIONED',
+  botMentionSpanTrust: 'VALID',
+  botMentionSpanCount: 1,
+} as const
 
 function sequentialIds(): () => string {
   let counter = 0
@@ -222,7 +237,20 @@ interface TurnOptions {
   msgId?: string
   isMentioned?: boolean
   ownerDisplayName?: string
+  /**
+   * True when this turn's wire body carries a REAL bot mention token in front of the
+   * text, plus the span that identifies it.
+   *
+   * A persistent memory side effect is only admitted when the runtime confirmed a
+   * trusted bot mention token, so a write fixture has to be a real
+   * `@<display name><U+2005>command` body — the `@椰椰 ` with a plain space used by the
+   * older fixtures is hand-typed text and never was a token.
+   */
+  botMention?: boolean
 }
+
+/** The runtime's real mention token for the synthetic display name used here. */
+const BOT_MENTION_TOKEN = `@椰椰${MENTION_SEPARATOR}`
 
 interface Session {
   ask(options?: TurnOptions): Promise<{ request: AgentRequest; reply: string }>
@@ -238,16 +266,20 @@ function createSession(service: MemoryService, chat: CapturingChatService): Sess
   return {
     async ask(options: TurnOptions = {}) {
       counter += 1
+      const body = options.text ?? '@椰椰 你好'
       const raw = groupRaw({
         from: options.conversationId ?? 'room-a@chatroom',
         conversationId: options.conversationId ?? 'room-a@chatroom',
         signature: options.signature ?? 'sig-a',
         msgId: options.msgId ?? `memory-message-${counter}`,
-        content: options.text ?? '@椰椰 你好',
+        content: options.botMention === true ? `${BOT_MENTION_TOKEN}${body}` : body,
         isMentioned: options.isMentioned ?? true,
         requesterRole: options.role ?? 'MEMBER',
         ownerConfigured: (options.role ?? 'MEMBER') === 'OWNER',
         ownerDisplayName: options.ownerDisplayName,
+        botMentionSpans: options.botMention === true
+          ? [{ start: 0, length: BOT_MENTION_TOKEN.length }]
+          : undefined,
       })
       const request = toAgentRequest(validMessage(raw))
       const reply = await agent.complete(request)
@@ -496,6 +528,7 @@ async function testExplicitRememberHistoricalBehavior(): Promise<void> {
     requesterId: 'sig-o',
     requesterRole: 'OWNER',
     question: '记住我的代号是 Alpha',
+    ...TRUSTED_BOT_MENTION,
   })
   assert(owner.handled && owner.reply === '记住了。', `unexpected explicit result: ${JSON.stringify(owner)}`)
   const personal = harness.store.retrieve([{ scopeType: 'OWNER', scopeId: 'sig-o', visibility: 'SHARED' }], 10)
@@ -508,6 +541,7 @@ async function testExplicitRememberHistoricalBehavior(): Promise<void> {
     requesterId: 'sig-o',
     requesterRole: 'OWNER',
     question: '记住以后这个群活动时间是周五',
+    ...TRUSTED_BOT_MENTION,
   })
   assert(groupScoped.handled, 'the group-scoped explicit request was not handled')
   const group = harness.store.retrieve([{ scopeType: 'GROUP', scopeId: 'room-a@chatroom', visibility: 'SHARED' }], 10)
@@ -520,6 +554,7 @@ async function testExplicitRememberHistoricalBehavior(): Promise<void> {
     requesterId: 'sig-a',
     requesterRole: 'MEMBER',
     question: '记住我的代号是 Alpha',
+    ...TRUSTED_BOT_MENTION,
   })
   assert(member.handled === false, 'a member triggered the owner-only explicit path')
 
@@ -530,6 +565,7 @@ async function testExplicitRememberHistoricalBehavior(): Promise<void> {
     requesterId: 'private-a',
     requesterRole: 'OWNER',
     question: '记住我的代号是 Alpha',
+    ...TRUSTED_BOT_MENTION,
   })
   assert(direct.handled === false, 'DIRECT memory was enabled')
 }
@@ -739,8 +775,9 @@ async function testReasoningNeverPersisted(): Promise<void> {
     requesterId: 'sig-o',
     requesterRole: 'OWNER',
     question: '记住我的代号是 Alpha',
+    ...TRUSTED_BOT_MENTION,
   })
-  assert(explicit.reply === '先不改。', 'a reasoning-only mutation was accepted')
+  assert(explicit.reply === '这条记忆没有保存成功。', 'a reasoning-only mutation was accepted')
   assert(mutationRecordCount(mutation.service) === 0, 'a reasoning-only mutation wrote memory')
 }
 
@@ -758,8 +795,8 @@ async function testRawIdentityNeverReachesProvider(): Promise<void> {
   for (const raw of ['sig-a', 'room-a@chatroom', 'shared-account-wxid']) {
     assert(!prompt.includes(raw), `a raw identity reached the provider prompt: ${raw}`)
   }
-  assert(prompt.includes('[Relevant Personal Memory]'), 'the personal memory section is missing')
-  assert(prompt.includes('[Relevant Group Memory]'), 'the group memory section is missing')
+  assert(prompt.includes('[Authorized Personal Memory]'), 'the personal memory section is missing')
+  assert(prompt.includes('[Authorized Group Memory]'), 'the group memory section is missing')
   assert(prompt.includes('A 的代号是 Alpha'), 'personal memory content is missing from the prompt')
   assert(prompt.includes('本群活动时间是周五'), 'group memory content is missing from the prompt')
   assert(MemoryText.forModel('联系 wxid_abc123 那个人') === '联系 群成员 那个人', 'the raw identity mask changed')
@@ -771,7 +808,7 @@ async function testRawIdentityNeverLogged(): Promise<void> {
     mutateResponse: '{"operation":"ADD","target":null,"content":"我的代号是 Alpha","scope":"OWNER"}',
   })
   const chat = createChatService()
-  await turn(harness.service, chat, { signature: 'sig-o', role: 'OWNER', text: '记住我的代号是 Alpha', ownerDisplayName: 'Boss' })
+  await turn(harness.service, chat, { signature: 'sig-o', role: 'OWNER', text: '记住我的代号是 Alpha', ownerDisplayName: 'Boss', botMention: true })
   await turn(harness.service, chat, { signature: 'sig-a', role: 'MEMBER', text: '我的代号是什么' })
 
   const text = harness.textOf()
@@ -876,8 +913,8 @@ async function testRecentContextSeparatedFromMemory(): Promise<void> {
   const prompt = buildUserPrompt(chat.calls[1]!.context, chat.calls[1]!.question, chat.calls[1]!.request)
   assert(prompt.includes('[Recent Group Context]'), 'the recent context section is missing')
   assert(prompt.includes('今天天气不错'), 'the recent context lost the earlier message')
-  assert(prompt.includes('[Relevant Personal Memory]\n（无）'), 'an empty personal memory section is not explicit')
-  assert(prompt.includes('[Relevant Group Memory]\n（无）'), 'an empty group memory section is not explicit')
+  assert(prompt.includes('[Authorized Personal Memory]\n（无）'), 'an empty personal memory section is not explicit')
+  assert(prompt.includes('[Authorized Group Memory]\n（无）'), 'an empty group memory section is not explicit')
 }
 
 /** 29. Two members in one room are never conflated in memory or transcript. */
@@ -1037,6 +1074,7 @@ async function testDirectMemoryDisabled(): Promise<void> {
     requesterId: 'private-a',
     requesterRole: 'OWNER',
     question: '记住我的代号是 Alpha',
+    ...TRUSTED_BOT_MENTION,
   })
   assert(explicit.handled === false, 'DIRECT explicit remember was enabled')
 }
@@ -1101,6 +1139,7 @@ async function runRestartChild(phase: string): Promise<void> {
       requesterId: 'sig-a',
       requesterRole: 'OWNER',
       question: '记住我的代号是 Alpha',
+      ...TRUSTED_BOT_MENTION,
     })
     console.log(`[MEMORY_RESTART_CHILD] phase=write handled=${result.handled} records=${service.recordCount}`)
   } else {

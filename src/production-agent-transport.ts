@@ -3,11 +3,13 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import {
   runRawAgentPipeline,
+  runRawPassiveContextPipeline,
   type AgentExecutor,
   type AgentPipelineResult,
   type OutboundCommand,
+  type PassivePipelineResult,
 } from './agent-adapter.js'
-import type { RawHookMessage } from './message-contract.js'
+import { PASSIVE_CONTEXT_KIND, type RawHookMessage } from './message-contract.js'
 import {
   identityToken,
   logRequesterIdentity,
@@ -31,22 +33,33 @@ export interface ProductionAgentTransportOptions {
 
 export interface ProductionTransportSummaryEntry {
   messageId: string
-  status: AgentPipelineResult['status']
+  status: AgentPipelineResult['status'] | PassivePipelineResult['status']
   agentCalled: boolean
   outboundGenerated: boolean
   conversationType?: OutboundCommand['conversationType']
   conversationId?: string
   text?: string
+  /** True for a passive ambient event. Such an entry never carries an outbound. */
+  passiveContext?: boolean
 }
 
-interface InboundEnvelope {
-  kind: 'INBOUND_MESSAGE'
-  message: RawHookMessage
-}
+/**
+ * Two envelope kinds, two authorities.
+ *
+ * `INBOUND_MESSAGE` is the active request the runtime admitted. The additive
+ * `PASSIVE_CONTEXT_ONLY` kind is group ambience: no admission, no request and no
+ * reply — an older Agent that does not know the kind rejects it instead of
+ * treating group chatter as something it was asked.
+ */
+type InboundEnvelope =
+  | { kind: 'INBOUND_MESSAGE'; message: RawHookMessage }
+  | { kind: typeof PASSIVE_CONTEXT_KIND; message: RawHookMessage }
 
 type AgentResponse =
   | { kind: 'NO_REPLY'; reason?: string }
   | { kind: 'ERROR'; code: string; message?: string }
+  | { kind: 'CONTEXT_ACCEPTED' }
+  | { kind: 'CONTEXT_NOT_ACCEPTED'; reason?: string }
   | ({ kind: 'OUTBOUND_COMMAND' } & OutboundCommand)
 
 /**
@@ -243,6 +256,16 @@ export class ProductionAgentTransportServer {
     // Its return value is deliberately discarded — the observer stays a pure
     // observation and never feeds the pipeline.
     logRequesterIdentity(identity)
+
+    if (envelope.kind === PASSIVE_CONTEXT_KIND) {
+      await this.processPassiveContext(socket, envelope.message, identity)
+      if (this.options.maxMessages !== undefined && this.messageCount >= this.options.maxMessages) {
+        socket.end()
+        await this.stop()
+      }
+      return
+    }
+
     const result = await runRawAgentPipeline(envelope.message, this.options.agent)
     const entry = toSummaryEntry(envelope.message, result)
     this.summary.push(entry)
@@ -286,6 +309,49 @@ export class ProductionAgentTransportServer {
     }
   }
 
+  /**
+   * One passive ambient event.
+   *
+   * Structurally separate from the active path: it never consults
+   * `invalidOutboundMessageId`, never reaches `toAgentResponse` and has no
+   * response shape that carries an outbound command. Delivery and model
+   * invocation are therefore separable facts — `CONTEXT_ACCEPTED` means "the
+   * ambience was stored", not "the Agent was asked anything".
+   */
+  private async processPassiveContext(
+    socket: Socket,
+    raw: RawHookMessage,
+    identity: RequesterIdentityFields,
+  ): Promise<void> {
+    const result = await runRawPassiveContextPipeline(raw, this.options.agent)
+    const entry: ProductionTransportSummaryEntry = {
+      messageId: raw.msgId.toString(),
+      status: result.status,
+      agentCalled: false,
+      outboundGenerated: false,
+      passiveContext: true,
+    }
+    this.summary.push(entry)
+
+    const response: AgentResponse = result.status === 'PASSIVE_CONTEXT'
+      ? { kind: 'CONTEXT_ACCEPTED' }
+      : { kind: 'CONTEXT_NOT_ACCEPTED', reason: passiveDropReason(result) }
+
+    this.persistentSink?.writeStructured(
+      'INBOUND_DISPATCHED',
+      {
+        result: response.kind,
+        phase: 'passive-context',
+        conversationType: identity.conversationType,
+        msgIdToken: this.persistentLog?.shortIdFor(raw.msgId) ?? 'NONE',
+        conversationToken: identityToken(identity.conversationId),
+        requesterToken: identityToken(identity.requesterId),
+      },
+      `status=${result.status} agentInvoked=false outbound=false`,
+    )
+    await writeResponse(socket, response)
+  }
+
   private async writeSummary(): Promise<void> {
     if (!this.options.summaryPath) {
       return
@@ -298,7 +364,11 @@ export class ProductionAgentTransportServer {
 }
 
 function parseInboundEnvelope(value: unknown): InboundEnvelope {
-  if (!isRecord(value) || value.kind !== 'INBOUND_MESSAGE') {
+  if (!isRecord(value)) {
+    throw new Error('Inbound kind is invalid')
+  }
+  const kind = value.kind
+  if (kind !== 'INBOUND_MESSAGE' && kind !== PASSIVE_CONTEXT_KIND) {
     throw new Error('Inbound kind is invalid')
   }
   if (!isRecord(value.message)) {
@@ -328,7 +398,26 @@ function parseInboundEnvelope(value: unknown): InboundEnvelope {
     throw new Error('Inbound ownerConfigured is invalid')
   }
 
-  return { kind: 'INBOUND_MESSAGE', message: raw as unknown as RawHookMessage }
+  return { kind, message: raw as unknown as RawHookMessage }
+}
+
+/**
+ * Why a passive event was not captured. A closed set of enum-like codes: the
+ * operator needs to know that ambience was lost, and the reason must never be the
+ * message body, a conversation id or a sender id.
+ */
+function passiveDropReason(result: PassivePipelineResult): string {
+  switch (result.status) {
+    case 'INVALID':
+    case 'UNSUPPORTED':
+      return result.normalization.reason
+    case 'PASSIVE_CONTEXT_UNSUPPORTED':
+      return 'PASSIVE_CONTEXT_SINK_UNSUPPORTED'
+    case 'PASSIVE_CONTEXT_ERROR':
+      return 'PASSIVE_CONTEXT_APPEND_FAILED'
+    default:
+      return 'PASSIVE_CONTEXT_NOT_CAPTURED'
+  }
 }
 
 /** Runtime identity decision fields carried by the C# wire contract. */

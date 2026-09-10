@@ -16,10 +16,14 @@
  *    person asking;
  *  - a runtime field name, raw requester/sender/conversation id or token is never
  *    guessed away: nothing is sent.
+ *  - an ungrounded self-identity answer that turns authorization into a social
+ *    role is blocked for one bounded regeneration; ordinary quoted language is
+ *    outside that mode.
  *
  * Like every other identity-safe diagnostic in this Agent, the guard reports kinds
  * and counts only. It never puts a detected label or raw value into a log line.
  */
+import { ASSISTANT_LABEL, CURRENT_REQUESTER_LABEL } from './group-ambient-context.js'
 import { isInternalSpeakerLabel } from './speaker-labels.js'
 
 /** Why a draft was touched. Kinds are safe to log; values are not. */
@@ -28,6 +32,7 @@ export type InternalLeakKind =
   | 'SPEAKER_LABEL_OTHER'
   | 'SPEAKER_LABEL_CONFLATION'
   | 'INTERNAL_FIELD_NAME'
+  | 'UNGROUNDED_IDENTITY_CLAIM'
   | 'INTERNAL_VALUE'
 
 export interface InternalLeakCount {
@@ -44,6 +49,9 @@ export interface AnswerGuardFacts {
   speakerLabels?: readonly string[]
   /** Runtime-only raw values (requester id, sender id, conversation id, tokens). */
   internalValues?: readonly string[]
+  /** Grounding facts for the narrow current-requester identity path. */
+  selfIdentityQuery?: boolean
+  retrievedPersonalMemoryCount?: number
 }
 
 export interface AnswerGuardResult {
@@ -95,18 +103,31 @@ export const CURRENT_SPEAKER_PHRASE = '正在和我说话的人'
 /** Natural phrase used where another member's label was rendered. */
 export const OTHER_MEMBER_PHRASE = '群里的另一位成员'
 
-/** Pseudonymous label shape, matched even when this conversation never used it. */
-const SPEAKER_LABEL_PATTERN = /MEMBER_\d+/gi
+/**
+ * Pseudonymous label shape, matched even when this conversation never used it.
+ *
+ * `AMBIENT_SPEAKER` must stay ahead of `SPEAKER` in the alternation: the ambient
+ * namespace is a distinct one, and a match that started one character later would
+ * leave a bare `AMBIENT_` behind in the reply.
+ */
+const SPEAKER_LABEL_PATTERN = /(?:AMBIENT_SPEAKER|MEMBER|SPEAKER)_\d+/gi
+
+/** Natural phrase used where the bot's own ambient label was rendered. */
+export const ASSISTANT_SELF_PHRASE = '我'
 
 const FIELD_ALTERNATION = INTERNAL_FIELD_NAMES.join('|')
 const FIELD_PREFIX_PATTERN = new RegExp(`(?:${FIELD_ALTERNATION})\\s*[=:：]\\s*`, 'gi')
 const FIELD_ANY_PATTERN = new RegExp(`(?:${FIELD_ALTERNATION})`, 'i')
+
+/** These terms are unsafe only for an ungrounded self-identity answer. */
+const UNGROUNDED_IDENTITY_CLAIM_PATTERN = /主人|群主|管理员|老板/gu
 
 const DETECTION_ORDER: readonly InternalLeakKind[] = [
   'SPEAKER_LABEL_CURRENT',
   'SPEAKER_LABEL_OTHER',
   'SPEAKER_LABEL_CONFLATION',
   'INTERNAL_FIELD_NAME',
+  'UNGROUNDED_IDENTITY_CLAIM',
   'INTERNAL_VALUE',
 ]
 
@@ -181,6 +202,23 @@ function rewriteOtherLabel(text: string, label: string): LabelRewrite {
 }
 
 /**
+ * Replaces one ambient-transcript label with a natural phrase.
+ *
+ * The ambient labels are resolved before the pseudonym loop, and by meaning
+ * rather than by position: `CURRENT_REQUESTER` is the person asking, so a
+ * third-person rewrite would misattribute their own words, and `ASSISTANT` is
+ * this bot, not "another member".
+ */
+function rewriteAmbientLabel(text: string, label: string, phrase: string): LabelRewrite {
+  let rewritten = 0
+  const next = text.replace(new RegExp(`\\s*${escapeRegExp(label)}\\s*`, 'gu'), () => {
+    rewritten += 1
+    return phrase
+  })
+  return { text: next, rewritten }
+}
+
+/**
  * Inspects a final answer and returns the text that may be sent.
  *
  * `CLEAN` returns the draft untouched (trimmed); `REWRITTEN` returns a safe
@@ -212,6 +250,21 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
   let text = input
   let blocked = false
   let regenerable = true
+
+  // Ambient-section labels first, and by meaning: they are runtime vocabulary with
+  // a known referent, so they resolve to a natural phrase instead of being folded
+  // into the pseudonym loop, where `CURRENT_REQUESTER` would have been rewritten
+  // as "another member" — the exact misattribution this guard exists to prevent.
+  const requesterLabel = rewriteAmbientLabel(text, CURRENT_REQUESTER_LABEL, CURRENT_SPEAKER_PHRASE)
+  if (requesterLabel.rewritten > 0) {
+    bump('SPEAKER_LABEL_CURRENT', requesterLabel.rewritten)
+    text = requesterLabel.text
+  }
+  const assistantLabel = rewriteAmbientLabel(text, ASSISTANT_LABEL, ASSISTANT_SELF_PHRASE)
+  if (assistantLabel.rewritten > 0) {
+    bump('SPEAKER_LABEL_OTHER', assistantLabel.rewritten)
+    text = assistantLabel.text
+  }
 
   // A raw identity value is never rewritten into a guess and never handed back to
   // a provider: the whole reply fails closed, exactly like an unterminated
@@ -266,8 +319,19 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
     blocked = true
   }
 
+  if (facts.selfIdentityQuery === true && facts.retrievedPersonalMemoryCount === 0) {
+    const claims = [...text.matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
+    if (claims > 0) {
+      bump('UNGROUNDED_IDENTITY_CLAIM', claims)
+      blocked = true
+    }
+  }
+
   // Re-scan: nothing rewritten above may survive, and nothing may be re-created by
-  // the replacements themselves.
+  // the replacements themselves. The module-level pattern is stateful (`g`), so
+  // its position is reset first: a stale `lastIndex` from an earlier reply would
+  // let a label through the very check that exists to stop it.
+  SPEAKER_LABEL_PATTERN.lastIndex = 0
   if (SPEAKER_LABEL_PATTERN.test(text)) {
     bump('SPEAKER_LABEL_OTHER')
     blocked = true

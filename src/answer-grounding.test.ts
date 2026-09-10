@@ -373,8 +373,8 @@ async function testMemoryZeroForbidsLongTermClaims(): Promise<void> {
     assert(call.user.includes('RETRIEVED_MEMORY_COUNT=0'), 'the prompt does not state that nothing was retrieved')
     assert(call.user.includes('RETRIEVED_MEMORY_PRESENT=false'), 'retrieved memory presence is not stated')
     assert(call.user.includes('PERSISTENT_MEMORY_AVAILABLE=true'), 'the available persistent store is not stated')
-    assert(call.user.includes('[Relevant Personal Memory]\n（无）'), 'an empty personal memory section is not explicit')
-    assert(call.user.includes('[Relevant Group Memory]\n（无）'), 'an empty group memory section is not explicit')
+    assert(call.user.includes('[Authorized Personal Memory]\n（无）'), 'an empty personal memory section is not explicit')
+    assert(call.user.includes('[Authorized Group Memory]\n（无）'), 'an empty group memory section is not explicit')
 
     const systemPrompt = buildSystemPrompt('椰椰')
     assert(
@@ -404,7 +404,7 @@ async function testRetrievedCodenameIsAnswerable(): Promise<void> {
     assert(call.user.includes('RETRIEVED_MEMORY_COUNT=1'), 'the retrieved memory count is wrong')
     assert(call.user.includes('RETRIEVED_MEMORY_PRESENT=true'), 'retrieved memory presence is not stated')
     assert(
-      call.user.includes('[Relevant Personal Memory]\n- 用户代号是 AlphaTest'),
+      call.user.includes('[Authorized Personal Memory]\n- 用户代号是 AlphaTest'),
       'the retrieved codename did not reach the personal memory section',
     )
     assert(reply === '你的代号是 AlphaTest。', `a grounded codename answer was altered: ${reply}`)
@@ -453,14 +453,15 @@ async function testRetentionPolicyIsNeverInvented(): Promise<void> {
     const facts = runtimeFactLines(call.user)
     assert(
       facts.map((line) => line.split('=')[0]).join(',') ===
-        'CURRENT_CONTEXT_PRESENT,RETRIEVED_MEMORY_PRESENT,RETRIEVED_MEMORY_COUNT,PERSISTENT_MEMORY_AVAILABLE,RETENTION_POLICY_PROVIDED',
+        'SELF_IDENTITY_QUERY,CURRENT_CONTEXT_PRESENT,RETRIEVED_MEMORY_PRESENT,RETRIEVED_MEMORY_COUNT,PERSISTENT_MEMORY_AVAILABLE,RETENTION_POLICY_PROVIDED',
       `the runtime fact block changed shape: ${facts.join(' | ')}`,
     )
-    assert(facts[0] === 'CURRENT_CONTEXT_PRESENT=true', 'the provided context is not stated')
-    assert(facts[1] === 'RETRIEVED_MEMORY_PRESENT=false', 'retrieved memory was claimed although nothing was retrieved')
-    assert(facts[2] === 'RETRIEVED_MEMORY_COUNT=0', 'the retrieved memory count is wrong')
-    assert(facts[3] === 'PERSISTENT_MEMORY_AVAILABLE=true', 'the available persistent store is not stated')
-    assert(facts[4] === 'RETENTION_POLICY_PROVIDED=false', 'a retention policy was invented')
+    assert(facts[0] === 'SELF_IDENTITY_QUERY=false', 'the identity-query fact is wrong')
+    assert(facts[1] === 'CURRENT_CONTEXT_PRESENT=true', 'the provided context is not stated')
+    assert(facts[2] === 'RETRIEVED_MEMORY_PRESENT=false', 'retrieved memory was claimed although nothing was retrieved')
+    assert(facts[3] === 'RETRIEVED_MEMORY_COUNT=0', 'the retrieved memory count is wrong')
+    assert(facts[4] === 'PERSISTENT_MEMORY_AVAILABLE=true', 'the available persistent store is not stated')
+    assert(facts[5] === 'RETENTION_POLICY_PROVIDED=false', 'a retention policy was invented')
     for (const line of facts) {
       assert(
         !/\d+\s*(分钟|小时|天|条|token)/iu.test(line),

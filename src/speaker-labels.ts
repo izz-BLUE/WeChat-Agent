@@ -8,7 +8,8 @@
  * current requester, which is exactly the A/B personal-memory hazard.
  *
  * CURRENT_MIGRATION_DECISION: GROUP members get a conversation-stable
- * pseudonymous label (`MEMBER_1`, `MEMBER_2`, ...) instead of a bare `MEMBER`.
+ * pseudonymous label (`MEMBER_1`, `MEMBER_2`, ...), while the owner gets the
+ * neutral `SPEAKER_1` label instead of an OWNER role word or display name.
  * The label is:
  *  - derived from the trusted runtime requester id used only as a local index,
  *  - never a raw identity and never logged as one,
@@ -16,6 +17,11 @@
  *  - never a memory storage key (memory keys are the trusted ids),
  *  - never rendered to a WeChat user (see `answer-guard.ts` for that boundary).
  */
+import {
+  ASSISTANT_LABEL,
+  CURRENT_REQUESTER_LABEL,
+  isAmbientSpeakerLabel,
+} from './group-ambient-context.js'
 import type { ConversationType, RequesterRole } from './message-contract.js'
 
 /** Everything needed to render a stateless label. No raw identity is rendered. */
@@ -34,6 +40,10 @@ export interface SpeakerFacts extends SpeakerDisplayFacts {
 }
 
 export const MEMBER_LABEL_PREFIX = 'MEMBER_'
+export const SPEAKER_LABEL_PREFIX = 'SPEAKER_'
+
+/** Neutral label used for the owner in provider-facing group transcripts. */
+export const OWNER_SPEAKER_LABEL = `${SPEAKER_LABEL_PREFIX}1`
 
 /** The role label used where no pseudonymous registry exists. */
 export const MEMBER_LABEL = 'MEMBER'
@@ -50,7 +60,7 @@ export function statelessSpeakerLabel(facts: SpeakerDisplayFacts): string {
   }
 
   if (facts.requesterRole === 'OWNER') {
-    return facts.ownerDisplayName ?? 'OWNER'
+    return OWNER_SPEAKER_LABEL
   }
 
   return MEMBER_LABEL
@@ -91,12 +101,28 @@ export function isPseudonymousMemberLabel(label: string): boolean {
   return new RegExp(`^${MEMBER_LABEL_PREFIX}\\d+$`, 'u').test(label)
 }
 
+/** True when a neutral provider-facing speaker label is used. */
+export function isPseudonymousSpeakerLabel(label: string): boolean {
+  return new RegExp(`^${SPEAKER_LABEL_PREFIX}\\d+$`, 'u').test(label)
+}
+
 /**
  * True when a label is runtime-only speaker bookkeeping. Such a label may be used
- * to tell speakers apart, but it must never reach a WeChat user: the owner's own
- * display name (or the `OWNER` role word) is public metadata, while a member
- * pseudonym is not.
+ * to tell speakers apart, but it must never reach a WeChat user. Neither the
+ * authorization role nor owner display metadata belongs in this label.
+ *
+ * The ambient transcript has its own namespace (`AMBIENT_SPEAKER_n`,
+ * `CURRENT_REQUESTER`, `ASSISTANT`) on purpose: the requester transcript already
+ * spends `SPEAKER_1` on the owner, and one prompt must never spell two different
+ * people the same way.
  */
 export function isInternalSpeakerLabel(label: string): boolean {
-  return label === MEMBER_LABEL || isPseudonymousMemberLabel(label)
+  return (
+    label === MEMBER_LABEL ||
+    label === CURRENT_REQUESTER_LABEL ||
+    label === ASSISTANT_LABEL ||
+    isPseudonymousMemberLabel(label) ||
+    isPseudonymousSpeakerLabel(label) ||
+    isAmbientSpeakerLabel(label)
+  )
 }
