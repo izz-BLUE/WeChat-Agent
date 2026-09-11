@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type WebSearchProvider, type WebSearchResult } from './web-search.js'
-import { WebSearchPlanner, parseWebSearchDecision, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
+import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { ChatService } from './chat.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
@@ -130,6 +130,42 @@ function inputWithoutIdentity(question = '当前问题'): WebSearchPlanInput {
 }
 
 async function main(): Promise<void> {
+  await test('strict planner text protocol accepts only the complete three-line shape', () => {
+    const validCases = [
+      ['ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY=', 'DIRECT'],
+      ['ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI recent news', 'SEARCH'],
+      ['ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=广州 今日 天气 政策预警', 'SEARCH'],
+      ['```text\nACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY=\n```', 'DIRECT'],
+      ['```\nACTION=SEARCH\nREASON=KNOWLEDGE_UNCERTAIN\nQUERY=中文查询\n```', 'SEARCH'],
+    ] as const
+    for (const [raw, action] of validCases) {
+      const parsed = parseWebSearchDecisionProtocol(raw)
+      check(parsed.valid && parsed.decision.action === action, `valid protocol rejected: ${raw}`)
+    }
+
+    const invalidCases = [
+      '好的，ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI',
+      'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI\n这里是结果',
+      'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI\n第四行',
+      'ACTION=SEARCH\nREASON=FRESH_INFORMATION',
+      'ACTION=SEARCH\nREASON=UNKNOWN\nQUERY=OpenAI',
+      'ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY=OpenAI',
+      'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=',
+      'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI|recent',
+      '```text\nACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI\n```\n尾巴',
+    ]
+    for (const raw of invalidCases) {
+      const parsed = parseWebSearchDecisionProtocol(raw)
+      check(!parsed.valid && parsed.decision.action === 'DIRECT', `invalid protocol accepted: ${raw}`)
+    }
+
+    const identity = parseWebSearchDecisionProtocol(
+      'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=requesterId',
+      ['requesterId'],
+    )
+    check(!identity.valid && identity.failureReason === 'IDENTITY_GUARD', 'identity query was not rejected')
+  })
+
   await test('provider control markup is non-sendable at final-answer boundary', () => {
     const content = '好的，我帮你搜一下。\n<|minimax|><tool_call><invoke name="web_search">query</invoke></tool_call>'
     const extraction = extractFinalAnswer({ content })
@@ -168,7 +204,7 @@ async function main(): Promise<void> {
       }
       return plannerAttempts === 1
         ? '<|minimax|><tool_call>web_search</tool_call>'
-        : '{"action":"SEARCH","query":"OpenAI latest news","reasonCode":"FRESH_INFORMATION"}'
+        : 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news'
     })
     const final = fakeFinalChat('根据[S1]回答')
     const fake = fakeProvider([result('S1', 'OpenAI news')])
@@ -180,9 +216,34 @@ async function main(): Promise<void> {
     })
     const answer = await agent.complete(request())
     check(plannerAttempts === 2, `expected 2 planner attempts, got ${plannerAttempts}`)
-    check(repairSystem.includes('只能输出严格 JSON') && repairSystem.includes('不要调用任何工具'), 'planner repair boundary missing')
+    check(repairSystem.includes('严格只输出三行') && repairSystem.includes('不要调用任何工具'), 'planner repair boundary missing')
     check(fake.calls === 1, `expected one Tavily call, got ${fake.calls}`)
     check(answer.includes('https://example.com/s1') && !answer.includes('tool_call'), 'repaired search answer was not clean')
+    final.restore()
+  })
+
+  await test('planner repairs one invalid text protocol then searches once', async () => {
+    let plannerAttempts = 0
+    const plannerUsers: string[] = []
+    const planner = new WebSearchPlanner(async (_system, user) => {
+      plannerAttempts += 1
+      plannerUsers.push(user)
+      return plannerAttempts === 1
+        ? 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI\n多余文本'
+        : 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI recent news'
+    })
+    const final = fakeFinalChat('根据[S1]回答')
+    const fake = fakeProvider([result('S1', 'OpenAI news')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    const answer = await agent.complete(request())
+    check(plannerAttempts === 2 && fake.calls === 1, 'invalid protocol was not repaired with one search')
+    check(plannerUsers.length === 2 && plannerUsers.every((user) => user.includes('CURRENT_TIME_UTC=2026-09-11T07:40:00.000Z')), 'Runtime Time was not shared across planner attempts')
+    check(answer.includes('https://example.com/s1'), 'repaired protocol did not reach grounded final answer')
     final.restore()
   })
 
@@ -206,6 +267,26 @@ async function main(): Promise<void> {
     final.restore()
   })
 
+  await test('planner diagnostic reports invalid protocol failure reason without query text', async () => {
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
+    const final = fakeFinalChat('普通回答')
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('not a planner protocol'),
+        webSearchProvider: fakeProvider([result('S1')]).provider,
+      })
+      await agent.complete(request())
+      const decisionLog = logs.find((line) => line.includes('[WEB_SEARCH_DECISION]')) ?? ''
+      check(decisionLog.includes('failureReason=INVALID_PROTOCOL'), 'invalid protocol failure reason missing')
+      check(!decisionLog.includes('not a planner protocol'), 'planner output leaked into diagnostics')
+    } finally {
+      console.log = originalLog
+      final.restore()
+    }
+  })
+
   await test('final control markup regenerates once and preserves grounded sources', async () => {
     const final = scriptedFinalChat([
       '<|minimax|><tool_call><invoke name="web_search">query</invoke></tool_call>',
@@ -213,7 +294,7 @@ async function main(): Promise<void> {
     ])
     const fake = fakeProvider([result('S1', '真实来源')])
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"OpenAI latest news","reasonCode":"FRESH_INFORMATION"}'),
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news'),
       webSearchProvider: fake.provider,
       runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
       runtimeTimeZone: 'Asia/Shanghai',
@@ -230,7 +311,7 @@ async function main(): Promise<void> {
     const final = scriptedFinalChat([protocol, protocol])
     const fake = fakeProvider([result('S1')])
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"OpenAI latest news","reasonCode":"FRESH_INFORMATION"}'),
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news'),
       webSearchProvider: fake.provider,
       runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
       runtimeTimeZone: 'Asia/Shanghai',
@@ -248,7 +329,7 @@ async function main(): Promise<void> {
     const planner = new WebSearchPlanner(async (_system, user) => {
       plannerSystem = _system
       plannerUser = user
-      return '{"action":"DIRECT","query":null,"reasonCode":"DIRECT_SUFFICIENT"}'
+      return 'ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY='
     })
     const final = fakeFinalChat('正常回答')
     const agent = new ProductionChatAgent(final.chat, {
@@ -278,8 +359,34 @@ async function main(): Promise<void> {
     final.restore()
   })
 
-  await test('planner direct uses strict schema', async () => {
-    const planner = new WebSearchPlanner(async () => '{"action":"DIRECT","query":null,"reasonCode":"DIRECT_SUFFICIENT"}')
+  await test('live OpenAI latest-news question uses text protocol and searches once', async () => {
+    const current = '@椰椰 帮我查一下 OpenAI 最近有什么最新消息'
+    let plannerUser = ''
+    const planner = new WebSearchPlanner(async (_system, user) => {
+      plannerUser = user
+      return 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI recent news'
+    })
+    const final = fakeFinalChat('根据[S1]回答')
+    const fake = fakeProvider([result('S1', 'OpenAI latest news')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    const answer = await agent.complete(request({
+      text: current,
+      rawText: current,
+      userContentSpan: { trust: 'VALID', span: { start: 0, length: current.length } },
+    }))
+    check(plannerUser.includes('帮我查一下 OpenAI 最近有什么最新消息'), 'live semantic question did not reach Planner')
+    check(fake.calls === 1, `expected one Tavily call, got ${fake.calls}`)
+    check(answer.includes('https://example.com/s1'), 'live semantic search result was not grounded')
+    final.restore()
+  })
+
+  await test('planner direct uses strict three-line protocol', async () => {
+    const planner = new WebSearchPlanner(async () => 'ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY=')
     const planned = await planner.plan(BASE_INPUT)
     check(planned.result === 'PASS', 'DIRECT planner did not pass')
     assert.deepEqual(planned.decision, { action: 'DIRECT', query: null, reasonCode: 'DIRECT_SUFFICIENT' })
@@ -289,7 +396,7 @@ async function main(): Promise<void> {
     let prompt = ''
     const planner = new WebSearchPlanner(async (_system, user) => {
       prompt = user
-      return '{"action":"SEARCH","query":"上海最新公共信息","reasonCode":"FRESH_INFORMATION"}'
+      return 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=上海最新公共信息'
     })
     const planned = await planner.plan(BASE_INPUT)
     check(planned.decision.action === 'SEARCH', 'planner did not choose SEARCH')
@@ -303,7 +410,7 @@ async function main(): Promise<void> {
     const planner = new WebSearchPlanner(async (systemPrompt, userPrompt) => {
       system = systemPrompt
       user = userPrompt
-      return '{"action":"DIRECT","query":null,"reasonCode":"DIRECT_SUFFICIENT"}'
+      return 'ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY='
     })
     const planned = await planner.plan({
       ...BASE_INPUT,
@@ -321,7 +428,7 @@ async function main(): Promise<void> {
     let user = ''
     const planner = new WebSearchPlanner(async (_system, userPrompt) => {
       user = userPrompt
-      return '{"action":"SEARCH","query":"requesterId","reasonCode":"EXTERNAL_VERIFICATION"}'
+      return 'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=requesterId'
     })
     const planned = await planner.plan({
       ...BASE_INPUT,
@@ -337,7 +444,7 @@ async function main(): Promise<void> {
     let user = ''
     const planner = new WebSearchPlanner(async (_system, userPrompt) => {
       user = userPrompt
-      return '{"action":"SEARCH","query":"某家公司今天最新消息","reasonCode":"FRESH_INFORMATION"}'
+      return 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=某家公司今天最新消息'
     })
     const planned = await planner.plan({
       ...BASE_INPUT,
@@ -348,15 +455,15 @@ async function main(): Promise<void> {
     check(user.includes('我们刚才在聊某家公司') && user.includes('它今天有什么新消息？'), 'ambient semantic context was dropped')
   })
 
-  await test('malformed planner JSON fails safe to direct', async () => {
+  await test('malformed planner protocol fails safe to direct', async () => {
     const planned = await new WebSearchPlanner(async () => 'not json').plan(BASE_INPUT)
     check(planned.result === 'FAIL' && planned.decision.action === 'DIRECT', 'malformed JSON did not fail safe')
   })
 
   await test('query identity and internal label guards reject search', () => {
     for (const query of [REQUESTER_ID, CONVERSATION_ID, '查 MEMBER_1 的资料', 'a\nb']) {
-      const parsed = parseWebSearchDecision(
-        JSON.stringify({ action: 'SEARCH', query, reasonCode: 'EXTERNAL_VERIFICATION' }),
+      const parsed = parseWebSearchDecisionProtocol(
+        `ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=${query}`,
         [REQUESTER_ID, CONVERSATION_ID],
       )
       check(parsed.valid === false && parsed.decision.action === 'DIRECT', `unsafe query accepted: ${query}`)
@@ -364,8 +471,8 @@ async function main(): Promise<void> {
   })
 
   await test('query length is bounded at 200 characters', () => {
-    const parsed = parseWebSearchDecision(
-      JSON.stringify({ action: 'SEARCH', query: 'x'.repeat(201), reasonCode: 'KNOWLEDGE_UNCERTAIN' }),
+    const parsed = parseWebSearchDecisionProtocol(
+      `ACTION=SEARCH\nREASON=KNOWLEDGE_UNCERTAIN\nQUERY=${'x'.repeat(201)}`,
     )
     check(parsed.valid === false && parsed.decision.action === 'DIRECT', 'overlong query accepted')
   })
@@ -374,7 +481,7 @@ async function main(): Promise<void> {
     const final = fakeFinalChat('普通回答')
     const fake = fakeProvider([result('S1')])
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom('{"action":"DIRECT","query":null,"reasonCode":"DIRECT_SUFFICIENT"}'),
+      webSearchPlanner: plannerFrom('ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY='),
       webSearchProvider: fake.provider,
     })
     const answer = await agent.complete(request())
@@ -387,7 +494,7 @@ async function main(): Promise<void> {
     const final = fakeFinalChat('参考[S1]给出回答')
     const fake = fakeProvider([result('S1', '上海公共信息')])
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"上海公共信息","reasonCode":"FRESH_INFORMATION"}'),
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=上海公共信息'),
       webSearchProvider: fake.provider,
       webSearchMaxContextChars: 500,
     })
@@ -403,7 +510,7 @@ async function main(): Promise<void> {
     const final = fakeFinalChat('回答')
     const fake = fakeProvider([result('S1')])
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"一次查询","reasonCode":"EXPLICIT_SEARCH_REQUEST"}'),
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询'),
       webSearchProvider: fake.provider,
     })
     await agent.complete(request())
@@ -420,7 +527,7 @@ async function main(): Promise<void> {
       const final = fakeFinalChat(name === 'timeout' ? '我刚刚查到最新情况。' : '当前没有成功取得联网结果，无法可靠确认最新情况。')
       const fake = fakeProvider(error ?? [])
       const agent = new ProductionChatAgent(final.chat, {
-        webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"实时事实","reasonCode":"FRESH_INFORMATION"}'),
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=实时事实'),
         webSearchProvider: fake.provider,
       })
       const answer = await agent.complete(request())
@@ -439,7 +546,7 @@ async function main(): Promise<void> {
       search: async () => ({ results: [{ ...result('S1'), snippet: injection }] }),
     }
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"安全边界","reasonCode":"EXTERNAL_VERIFICATION"}'),
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=安全边界'),
       webSearchProvider: provider,
     })
     const answer = await agent.complete(request())
@@ -490,7 +597,7 @@ async function main(): Promise<void> {
     console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
     try {
       const agent = new ProductionChatAgent(new ChatService('https://provider.invalid/v1', 'chat-key', 'test-model'), {
-        webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"公开问题","reasonCode":"EXPLICIT_SEARCH_REQUEST"}'),
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=公开问题'),
         webSearchProvider: new TavilyWebSearchProvider('https://tavily.invalid', secret),
       })
       const answer = await agent.complete(request())
@@ -543,7 +650,7 @@ async function main(): Promise<void> {
     const final = fakeFinalChat('普通回答')
     const fake = fakeProvider([result('S1')])
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom(`{"action":"SEARCH","query":"${REQUESTER_ID}","reasonCode":"EXTERNAL_VERIFICATION"}`),
+      webSearchPlanner: plannerFrom(`ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=${REQUESTER_ID}`),
       webSearchProvider: fake.provider,
     })
     await agent.complete(request())
@@ -555,7 +662,7 @@ async function main(): Promise<void> {
     const final = fakeFinalChat('结论 [S1] https://evil.example/fabricated')
     const fake = fakeProvider([result('S1', '真实来源标题', 'https://real.example/source')])
     const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"来源测试","reasonCode":"EXTERNAL_VERIFICATION"}'),
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=来源测试'),
       webSearchProvider: fake.provider,
     })
     const answer = await agent.complete(request())

@@ -24,8 +24,9 @@ import {
   type WebSearchResult,
 } from './web-search.js'
 import {
+  formatWebSearchDecisionProtocol,
   WebSearchPlanner,
-  parseWebSearchDecision,
+  parseWebSearchDecisionProtocol,
   type WebSearchPlannerLike,
 } from './web-search-planner.js'
 import {
@@ -363,11 +364,17 @@ export class ProductionChatAgent implements AgentExecutor {
       },
       guardValues(request),
     )
-    const revalidated = parseWebSearchDecision(JSON.stringify(planner.decision), guardValues(request))
+    const revalidated = parseWebSearchDecisionProtocol(
+      formatWebSearchDecisionProtocol(planner.decision),
+      guardValues(request),
+    )
     const decision = planner.result === 'PASS' && revalidated.valid
       ? revalidated.decision
       : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const }
     const decisionResult = planner.result === 'PASS' && revalidated.valid ? 'PASS' : 'FAIL'
+    const failureReason = planner.result === 'PASS' && !revalidated.valid
+      ? revalidated.failureReason
+      : planner.failureReason ?? 'NONE'
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
@@ -378,6 +385,7 @@ export class ProductionChatAgent implements AgentExecutor {
         reasonCode: decision.reasonCode,
         queryChars: decision.query?.length ?? 0,
         plannerAttempts: planner.attempts ?? 1,
+        failureReason,
       },
     )
 
