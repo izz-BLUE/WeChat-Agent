@@ -34,6 +34,7 @@ import {
   PersistentRuntimeLogSink,
   type TokenCorrelationState,
 } from './persistent-runtime-log.js'
+import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from './runtime-time.js'
 
 /**
  * The mention fact handed to the model. A group message only reaches the Agent
@@ -94,6 +95,8 @@ export interface ProductionChatAgentOptions {
   webSearchMaxResults?: number
   webSearchTimeoutMs?: number
   webSearchMaxContextChars?: number
+  runtimeClock?: RuntimeClock
+  runtimeTimeZone?: string
 }
 
 export class ProductionChatAgent implements AgentExecutor {
@@ -107,6 +110,8 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly webSearchMaxResults: number
   private readonly webSearchTimeoutMs: number
   private readonly webSearchMaxContextChars: number
+  private readonly runtimeClock: RuntimeClock
+  private readonly runtimeTimeZone: string | undefined
 
   public constructor(
     private readonly chatService: ChatService,
@@ -120,6 +125,8 @@ export class ProductionChatAgent implements AgentExecutor {
     this.webSearchMaxResults = options.webSearchMaxResults ?? config.webSearchMaxResults
     this.webSearchTimeoutMs = options.webSearchTimeoutMs ?? config.webSearchTimeoutMs
     this.webSearchMaxContextChars = options.webSearchMaxContextChars ?? config.webSearchMaxContextChars
+    this.runtimeClock = options.runtimeClock ?? { now: () => new Date() }
+    this.runtimeTimeZone = options.runtimeTimeZone ?? config.agentTimeZone
     this.context = new GroupContext(
       config.maxContextMessages,
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
@@ -159,6 +166,8 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   public async complete(request: AgentRequest): Promise<string> {
+    // One immutable snapshot is shared by the Planner and final-answer prompt.
+    const runtimeTime = createRuntimeTimeFacts(this.runtimeClock, this.runtimeTimeZone)
     const label = this.speakerLabels.labelFor({
       conversationType: request.conversationType,
       conversationId: request.conversationId,
@@ -286,6 +295,7 @@ export class ProductionChatAgent implements AgentExecutor {
       window.messages,
       ambient,
       request,
+      runtimeTime,
     )
 
     const answer = await this.chatService.reply(
@@ -302,6 +312,7 @@ export class ProductionChatAgent implements AgentExecutor {
         // A disabled or absent store is a runtime fact: the model may not claim a
         // long-term memory that this process does not have.
         persistentMemoryAvailable: this.memory !== null && this.memory.isEnabled,
+        runtimeTime,
         webSearch,
       },
       guardValues(request),
@@ -332,6 +343,7 @@ export class ProductionChatAgent implements AgentExecutor {
     recentContext: readonly GroupMessage[],
     ambient: readonly AmbientLine[],
     request: AgentRequest,
+    runtimeTime: RuntimeTimeFacts,
   ): Promise<{
     used: boolean
     status: 'PASS' | 'FAILED'
@@ -347,7 +359,7 @@ export class ProductionChatAgent implements AgentExecutor {
         question,
         recentContext,
         ambient,
-        now: new Date().toISOString(),
+        runtimeTime,
       },
       guardValues(request),
     )
@@ -365,6 +377,7 @@ export class ProductionChatAgent implements AgentExecutor {
         result: decisionResult,
         reasonCode: decision.reasonCode,
         queryChars: decision.query?.length ?? 0,
+        plannerAttempts: planner.attempts ?? 1,
       },
     )
 
@@ -484,6 +497,7 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     webSearchMaxResults: config.webSearchMaxResults,
     webSearchTimeoutMs: config.webSearchTimeoutMs,
     webSearchMaxContextChars: config.webSearchMaxContextChars,
+    runtimeTimeZone: config.agentTimeZone,
   })
 }
 

@@ -4,6 +4,7 @@ import { PuppetXp } from 'wechaty-puppet-xp'
 import { ChatService } from './chat.js'
 import { GroupContext } from './context.js'
 import { config, validateChatConfig } from './config.js'
+import { createRuntimeTimeFacts } from './runtime-time.js'
 
 if (config.botMode === 'chat') {
   validateChatConfig()
@@ -80,6 +81,7 @@ bot.on('message', async (message) => {
     console.log(`[CHAT] room=${roomId} sender=${senderName} contextMessages=${recent.length}`)
 
     try {
+      const runtimeTime = createRuntimeTimeFacts(undefined, config.agentTimeZone)
       // Legacy wechaty dev path: it has no trusted runtime identity contract, so
       // it can never resolve an owner. The production path is the C# runtime.
       const reply = await chatService!.reply(recent, groupMessage, {
@@ -87,6 +89,7 @@ bot.on('message', async (message) => {
         mention: mentioned ? 'MENTIONED' : 'NOT_MENTIONED',
         requesterRole: 'MEMBER',
         ownerConfigured: false,
+        runtimeTime,
       })
       await room.say(reply, talker)
       console.log(`[REPLY] room=${roomId} sender=${senderName}`)

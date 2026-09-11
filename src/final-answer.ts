@@ -25,6 +25,26 @@ export const REASONING_FIELD_NAMES = [
 
 export const THINKING_TAG_NAMES = ['think', 'thinking', 'reasoning', 'analysis', 'mm:think'] as const
 
+export type ProviderControlKind =
+  | 'MINIMAX_MARKUP'
+  | 'TOOL_CALL_MARKUP'
+  | 'INVOKE_MARKUP'
+  | 'FUNCTION_CALL_MARKUP'
+  | 'TOOL_CALLS_MARKUP'
+
+export interface ProviderControlDetection {
+  providerControlMarkup: boolean
+  providerControlKinds: readonly ProviderControlKind[]
+}
+
+const PROVIDER_CONTROL_PATTERNS: readonly [ProviderControlKind, RegExp][] = [
+  ['MINIMAX_MARKUP', /<\|minimax\|>/iu],
+  ['TOOL_CALL_MARKUP', /<\/?tool_call\b/iu],
+  ['INVOKE_MARKUP', /<\/?invoke\b/iu],
+  ['FUNCTION_CALL_MARKUP', /\bfunction_call\b/iu],
+  ['TOOL_CALLS_MARKUP', /\btool_calls\b/iu],
+]
+
 export interface SanitizedFinalAnswer {
   /** Sendable text; an empty string means nothing may be sent. */
   text: string
@@ -35,6 +55,8 @@ export interface SanitizedFinalAnswer {
    * reasoning from answer, so nothing from this text may be sent.
    */
   unterminatedTag: boolean
+  providerControlMarkup: boolean
+  providerControlKinds: readonly ProviderControlKind[]
 }
 
 export interface FinalAnswerExtraction extends SanitizedFinalAnswer {
@@ -42,6 +64,23 @@ export interface FinalAnswerExtraction extends SanitizedFinalAnswer {
   contentPresent: boolean
   /** Reasoning carriers found next to `content`; never used as a reply. */
   reasoningFields: readonly string[]
+}
+
+export class ProviderControlMarkupError extends Error {
+  public constructor(public readonly kinds: readonly ProviderControlKind[]) {
+    super('Provider control markup was blocked')
+    this.name = 'ProviderControlMarkupError'
+  }
+}
+
+export function detectProviderControlMarkup(input: string): ProviderControlDetection {
+  const providerControlKinds = PROVIDER_CONTROL_PATTERNS
+    .filter(([, pattern]) => pattern.test(input))
+    .map(([kind]) => kind)
+  return {
+    providerControlMarkup: providerControlKinds.length > 0,
+    providerControlKinds,
+  }
 }
 
 function escapeTagName(name: string): string {
@@ -63,6 +102,16 @@ const UNCLOSED_OPEN_TAG = new RegExp(`<(?:${TAG_ALTERNATION})>`, 'i')
  * makes the whole text unsendable instead of being guessed at.
  */
 export function sanitizeFinalAnswer(input: string): SanitizedFinalAnswer {
+  const control = detectProviderControlMarkup(input)
+  if (control.providerControlMarkup) {
+    return {
+      text: '',
+      removedBlocks: 0,
+      unterminatedTag: false,
+      ...control,
+    }
+  }
+
   let text = input
   let removedBlocks = 0
 
@@ -79,6 +128,7 @@ export function sanitizeFinalAnswer(input: string): SanitizedFinalAnswer {
     text: text.trim(),
     removedBlocks,
     unterminatedTag: UNCLOSED_OPEN_TAG.test(text),
+    ...control,
   }
 }
 
@@ -112,6 +162,8 @@ export function extractFinalAnswer(message: unknown): FinalAnswerExtraction {
       unterminatedTag: false,
       contentPresent: false,
       reasoningFields,
+      providerControlMarkup: false,
+      providerControlKinds: [],
     }
   }
 
@@ -122,5 +174,7 @@ export function extractFinalAnswer(message: unknown): FinalAnswerExtraction {
     unterminatedTag: sanitized.unterminatedTag,
     contentPresent: true,
     reasoningFields,
+    providerControlMarkup: sanitized.providerControlMarkup,
+    providerControlKinds: sanitized.providerControlKinds,
   }
 }

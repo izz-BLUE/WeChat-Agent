@@ -2,6 +2,7 @@ import 'dotenv/config'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { memoryFileIn } from './memory-store.js'
+import { validateRuntimeTimeZone } from './runtime-time.js'
 
 export type BotMode = 'smoke' | 'chat'
 
@@ -70,6 +71,7 @@ export const config = {
   webSearchMaxResults: positiveInteger('WEB_SEARCH_MAX_RESULTS', 5),
   webSearchTimeoutMs: positiveInteger('WEB_SEARCH_TIMEOUT_MS', 8_000),
   webSearchMaxContextChars: positiveInteger('WEB_SEARCH_MAX_CONTEXT_CHARS', 6_000),
+  agentTimeZone: process.env.AGENT_TIME_ZONE?.trim() || undefined,
 }
 
 export function validateChatConfig(): void {
@@ -84,6 +86,8 @@ export function validateChatConfig(): void {
   if (missing.length > 0) {
     throw new Error(`Chat mode requires: ${missing.join(', ')}`)
   }
+
+  validateRuntimeTimeZone(config.agentTimeZone)
 
   if (config.webSearchEnabled) {
     if (config.webSearchProvider !== 'tavily') {

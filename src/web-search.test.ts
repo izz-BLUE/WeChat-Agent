@@ -3,7 +3,9 @@ import { TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normali
 import { WebSearchPlanner, parseWebSearchDecision, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { ChatService } from './chat.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
-import type { AgentRequest } from './agent-adapter.js'
+import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
+import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
+import { type RuntimeTimeFacts } from './runtime-time.js'
 
 let cases = 0
 let failures = 0
@@ -25,14 +27,19 @@ async function test(name: string, body: () => Promise<void> | void): Promise<voi
   }
 }
 
-const NOW = '2026-09-11T00:00:00.000Z'
+const RUNTIME_TIME: RuntimeTimeFacts = {
+  utcIso: '2026-09-11T07:40:00.000Z',
+  localDate: '2026-09-11',
+  localDateTime: '2026-09-11T15:40:00',
+  timeZone: 'Asia/Shanghai',
+}
 const REQUESTER_ID = 'requester-secret-001'
 const CONVERSATION_ID = 'room-secret-001'
 const BASE_INPUT: WebSearchPlanInput = {
   question: '今天上海有什么值得关注的公共信息？',
   recentContext: [{ senderId: 'SPEAKER_1', senderName: 'SPEAKER_1', text: '大家在讨论上海活动', timestamp: 1 }],
   ambient: [{ label: 'AMBIENT_SPEAKER_1', text: '最近有什么新消息？' }],
-  now: NOW,
+  runtimeTime: RUNTIME_TIME,
 }
 
 function request(overrides: Partial<AgentRequest> = {}): AgentRequest {
@@ -98,6 +105,22 @@ function fakeFinalChat(answer: string): { chat: ChatService; calls: Array<{ syst
   }
 }
 
+function scriptedFinalChat(answers: readonly string[]): { chat: ChatService; calls: Array<{ system: string; user: string }>; restore: () => void } {
+  const calls: Array<{ system: string; user: string }> = []
+  const original = globalThis.fetch
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: Array<{ content?: string }> }
+    calls.push({ system: body.messages?.[0]?.content ?? '', user: body.messages?.[1]?.content ?? '' })
+    const answer = answers[Math.min(calls.length - 1, answers.length - 1)] ?? ''
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: answer } }] }) }
+  }) as unknown as typeof fetch
+  return {
+    chat: new ChatService('https://provider.invalid/v1', 'chat-key', 'test-model'),
+    calls,
+    restore: () => { globalThis.fetch = original },
+  }
+}
+
 function plannerFrom(raw: string): WebSearchPlannerLike {
   return new WebSearchPlanner(async () => raw)
 }
@@ -107,6 +130,154 @@ function inputWithoutIdentity(question = '当前问题'): WebSearchPlanInput {
 }
 
 async function main(): Promise<void> {
+  await test('provider control markup is non-sendable at final-answer boundary', () => {
+    const content = '好的，我帮你搜一下。\n<|minimax|><tool_call><invoke name="web_search">query</invoke></tool_call>'
+    const extraction = extractFinalAnswer({ content })
+    check(extraction.providerControlMarkup === true, 'MiniMax control markup was not detected')
+    check(extraction.providerControlKinds.includes('MINIMAX_MARKUP'), 'MiniMax kind was not reported')
+    check(extraction.providerControlKinds.includes('TOOL_CALL_MARKUP'), 'tool_call kind was not reported')
+    check(extraction.providerControlKinds.includes('INVOKE_MARKUP'), 'invoke kind was not reported')
+    check(extraction.text === '', 'provider control text remained sendable')
+    check(mapAgentResponse(content).kind === 'NO_REPLY', 'provider control reached outbound mapping')
+  })
+
+  await test('structured completion rejects provider control markup', async () => {
+    const original = globalThis.fetch
+    try {
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: '<|minimax|><tool_call>web_search</tool_call>' } }] }),
+      })) as unknown as typeof fetch
+      await assert.rejects(
+        () => new ChatService('https://provider.invalid/v1', 'chat-key', 'test-model').completeStructured('system', 'user'),
+        (error: unknown) => error instanceof ProviderControlMarkupError,
+      )
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  await test('planner repairs one provider control response then searches once', async () => {
+    let plannerAttempts = 0
+    let repairSystem = ''
+    const planner = new WebSearchPlanner(async (system) => {
+      plannerAttempts += 1
+      if (plannerAttempts === 2) {
+        repairSystem = system
+      }
+      return plannerAttempts === 1
+        ? '<|minimax|><tool_call>web_search</tool_call>'
+        : '{"action":"SEARCH","query":"OpenAI latest news","reasonCode":"FRESH_INFORMATION"}'
+    })
+    const final = fakeFinalChat('根据[S1]回答')
+    const fake = fakeProvider([result('S1', 'OpenAI news')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    const answer = await agent.complete(request())
+    check(plannerAttempts === 2, `expected 2 planner attempts, got ${plannerAttempts}`)
+    check(repairSystem.includes('只能输出严格 JSON') && repairSystem.includes('不要调用任何工具'), 'planner repair boundary missing')
+    check(fake.calls === 1, `expected one Tavily call, got ${fake.calls}`)
+    check(answer.includes('https://example.com/s1') && !answer.includes('tool_call'), 'repaired search answer was not clean')
+    final.restore()
+  })
+
+  await test('planner fails closed after two control responses without searching', async () => {
+    let plannerAttempts = 0
+    const planner = new WebSearchPlanner(async () => {
+      plannerAttempts += 1
+      return '<|minimax|><tool_call>web_search</tool_call>'
+    })
+    const final = fakeFinalChat('普通回答')
+    const fake = fakeProvider([result('S1')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    const answer = await agent.complete(request())
+    check(plannerAttempts === 2 && fake.calls === 0, 'planner control failure invoked Search Provider')
+    check(answer === '普通回答' && !answer.includes('tool_call'), 'planner fail-safe leaked protocol')
+    final.restore()
+  })
+
+  await test('final control markup regenerates once and preserves grounded sources', async () => {
+    const final = scriptedFinalChat([
+      '<|minimax|><tool_call><invoke name="web_search">query</invoke></tool_call>',
+      '根据[S1]，这是正常回答。',
+    ])
+    const fake = fakeProvider([result('S1', '真实来源')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"OpenAI latest news","reasonCode":"FRESH_INFORMATION"}'),
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    const answer = await agent.complete(request())
+    check(final.calls.length === 2 && fake.calls === 1, 'final regeneration/search bounds changed')
+    check(answer.includes('正常回答') && answer.includes('https://example.com/s1'), 'regenerated answer lost grounded source')
+    check(!answer.includes('tool_call') && !answer.includes('<invoke'), 'provider protocol reached final answer')
+    final.restore()
+  })
+
+  await test('two final control responses fail closed with no sendable protocol', async () => {
+    const protocol = '<|minimax|><tool_call><invoke name="web_search">query</invoke></tool_call>'
+    const final = scriptedFinalChat([protocol, protocol])
+    const fake = fakeProvider([result('S1')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('{"action":"SEARCH","query":"OpenAI latest news","reasonCode":"FRESH_INFORMATION"}'),
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    await assert.rejects(() => agent.complete(request()))
+    check(final.calls.length === 2 && fake.calls === 1, 'final control retry was not bounded')
+    check(mapAgentResponse(protocol).kind === 'NO_REPLY', 'control protocol remained outbound-capable')
+    final.restore()
+  })
+
+  await test('planner and final prompt share one injected runtime time', async () => {
+    let plannerSystem = ''
+    let plannerUser = ''
+    let clockCalls = 0
+    const planner = new WebSearchPlanner(async (_system, user) => {
+      plannerSystem = _system
+      plannerUser = user
+      return '{"action":"DIRECT","query":null,"reasonCode":"DIRECT_SUFFICIENT"}'
+    })
+    const final = fakeFinalChat('正常回答')
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      runtimeClock: {
+        now: () => {
+          clockCalls += 1
+          return new Date('2026-09-11T07:40:00.000Z')
+        },
+      },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    await agent.complete(request())
+    check(clockCalls === 1, `runtime clock was sampled ${clockCalls} times`)
+    const expected = [
+      'CURRENT_TIME_UTC=2026-09-11T07:40:00.000Z',
+      'CURRENT_LOCAL_DATE=2026-09-11',
+      'CURRENT_LOCAL_DATETIME=2026-09-11T15:40:00',
+      'CURRENT_TIME_ZONE=Asia/Shanghai',
+    ]
+    for (const line of expected) {
+      check(plannerUser.includes(line), `planner prompt lacks ${line}`)
+      check(final.calls[0]?.user.includes(line), `final prompt lacks ${line}`)
+    }
+    check(plannerSystem.includes('不得根据模型训练时间自行猜测当前年份'), 'planner lacks temporal grounding rule')
+    check(final.calls[0]?.system.includes('当前年份、日期以这里为准'), 'final system lacks temporal grounding rule')
+    final.restore()
+  })
+
   await test('planner direct uses strict schema', async () => {
     const planner = new WebSearchPlanner(async () => '{"action":"DIRECT","query":null,"reasonCode":"DIRECT_SUFFICIENT"}')
     const planned = await planner.plan(BASE_INPUT)
