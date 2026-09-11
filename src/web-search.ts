@@ -174,9 +174,11 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
       try {
         response = await fetch(endpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.apiKey}`,
+          },
           body: JSON.stringify({
-            api_key: this.apiKey,
             query: request.query,
             search_depth: 'basic',
             max_results: request.maxResults,
