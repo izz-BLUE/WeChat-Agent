@@ -56,6 +56,59 @@ function dispatchPlanner(message = '大家今晚十点开会，别迟到哈'): O
   }
 }
 
+const ownerPlannerFixtures: readonly [question: string, action: 'CHAT' | 'DISPATCH_NOW'][] = [
+  ['你觉得虚拟线程适合我们这种项目吗', 'CHAT'],
+  ['你怎么看这个方案', 'CHAT'],
+  ['帮我查一下 OpenAI 最近有什么新闻', 'CHAT'],
+  ['帮我写一段开会通知', 'CHAT'],
+  ['详细讲讲 Java 虚拟线程', 'CHAT'],
+  ['帮我跟大家说一下今晚十点开会，别迟到', 'DISPATCH_NOW'],
+  ['替我通知大家部署完成了', 'DISPATCH_NOW'],
+  ['帮我问一下大家今晚谁有空', 'DISPATCH_NOW'],
+]
+
+async function assertOwnerPlannerFixtures(): Promise<void> {
+  const expected = new Map(ownerPlannerFixtures)
+  const planner = new OwnerDispatchPlanner(async (systemPrompt, userPrompt) => {
+    const question = userPrompt.replace('[Canonical Owner Request]\n', '')
+    const action = expected.get(question)
+    assert(action)
+
+    // This fixture models a provider following the published Planner contract.
+    // Without the explicit delegation examples, the old prompt reproduces the
+    // observed false positive for ordinary Owner questions.
+    const hasDelegationExamples = [
+      '你觉得虚拟线程适合我们这种项目吗',
+      '你怎么看这个方案',
+      '帮我查一下 OpenAI 最近有什么新闻',
+      '帮我分析一下这个报错',
+      '帮我写一段开会通知',
+      '这个方案有什么问题',
+      '现在几点',
+      '详细讲讲 Java 虚拟线程',
+      '帮我跟大家说一下今晚十点开会，别迟到',
+      '替我通知群里明天不用来公司',
+      '帮我问一下大家今晚谁有空',
+      '跟大家说部署已经完成了',
+      '写一段通知并发给大家',
+      '帮我问大家觉得',
+    ].every((example) => systemPrompt.includes(example))
+
+    if (action === 'CHAT' && !hasDelegationExamples) {
+      return 'ACTION=DISPATCH_NOW\nMESSAGE=大家觉得这个问题怎么样？'
+    }
+    return action === 'CHAT'
+      ? 'ACTION=CHAT\nMESSAGE='
+      : 'ACTION=DISPATCH_NOW\nMESSAGE=大家今晚十点开会，别迟到'
+  })
+
+  for (const [question, action] of ownerPlannerFixtures) {
+    const result = await planner.plan(question, [OWNER, ROOM])
+    assert.equal(result.result, 'PASS', question)
+    assert.equal(result.decision.action, action, question)
+  }
+}
+
 async function readLine(socket: ReturnType<typeof createConnection>, state: { buffer: string }): Promise<Record<string, unknown>> {
   while (!state.buffer.includes('\n')) {
     const chunk = await new Promise<string>((resolve, reject) => {
@@ -79,6 +132,8 @@ async function readLine(socket: ReturnType<typeof createConnection>, state: { bu
 }
 
 async function main(): Promise<void> {
+  await assertOwnerPlannerFixtures()
+
   assert.deepEqual(parseOwnerDispatchProtocol('ACTION=CHAT\nMESSAGE='), {
     valid: true,
     decision: { action: 'CHAT', message: null },
@@ -156,6 +211,20 @@ async function main(): Promise<void> {
   assert.equal(memberPlannerCalls, 0)
   assert.equal(memberAgent.pollProactiveOutbound(), null)
 
+  const normalOwnerCalls = { count: 0 }
+  const normalOwnerAgent = new ProductionChatAgent(chat('owner normal', normalOwnerCalls), {
+    ownerDispatchPlanner: {
+      plan: async () => ({
+        result: 'PASS' as const,
+        decision: { action: 'CHAT' as const, message: null },
+        attempts: 1,
+      }),
+    },
+  })
+  assert.equal(await normalOwnerAgent.complete(request({ messageId: 'owner-normal' })), 'owner normal')
+  assert.equal(normalOwnerCalls.count, 1)
+  assert.equal(normalOwnerAgent.pollProactiveOutbound(), null)
+
   const invalidAgent = new ProductionChatAgent(chat('invalid normal', { count: 0 }), {
     ownerDispatchPlanner: dispatchPlanner(),
   })
@@ -214,7 +283,7 @@ async function main(): Promise<void> {
     await transport.stop()
   }
 
-  console.log('OWNER_DISPATCH_TESTS=PASS cases=20')
+  console.log('OWNER_DISPATCH_TESTS=PASS cases=29')
 }
 
 main().catch((error: unknown) => {
