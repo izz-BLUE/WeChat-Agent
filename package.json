@@ -22,11 +22,12 @@
     "test:memory-working-set": "npm run build && node dist/contextual-memory-working-set.test.js",
     "test:field-shape": "npm run build && node dist/explicit-memory-field-shape.test.js",
     "test:bot-mention-span": "npm run build && node dist/bot-mention-span.test.js",
+    "test:user-content-span": "npm run build && node dist/user-content-span.test.js",
     "test:transport-framing": "npm run build && node dist/transport-framing-admission.test.js",
     "test:persistent-log": "npm run build && node dist/persistent-runtime-log.test.js",
     "test:memory-runtime-log": "npm run build && node dist/memory-runtime-log.test.js",
     "test:memory-log-persist": "npm run build && node dist/memory-log-persist.test.js",
-    "test": "npm run build && node dist/message-contract.test.js && node dist/reasoning-boundary.test.js && node dist/identity-observer.test.js && node dist/group-requester-identity.test.js && node dist/owner-requester-resolution.test.js && node dist/memory-scope.test.js && node dist/memory-acceptance.test.js && node dist/memory-remember-regression.test.js && node dist/mutation-provider-compatibility.test.js && node dist/self-identity-role-regression.test.js && node dist/memory-retrieval-gap.test.js && node dist/memory-runtime-log.test.js && node dist/answer-grounding.test.js && node dist/group-ambient-context.test.js && node dist/contextual-memory-working-set.test.js && node dist/explicit-memory-field-shape.test.js && node dist/bot-mention-span.test.js && node dist/transport-framing-admission.test.js && node dist/persistent-runtime-log.test.js && node dist/memory-log-persist.test.js",
+    "test": "npm run build && node dist/message-contract.test.js && node dist/reasoning-boundary.test.js && node dist/identity-observer.test.js && node dist/group-requester-identity.test.js && node dist/owner-requester-resolution.test.js && node dist/memory-scope.test.js && node dist/memory-acceptance.test.js && node dist/memory-remember-regression.test.js && node dist/mutation-provider-compatibility.test.js && node dist/self-identity-role-regression.test.js && node dist/memory-retrieval-gap.test.js && node dist/memory-runtime-log.test.js && node dist/answer-grounding.test.js && node dist/group-ambient-context.test.js && node dist/contextual-memory-working-set.test.js && node dist/explicit-memory-field-shape.test.js && node dist/bot-mention-span.test.js && node dist/user-content-span.test.js && node dist/transport-framing-admission.test.js && node dist/persistent-runtime-log.test.js && node dist/memory-log-persist.test.js",
     "start:production-agent": "node dist/production-agent-receiver.js",
     "dev": "tsx src/main.ts",
     "start": "node dist/main.js"

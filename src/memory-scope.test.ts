@@ -70,6 +70,7 @@ const TRUSTED_BOT_MENTION = {
   mentionState: 'MENTIONED',
   botMentionSpanTrust: 'VALID',
   botMentionSpanCount: 1,
+  userContentSpanTrust: 'VALID',
 } as const
 
 function sequentialIds(): () => string {
@@ -202,13 +203,14 @@ function groupRaw(overrides: Partial<RawHookMessage> = {}): RawHookMessage {
   const from = overrides.from ?? 'room-a@chatroom'
   const signature = overrides.signature ?? 'sig-a'
   const senderId = overrides.senderId ?? signature
+  const content = overrides.content ?? '@椰椰 你好'
   return {
     msgId: 'memory-message-1',
     type: 1,
     timestamp: 1_757_000_000_000,
     from,
     wxid: 'shared-account-wxid',
-    content: '@椰椰 你好',
+    content,
     signature,
     senderName: 'Sender One',
     isMentioned: true,
@@ -220,6 +222,7 @@ function groupRaw(overrides: Partial<RawHookMessage> = {}): RawHookMessage {
     requesterSource: overrides.requesterSource ?? 'Signature',
     requesterRole: overrides.requesterRole ?? 'MEMBER',
     ownerConfigured: overrides.ownerConfigured ?? false,
+    userContentSpan: overrides.userContentSpan ?? { start: 0, length: content.length },
   }
 }
 

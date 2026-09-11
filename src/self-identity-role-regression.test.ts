@@ -340,14 +340,14 @@ async function testAuthorizationRoleStillControlsOwnerOnlyCapability(): Promise<
 
   const ownerResult = await harness.service.tryHandleExplicit({
     conversationType: 'GROUP', conversationId: ROOM, requesterId: OWNER, requesterRole: 'OWNER', question: '记住我叫辞老师',
-    mentionState: 'MENTIONED', botMentionSpanTrust: 'VALID', botMentionSpanCount: 1,
+    mentionState: 'MENTIONED', botMentionSpanTrust: 'VALID', botMentionSpanCount: 1, userContentSpanTrust: 'VALID',
   })
   assert(ownerResult.handled && ownerResult.reply === '记住了。', 'OWNER explicit memory capability stopped working')
   assert(calls === 1 && harness.store.liveRecordCount === 1, 'OWNER memory write did not persist')
 
   const memberResult = await harness.service.tryHandleExplicit({
     conversationType: 'GROUP', conversationId: ROOM, requesterId: MEMBER, requesterRole: 'MEMBER', question: '记住我叫辞老师',
-    mentionState: 'MENTIONED', botMentionSpanTrust: 'VALID', botMentionSpanCount: 1,
+    mentionState: 'MENTIONED', botMentionSpanTrust: 'VALID', botMentionSpanCount: 1, userContentSpanTrust: 'VALID',
   })
   assert(!memberResult.handled && calls === 1, 'MEMBER changed the owner-only memory path')
 }
@@ -388,7 +388,7 @@ async function testRawIdentityWriteRegressionRemainsFailClosed(): Promise<void> 
   })
   const result = await harness.service.tryHandleExplicit({
     conversationType: 'GROUP', conversationId: ROOM, requesterId: OWNER, requesterRole: 'OWNER', question: '记住我是谁',
-    mentionState: 'MENTIONED', botMentionSpanTrust: 'VALID', botMentionSpanCount: 1,
+    mentionState: 'MENTIONED', botMentionSpanTrust: 'VALID', botMentionSpanCount: 1, userContentSpanTrust: 'VALID',
   })
   assert(result.handled && calls === 1, 'raw identity regression fixture did not reach mutation')
   assert(harness.store.liveRecordCount === 0, 'raw identity candidate bypassed fail-closed validation')

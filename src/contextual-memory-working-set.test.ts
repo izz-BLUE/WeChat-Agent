@@ -289,6 +289,9 @@ function agentRequest(options: TurnOptions): AgentRequest {
     botMentionSpans: options.botMention === true
       ? { trust: 'VALID', spans: [{ start: 0, length: BOT_TOKEN.length }] }
       : { trust: 'ABSENT', spans: [] },
+    userContentSpan: options.botMention === true
+      ? { trust: 'VALID', span: { start: 0, length: body.length } }
+      : { trust: 'ABSENT', span: null },
     metadata: { rawMessageType: 1 },
   }
 }
@@ -1326,6 +1329,7 @@ async function testExplicitRememberStillWritesOwnerMemory(): Promise<void> {
       mentionState: 'MENTIONED',
       botMentionSpanTrust: 'VALID',
       botMentionSpanCount: 1,
+      userContentSpanTrust: 'VALID',
     })
     assert(handled.handled, 'the explicit remember request was not handled')
     assert(store.liveRecordCount === 1, 'the explicit remember request wrote nothing')

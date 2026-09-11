@@ -120,6 +120,7 @@ async function runExplicit(fixture: DeepSeekFixture, question: string): Promise<
       mentionState: 'MENTIONED',
       botMentionSpanTrust: 'VALID',
       botMentionSpanCount: 1,
+      userContentSpanTrust: 'VALID',
     })
     const records = store.retrieve([{ scopeType: 'OWNER', scopeId: REQUESTER, visibility: 'SHARED' }], 4)
     return { reply: result.reply, records, logs: [...logs, ...providerLogs], calls: provider.calls }

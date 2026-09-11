@@ -176,13 +176,14 @@ function createHarness(options: { mutate?: string; filePath?: string } = {}): Ha
 function groupRaw(overrides: Partial<RawHookMessage> = {}): RawHookMessage {
   const signature = overrides.signature ?? OWNER
   const senderId = overrides.senderId ?? signature
+  const content = overrides.content ?? `${BOT_TOKEN}你好`
   return {
     msgId: 'field-shape-1',
     type: 1,
     timestamp: NOW,
     from: ROOM,
     wxid: 'shared-account-synthetic',
-    content: `${BOT_TOKEN}你好`,
+    content,
     signature,
     senderName: 'Synthetic Sender',
     isMentioned: true,
@@ -194,6 +195,7 @@ function groupRaw(overrides: Partial<RawHookMessage> = {}): RawHookMessage {
     requesterSource: overrides.requesterSource ?? 'Signature',
     requesterRole: overrides.requesterRole ?? 'OWNER',
     ownerConfigured: overrides.ownerConfigured ?? true,
+    userContentSpan: overrides.userContentSpan ?? { start: 0, length: content.length },
   }
 }
 

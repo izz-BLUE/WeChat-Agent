@@ -1,5 +1,5 @@
 import { sanitizeFinalAnswer } from './final-answer.js'
-import type { BotMentionSpanFacts } from './canonical-user-text.js'
+import type { BotMentionSpanFacts, UserContentSpanFacts } from './canonical-user-text.js'
 import {
   normalizePassiveContextMessage,
   normalizeRawHookMessage,
@@ -43,6 +43,8 @@ export interface AgentRequest {
    * against the raw body. Absent means an older runtime that makes no claim.
    */
   botMentionSpans?: BotMentionSpanFacts
+  /** The runtime's resolved trusted GROUP user-content suffix claim. */
+  userContentSpan?: UserContentSpanFacts
   metadata: {
     rawMessageType: number
   }
@@ -176,6 +178,7 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     timestamp: message.timestamp,
     mentionState: toMentionState(message),
     botMentionSpans: message.botMentionSpans,
+    userContentSpan: message.userContentSpan,
     metadata: {
       rawMessageType: message.rawMessageType,
     },

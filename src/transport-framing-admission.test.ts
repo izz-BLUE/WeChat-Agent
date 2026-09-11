@@ -189,6 +189,7 @@ async function ask(
     requesterRole: role,
     ownerConfigured: role === 'OWNER',
     botMentionSpans: options.spans === undefined ? botSpansFor(options.content) : options.spans,
+    userContentSpan: { start: 0, length: options.content.length },
   }
   const normalized = normalizeRawHookMessage(raw)
   assert(normalized.status === 'VALID', `the synthetic contract message was rejected: ${normalized.status}`)

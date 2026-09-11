@@ -112,6 +112,7 @@ async function explicit(
     mentionState: 'MENTIONED',
     botMentionSpanTrust: 'VALID',
     botMentionSpanCount: 1,
+    userContentSpanTrust: 'VALID',
   })
   return result
 }

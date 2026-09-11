@@ -1,6 +1,13 @@
 export const SUPPORTED_TEXT_MESSAGE_TYPE = 1
 
-import { resolveBotMentionSpans, type BotMentionSpanFacts } from './canonical-user-text.js'
+import {
+  ABSENT_BOT_MENTION_SPANS,
+  canonicalUserText,
+  resolveBotMentionSpans,
+  resolveUserContentSpan,
+  type BotMentionSpanFacts,
+  type UserContentSpanFacts,
+} from './canonical-user-text.js'
 
 /**
  * Wire kind of the passive ambient event.
@@ -54,6 +61,8 @@ export interface RawHookMessage {
    * text — only offsets.
    */
   botMentionSpans?: ReadonlyArray<{ start?: unknown; length?: unknown }> | null
+  /** Trusted GROUP user-content suffix coordinates over the raw `content`. */
+  userContentSpan?: { start?: unknown; length?: unknown } | null
 }
 
 export interface InboundMessage {
@@ -93,6 +102,8 @@ export interface InboundMessage {
    * knowing which framing belongs to the bot.
    */
   botMentionSpans: BotMentionSpanFacts
+  /** Resolved trusted suffix claim over `rawText`; no framing is guessed. */
+  userContentSpan: UserContentSpanFacts
 }
 
 export type NormalizationResult =
@@ -242,6 +253,7 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
   const conversationType = resolveConversationType(raw, conversationId)
   const rawText = raw.content ?? ''
   const text = normalized(rawText)
+  const userContentSpan = resolveUserContentSpan(rawText, raw.userContentSpan)
 
   if (!messageId) {
     return { status: 'INVALID', reason: 'MESSAGE_ID_MISSING', rawMessageType: raw.type }
@@ -282,7 +294,8 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       // Resolved against the RAW body: the spans index that string, so validating
       // them against the trimmed view would invalidate every claim on a body with
       // padding.
-      botMentionSpans: resolveBotMentionSpans(rawText, raw.botMentionSpans),
+      botMentionSpans: resolveBotMentionSpans(rawText, raw.botMentionSpans, userContentSpan),
+      userContentSpan,
     },
   }
 }
@@ -314,7 +327,9 @@ export function normalizePassiveContextMessage(raw: RawHookMessage): PassiveNorm
 
   const messageId = normalized(raw.msgId)
   const conversationId = normalized(raw.conversationId) || normalized(raw.from)
-  const text = normalized(raw.content)
+  const rawText = raw.content ?? ''
+  const userContentSpan = resolveUserContentSpan(rawText, raw.userContentSpan)
+  const text = canonicalUserText(rawText, ABSENT_BOT_MENTION_SPANS, userContentSpan)
   const rawMessageType = raw.type
 
   if (!messageId) {

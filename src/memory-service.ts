@@ -50,7 +50,7 @@ import {
   type MemoryWriteStatus,
 } from './memory-models.js'
 import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
-import type { BotMentionSpanTrust, UserTextShape } from './canonical-user-text.js'
+import type { BotMentionSpanTrust, UserContentSpanTrust, UserTextShape } from './canonical-user-text.js'
 import type { MentionState } from './agent-adapter.js'
 import {
   buildAuthorizedMemoryWorkingSet,
@@ -106,6 +106,7 @@ export const MEMORY_ADMISSION_EVENT = 'MEMORY_ADMISSION'
 export type MemoryAdmissionBlocker =
   | 'NONE'
   | 'ROLE_NOT_OWNER'
+  | 'USER_CONTENT_SPAN_UNTRUSTED'
   | 'BOT_MENTION_SPAN_UNTRUSTED'
   | 'BODY_PREFIX_PRESENT'
   | 'GRAMMAR_MISS'
@@ -239,6 +240,7 @@ export interface MemoryReadRequest {
   mentionState?: MentionState
   botMentionSpanTrust?: BotMentionSpanTrust
   botMentionSpanCount?: number
+  userContentSpanTrust?: UserContentSpanTrust
 }
 
 export interface ExplicitMemoryRequest extends MemoryReadRequest {}
@@ -415,6 +417,10 @@ export class MemoryService {
       (request.botMentionSpanCount ?? 0) > 0
   }
 
+  private hasTrustedUserContentSpan(request: ExplicitMemoryRequest): boolean {
+    return request.userContentSpanTrust === 'VALID'
+  }
+
   /**
    * Why this entry did not admit a side effect, derived from structural facts only.
    *
@@ -432,6 +438,9 @@ export class MemoryService {
     }
     if (!this.hasTrustedBotMention(request)) {
       return 'BOT_MENTION_SPAN_UNTRUSTED'
+    }
+    if (!this.hasTrustedUserContentSpan(request)) {
+      return 'USER_CONTENT_SPAN_UNTRUSTED'
     }
     const canonicalLineCount = request.textShape?.canonicalLineCount
     if (canonicalLineCount === undefined) {
@@ -470,6 +479,7 @@ export class MemoryService {
       fields.botMentionSpanCount = request.textShape.botMentionSpanCount
       fields.botMentionSpanValid = request.textShape.botMentionSpanValid
       fields.botMentionSpanAbsent = request.textShape.botMentionSpanAbsent
+      fields.userContentSpanTrust = request.textShape.userContentSpanTrust
       fields.invisibleCharacterCount = request.textShape.invisibleCharacterCount
       fields.lineCount = request.textShape.lineCount
       fields.canonicalLineCount = request.textShape.canonicalLineCount
@@ -636,6 +646,16 @@ export class MemoryService {
         role: request.requesterRole,
         result: 'SKIPPED',
         reason: 'UNTRUSTED_BOT_MENTION_SPAN',
+      })
+      return { handled: false, reply: '' }
+    }
+    if (!this.hasTrustedUserContentSpan(request)) {
+      this.emitAdmission(request, 'CHAT', 'UNTRUSTED_USER_CONTENT_SPAN')
+      this.emit('MEMORY_TRIGGER', {
+        trigger: 'EXPLICIT_REMEMBER',
+        role: request.requesterRole,
+        result: 'SKIPPED',
+        reason: 'UNTRUSTED_USER_CONTENT_SPAN',
       })
       return { handled: false, reply: '' }
     }

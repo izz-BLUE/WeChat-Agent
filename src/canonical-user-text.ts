@@ -79,6 +79,23 @@ export interface BotMentionSpanFacts {
 
 export const ABSENT_BOT_MENTION_SPANS: BotMentionSpanFacts = { trust: 'ABSENT', spans: [] }
 
+/** Trusted suffix coordinates published by the runtime for GROUP framing. */
+export interface UserContentSpan {
+  /** UTF-16 code unit offset into the RAW body. */
+  start: number
+  /** UTF-16 code unit length of the trusted user suffix. */
+  length: number
+}
+
+export type UserContentSpanTrust = 'VALID' | 'INVALID' | 'ABSENT'
+
+export interface UserContentSpanFacts {
+  trust: UserContentSpanTrust
+  span: UserContentSpan | null
+}
+
+export const ABSENT_USER_CONTENT_SPAN: UserContentSpanFacts = { trust: 'ABSENT', span: null }
+
 export interface UserTextShape {
   /** Lines in the raw body, as the runtime delivered it. */
   lineCount: number
@@ -105,6 +122,8 @@ export interface UserTextShape {
   botMentionSpanValid: boolean
   /** True when the claim was absent (older runtime). */
   botMentionSpanAbsent: boolean
+  /** Whether the runtime's trusted GROUP user-content suffix claim is usable. */
+  userContentSpanTrust: UserContentSpanTrust
   /** Invisible formatting characters found (padding, not content). */
   invisibleCharacterCount: number
   /** True when the projection changed the text at all. */
@@ -131,7 +150,33 @@ export type LeadingLineLengthBucket = 'NONE' | 'SHORT' | 'MEDIUM' | 'LONG'
  * `INVALID`, because a partially trusted framing removal is exactly the failure
  * mode this contract exists to prevent.
  */
-export function resolveBotMentionSpans(raw: string, wire: unknown): BotMentionSpanFacts {
+export function resolveUserContentSpan(raw: string, wire: unknown): UserContentSpanFacts {
+  if (wire === null || wire === undefined) {
+    return ABSENT_USER_CONTENT_SPAN
+  }
+  if (typeof wire !== 'object' || Array.isArray(wire)) {
+    return { trust: 'INVALID', span: null }
+  }
+  const record = wire as Record<string, unknown>
+  const start = record.start
+  const length = record.length
+  if (typeof start !== 'number' || typeof length !== 'number' ||
+      !Number.isInteger(start) || !Number.isInteger(length) ||
+      start < 0 || length < 0) {
+    return { trust: 'INVALID', span: null }
+  }
+  const end = start + length
+  if (end > raw.length || end !== raw.length) {
+    return { trust: 'INVALID', span: null }
+  }
+  return { trust: 'VALID', span: { start, length } }
+}
+
+export function resolveBotMentionSpans(
+  raw: string,
+  wire: unknown,
+  userContentSpan: UserContentSpanFacts = ABSENT_USER_CONTENT_SPAN,
+): BotMentionSpanFacts {
   if (wire === null || wire === undefined) {
     return ABSENT_BOT_MENTION_SPANS
   }
@@ -160,6 +205,13 @@ export function resolveBotMentionSpans(raw: string, wire: unknown): BotMentionSp
     }
     if (start < 0 || length <= 0 || start + length > raw.length) {
       return { trust: 'INVALID', spans: [] }
+    }
+    if (userContentSpan.trust === 'VALID' && userContentSpan.span !== null) {
+      const bodyStart = userContentSpan.span.start
+      const bodyEnd = bodyStart + userContentSpan.span.length
+      if (start < bodyStart || start + length > bodyEnd) {
+        return { trust: 'INVALID', spans: [] }
+      }
     }
     if (start < previousEnd) {
       // Overlapping or unordered spans cannot be removed independently.
@@ -201,9 +253,20 @@ function isMentionTokenShape(token: string): boolean {
  * is passed through with newline normalization only, so no user content is ever
  * deleted on a guess.
  */
-export function canonicalUserText(raw: string, facts: BotMentionSpanFacts = ABSENT_BOT_MENTION_SPANS): string {
-  const normalized = normalizeNewlines(raw)
-  const withoutTokens = facts.trust === 'VALID' ? removeSpans(normalized, facts.spans) : normalized
+export function canonicalUserText(
+  raw: string,
+  facts: BotMentionSpanFacts = ABSENT_BOT_MENTION_SPANS,
+  userContentSpan: UserContentSpanFacts = ABSENT_USER_CONTENT_SPAN,
+): string {
+  const body = userContentSpan.trust === 'VALID' && userContentSpan.span !== null
+    ? raw.slice(userContentSpan.span.start, userContentSpan.span.start + userContentSpan.span.length)
+    : raw
+  const rebasedSpans = userContentSpan.trust === 'VALID' && userContentSpan.span !== null
+    ? facts.spans.map((span) => ({ start: span.start - userContentSpan.span!.start, length: span.length }))
+    : facts.spans
+  const projected = facts.trust === 'VALID' ? removeSpans(body, rebasedSpans) : body
+  const normalized = normalizeNewlines(projected)
+  const withoutTokens = normalized
   return withoutTokens
     .split('\n')
     .map((line) => line.replace(LINE_EDGE, ''))
@@ -227,9 +290,13 @@ function removeSpans(text: string, spans: readonly BotMentionSpan[]): string {
  * Booleans and counts only: no body text, no mention name, no conversation. This is
  * what makes an admission decision answerable from the field log alone.
  */
-export function describeUserText(raw: string, facts: BotMentionSpanFacts = ABSENT_BOT_MENTION_SPANS): UserTextShape {
+export function describeUserText(
+  raw: string,
+  facts: BotMentionSpanFacts = ABSENT_BOT_MENTION_SPANS,
+  userContentSpan: UserContentSpanFacts = ABSENT_USER_CONTENT_SPAN,
+): UserTextShape {
   const normalized = normalizeNewlines(raw)
-  const canonical = canonicalUserText(raw, facts)
+  const canonical = canonicalUserText(raw, facts, userContentSpan)
   const canonicalLines = canonical.length === 0 ? [] : canonical.split('\n')
   const leadingLine = canonicalLines[0] ?? ''
   return {
@@ -240,6 +307,7 @@ export function describeUserText(raw: string, facts: BotMentionSpanFacts = ABSEN
     botMentionSpanCount: facts.spans.length,
     botMentionSpanValid: facts.trust === 'VALID',
     botMentionSpanAbsent: facts.trust === 'ABSENT',
+    userContentSpanTrust: userContentSpan.trust,
     invisibleCharacterCount: (normalized.match(ANY_INVISIBLE) ?? []).length,
     canonicalized: canonical !== raw,
     canonicalBodyPresent: canonical.length > 0,

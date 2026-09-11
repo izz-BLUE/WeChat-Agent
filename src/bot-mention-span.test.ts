@@ -181,6 +181,7 @@ async function ask(harness: Harness, turn: Turn): Promise<string> {
     requesterRole: 'OWNER',
     ownerConfigured: true,
     botMentionSpans: turn.spans === undefined ? botSpansFor(turn.content) : turn.spans,
+    userContentSpan: turn.spans === null ? undefined : { start: 0, length: turn.content.length },
   }
   const normalized = normalizeRawHookMessage(raw)
   assert(normalized.status === 'VALID', `the synthetic contract message was rejected: ${normalized.status}`)

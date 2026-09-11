@@ -1,5 +1,10 @@
 import { ChatService, type ChatMentionFact } from './chat.js'
-import { canonicalUserText, describeUserText, ABSENT_BOT_MENTION_SPANS } from './canonical-user-text.js'
+import {
+  ABSENT_BOT_MENTION_SPANS,
+  ABSENT_USER_CONTENT_SPAN,
+  canonicalUserText,
+  describeUserText,
+} from './canonical-user-text.js'
 import { GroupContext, type GroupMessage } from './context.js'
 import { GroupAmbientContext } from './group-ambient-context.js'
 import { config, validateChatConfig } from './config.js'
@@ -117,6 +122,7 @@ export class ProductionChatAgent implements AgentExecutor {
     })
 
     const spanFacts = request.botMentionSpans ?? ABSENT_BOT_MENTION_SPANS
+    const userContentSpan = request.userContentSpan ?? ABSENT_USER_CONTENT_SPAN
     // Spans are UTF-16 offsets into the WIRE body, so the projection starts there;
     // `request.text` is the trimmed view and would shift every offset.
     const wireBody = request.rawText ?? request.text
@@ -129,10 +135,10 @@ export class ProductionChatAgent implements AgentExecutor {
       // retrieval query, the transcript and the final current request. It removes
       // exactly the spans the runtime identified as the BOT's tokens, so a mention
       // of another member stays in the sentence as real user text.
-      text: canonicalUserText(wireBody, spanFacts),
+      text: canonicalUserText(wireBody, spanFacts, userContentSpan),
       timestamp: request.timestamp,
     }
-    const textShape = describeUserText(wireBody, spanFacts)
+    const textShape = describeUserText(wireBody, spanFacts, userContentSpan)
     // The transcript window and the event ids it covers come from ONE selection
     // pass, so the ids used for cross-context de-duplication always describe the
     // messages that are about to be rendered.
@@ -190,6 +196,7 @@ export class ProductionChatAgent implements AgentExecutor {
         mentionState: request.mentionState,
         botMentionSpanTrust: spanFacts.trust,
         botMentionSpanCount: spanFacts.spans.length,
+        userContentSpanTrust: userContentSpan.trust,
       })
       if (explicit.handled) {
         return explicit.reply
