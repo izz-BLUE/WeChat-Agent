@@ -63,6 +63,13 @@ export const config = {
   memoryEnabled: (process.env.WECHAT_MEMORY_ENABLED ?? '1').trim() !== '0',
   memoryFilePath: memoryPath.filePath,
   memoryPathSource: memoryPath.source,
+  webSearchEnabled: (process.env.WEB_SEARCH_ENABLED ?? '0').trim() === '1',
+  webSearchProvider: process.env.WEB_SEARCH_PROVIDER?.trim() || 'tavily',
+  tavilyApiBase: process.env.TAVILY_API_BASE?.trim() ?? '',
+  tavilyApiKey: process.env.TAVILY_API_KEY ?? '',
+  webSearchMaxResults: positiveInteger('WEB_SEARCH_MAX_RESULTS', 5),
+  webSearchTimeoutMs: positiveInteger('WEB_SEARCH_TIMEOUT_MS', 8_000),
+  webSearchMaxContextChars: positiveInteger('WEB_SEARCH_MAX_CONTEXT_CHARS', 6_000),
 }
 
 export function validateChatConfig(): void {
@@ -76,5 +83,20 @@ export function validateChatConfig(): void {
 
   if (missing.length > 0) {
     throw new Error(`Chat mode requires: ${missing.join(', ')}`)
+  }
+
+  if (config.webSearchEnabled) {
+    if (config.webSearchProvider !== 'tavily') {
+      throw new Error(`Unsupported WEB_SEARCH_PROVIDER: ${config.webSearchProvider}`)
+    }
+    const webSearchMissing = [
+      ['TAVILY_API_BASE', config.tavilyApiBase],
+      ['TAVILY_API_KEY', config.tavilyApiKey],
+    ]
+      .filter(([, value]) => !value)
+      .map(([name]) => name)
+    if (webSearchMissing.length > 0) {
+      throw new Error(`Web search requires: ${webSearchMissing.join(', ')}`)
+    }
   }
 }

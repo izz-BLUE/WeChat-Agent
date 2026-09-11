@@ -6,7 +6,7 @@ import {
   describeUserText,
 } from './canonical-user-text.js'
 import { GroupContext, type GroupMessage } from './context.js'
-import { GroupAmbientContext } from './group-ambient-context.js'
+import { GroupAmbientContext, type AmbientLine } from './group-ambient-context.js'
 import { config, validateChatConfig } from './config.js'
 import type { AgentExecutor, AgentPassiveContext, AgentRequest } from './agent-adapter.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
@@ -14,6 +14,20 @@ import { MemoryExtractor } from './memory-extractor.js'
 import { MemoryService } from './memory-service.js'
 import { MemoryStore } from './memory-store.js'
 import { SpeakerLabelRegistry } from './speaker-labels.js'
+import {
+  buildWebSearchContext,
+  normalizeWebSearchResults,
+  TavilyWebSearchProvider,
+  WebSearchError,
+  type WebSearchFailureReason,
+  type WebSearchProvider,
+  type WebSearchResult,
+} from './web-search.js'
+import {
+  WebSearchPlanner,
+  parseWebSearchDecision,
+  type WebSearchPlannerLike,
+} from './web-search-planner.js'
 import {
   emitDiagnostic,
   PersistentRuntimeLog,
@@ -74,6 +88,12 @@ export interface ProductionChatAgentOptions {
    * silent no-op sink so the call sites stay identical for tests.
    */
   persistentLog?: PersistentRuntimeLog
+  /** Optional autonomous web-search seam. Absent means zero planner/provider calls. */
+  webSearchPlanner?: WebSearchPlannerLike | null
+  webSearchProvider?: WebSearchProvider | null
+  webSearchMaxResults?: number
+  webSearchTimeoutMs?: number
+  webSearchMaxContextChars?: number
 }
 
 export class ProductionChatAgent implements AgentExecutor {
@@ -82,6 +102,11 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly speakerLabels: SpeakerLabelRegistry
   private readonly memory: MemoryService | null
   private readonly persistentLog: PersistentRuntimeLog | null
+  private readonly webSearchPlanner: WebSearchPlannerLike | null
+  private readonly webSearchProvider: WebSearchProvider | null
+  private readonly webSearchMaxResults: number
+  private readonly webSearchTimeoutMs: number
+  private readonly webSearchMaxContextChars: number
 
   public constructor(
     private readonly chatService: ChatService,
@@ -90,6 +115,11 @@ export class ProductionChatAgent implements AgentExecutor {
     this.speakerLabels = options.speakerLabels ?? new SpeakerLabelRegistry()
     this.memory = options.memory ?? null
     this.persistentLog = options.persistentLog ?? null
+    this.webSearchPlanner = options.webSearchPlanner ?? null
+    this.webSearchProvider = options.webSearchProvider ?? null
+    this.webSearchMaxResults = options.webSearchMaxResults ?? config.webSearchMaxResults
+    this.webSearchTimeoutMs = options.webSearchTimeoutMs ?? config.webSearchTimeoutMs
+    this.webSearchMaxContextChars = options.webSearchMaxContextChars ?? config.webSearchMaxContextChars
     this.context = new GroupContext(
       config.maxContextMessages,
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
@@ -251,6 +281,13 @@ export class ProductionChatAgent implements AgentExecutor {
         })
       : []
 
+    const webSearch = await this.resolveWebSearch(
+      question.text,
+      window.messages,
+      ambient,
+      request,
+    )
+
     const answer = await this.chatService.reply(
       window.messages,
       question,
@@ -265,6 +302,7 @@ export class ProductionChatAgent implements AgentExecutor {
         // A disabled or absent store is a runtime fact: the model may not claim a
         // long-term memory that this process does not have.
         persistentMemoryAvailable: this.memory !== null && this.memory.isEnabled,
+        webSearch,
       },
       guardValues(request),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-chat') : undefined,
@@ -287,6 +325,110 @@ export class ProductionChatAgent implements AgentExecutor {
     }
 
     return answer
+  }
+
+  private async resolveWebSearch(
+    question: string,
+    recentContext: readonly GroupMessage[],
+    ambient: readonly AmbientLine[],
+    request: AgentRequest,
+  ): Promise<{
+    used: boolean
+    status: 'PASS' | 'FAILED'
+    results: readonly WebSearchResult[]
+    maxContextChars: number
+  } | undefined> {
+    if (this.webSearchPlanner === null) {
+      return undefined
+    }
+
+    const planner = await this.webSearchPlanner.plan(
+      {
+        question,
+        recentContext,
+        ambient,
+        now: new Date().toISOString(),
+      },
+      guardValues(request),
+    )
+    const revalidated = parseWebSearchDecision(JSON.stringify(planner.decision), guardValues(request))
+    const decision = planner.result === 'PASS' && revalidated.valid
+      ? revalidated.decision
+      : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const }
+    const decisionResult = planner.result === 'PASS' && revalidated.valid ? 'PASS' : 'FAIL'
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'WEB_SEARCH_DECISION',
+      {
+        action: decision.action,
+        result: decisionResult,
+        reasonCode: decision.reasonCode,
+        queryChars: decision.query?.length ?? 0,
+      },
+    )
+
+    if (decision.action !== 'SEARCH' || decision.query === null) {
+      return undefined
+    }
+
+    if (this.webSearchProvider === null) {
+      this.logWebSearch('FAIL', 0, 'DISABLED')
+      this.logWebSearchContext(0, 0, false)
+      return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
+    }
+
+    try {
+      const response = await this.webSearchProvider.search({
+        query: decision.query,
+        maxResults: this.webSearchMaxResults,
+        timeoutMs: this.webSearchTimeoutMs,
+      })
+      const normalized = normalizeWebSearchResults(response.results)
+      if (normalized.length === 0) {
+        this.logWebSearch('FAIL', 0, 'NO_RESULTS')
+        this.logWebSearchContext(0, 0, false)
+        return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
+      }
+
+      const bounded = buildWebSearchContext(normalized, this.webSearchMaxContextChars)
+      this.logWebSearch('PASS', bounded.results.length, 'NONE')
+      this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated)
+      if (bounded.results.length === 0) {
+        return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
+      }
+      return {
+        used: true,
+        status: 'PASS',
+        results: bounded.results,
+        maxContextChars: this.webSearchMaxContextChars,
+      }
+    } catch (error) {
+      const reason: WebSearchFailureReason = error instanceof WebSearchError
+        ? error.reason
+        : 'HTTP_ERROR'
+      this.logWebSearch('FAIL', 0, reason)
+      this.logWebSearchContext(0, 0, false)
+      return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
+    }
+  }
+
+  private logWebSearch(result: 'PASS' | 'FAIL', resultCount: number, reason: WebSearchFailureReason | 'NONE'): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'WEB_SEARCH',
+      { result, resultCount, reason },
+    )
+  }
+
+  private logWebSearchContext(resultCount: number, chars: number, truncated: boolean): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'WEB_SEARCH_CONTEXT',
+      { resultCount, chars, truncated },
+    )
   }
 }
 
@@ -328,9 +470,20 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
 
   validateChatConfig()
   const chatService = new ChatService(config.openAiApiBase, config.openAiApiKey, config.openAiModel)
+  const webSearchPlanner = config.webSearchEnabled
+    ? new WebSearchPlanner((system, user) => chatService.completeStructured(system, user))
+    : null
+  const webSearchProvider = config.webSearchEnabled
+    ? new TavilyWebSearchProvider(config.tavilyApiBase, config.tavilyApiKey)
+    : null
   return new ProductionChatAgent(chatService, {
     memory: createMemoryService(chatService, options.persistentLog),
     persistentLog: options.persistentLog,
+    webSearchPlanner,
+    webSearchProvider,
+    webSearchMaxResults: config.webSearchMaxResults,
+    webSearchTimeoutMs: config.webSearchTimeoutMs,
+    webSearchMaxContextChars: config.webSearchMaxContextChars,
   })
 }
 

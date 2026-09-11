@@ -1,0 +1,215 @@
+export interface WebSearchRequest {
+  query: string
+  maxResults: number
+  timeoutMs: number
+}
+
+export interface WebSearchResult {
+  sourceId: string
+  title: string
+  url: string
+  snippet: string
+  publishedAt?: string | null
+}
+
+export interface WebSearchResponse {
+  results: readonly WebSearchResult[]
+}
+
+export interface WebSearchProvider {
+  search(request: WebSearchRequest): Promise<WebSearchResponse>
+}
+
+export type WebSearchFailureReason = 'TIMEOUT' | 'HTTP_ERROR' | 'INVALID_RESPONSE' | 'NO_RESULTS' | 'DISABLED'
+
+export class WebSearchError extends Error {
+  public constructor(public readonly reason: Exclude<WebSearchFailureReason, 'NO_RESULTS'>) {
+    super(`Web search failed: ${reason}`)
+    this.name = 'WebSearchError'
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function cleanText(value: unknown, maxChars: number): string {
+  if (typeof value !== 'string') {
+    return ''
+  }
+  return value
+    .replace(/<[^>]*>/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .slice(0, maxChars)
+}
+
+function cleanUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2048) {
+    return null
+  }
+  try {
+    const parsed = new URL(value)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null
+    }
+    return parsed.href
+  } catch {
+    return null
+  }
+}
+
+/** Normalize provider-shaped data before it can enter a prompt or final source list. */
+export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchResult[] {
+  const results: WebSearchResult[] = []
+  const seen = new Set<string>()
+  for (const item of input) {
+    const record = asRecord(item)
+    if (!record) {
+      continue
+    }
+    const url = cleanUrl(record.url)
+    const title = cleanText(record.title, 160)
+    const snippet = cleanText(record.snippet ?? record.content, 1200)
+    if (url === null || (title.length === 0 && snippet.length === 0) || seen.has(url)) {
+      continue
+    }
+    seen.add(url)
+    const publishedAt = typeof record.publishedAt === 'string' ? record.publishedAt.slice(0, 80) : null
+    results.push({ sourceId: `S${results.length + 1}`, title, url, snippet, publishedAt })
+  }
+  return results
+}
+
+export interface WebSearchContext {
+  text: string
+  results: readonly WebSearchResult[]
+  chars: number
+  truncated: boolean
+}
+
+/** Render only bounded title/snippet data; URLs remain outside the model prompt. */
+export function buildWebSearchContext(results: readonly WebSearchResult[], maxChars: number): WebSearchContext {
+  const header = '[Web Search Results]\n'
+  const budget = Math.max(0, maxChars)
+  if (budget <= 0) {
+    return { text: '', results: [], chars: 0, truncated: results.length > 0 }
+  }
+
+  let text = header.slice(0, budget)
+  const selected: WebSearchResult[] = []
+  let truncated = text.length < header.length
+  for (const item of results) {
+    if (text.length >= budget) {
+      truncated = true
+      break
+    }
+    const block = `[${item.sourceId}]\nTitle: ${item.title}\nSnippet: ${item.snippet}\n`
+    const remaining = budget - text.length
+    if (block.length <= remaining) {
+      text += block
+      selected.push(item)
+      continue
+    }
+    text += block.slice(0, remaining)
+    selected.push(item)
+    truncated = true
+    break
+  }
+
+  if (selected.length < results.length) {
+    truncated = true
+  }
+  return { text, results: selected, chars: text.length, truncated }
+}
+
+function containsForbiddenValue(value: string, forbiddenValues: readonly string[]): boolean {
+  return forbiddenValues.some((forbidden) => forbidden.length > 0 && value.includes(forbidden))
+}
+
+/** Keep source references grounded in the provider response and remove model-created URLs. */
+export function appendGroundedSources(
+  answer: string,
+  results: readonly WebSearchResult[],
+  forbiddenValues: readonly string[] = [],
+): string {
+  const safeResults = results.filter((item) => !containsForbiddenValue(`${item.title} ${item.url}`, forbiddenValues))
+  const sourceById = new Map(safeResults.map((item) => [item.sourceId, item]))
+  const referencedIds = [...answer.matchAll(/\[(S\d+)\]/gu)]
+    .map((match) => match[1])
+    .filter((sourceId): sourceId is string => sourceId !== undefined && sourceById.has(sourceId))
+  const selected = referencedIds.length > 0
+    ? [...new Set(referencedIds)].map((sourceId) => sourceById.get(sourceId)!).slice(0, 3)
+    : safeResults.slice(0, 2)
+
+  const groundedAnswer = answer.replace(/https?:\/\/[^\s)\]}>]+/gu, (url) => {
+    return safeResults.some((item) => item.url === url) ? url : ''
+  })
+  if (selected.length === 0) {
+    return groundedAnswer
+  }
+
+  const sourceLines = selected.map((item, index) => `${index + 1}. ${item.title} ${item.url}`).join('\n')
+  return `${groundedAnswer}\n\n来源：\n${sourceLines}`
+}
+
+export class TavilyWebSearchProvider implements WebSearchProvider {
+  public constructor(
+    private readonly apiBase: string,
+    private readonly apiKey: string,
+  ) {}
+
+  public async search(request: WebSearchRequest): Promise<WebSearchResponse> {
+    if (!this.apiBase || !this.apiKey) {
+      throw new WebSearchError('DISABLED')
+    }
+
+    const endpoint = this.apiBase.replace(/\/$/u, '').endsWith('/search')
+      ? this.apiBase
+      : `${this.apiBase.replace(/\/$/u, '')}/search`
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), request.timeoutMs)
+    try {
+      let response: Response
+      try {
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: this.apiKey,
+            query: request.query,
+            search_depth: 'basic',
+            max_results: request.maxResults,
+            include_answer: false,
+            include_raw_content: false,
+            include_images: false,
+          }),
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (controller.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+          throw new WebSearchError('TIMEOUT')
+        }
+        throw new WebSearchError('HTTP_ERROR')
+      }
+
+      if (!response.ok) {
+        throw new WebSearchError('HTTP_ERROR')
+      }
+
+      let data: unknown
+      try {
+        data = await response.json()
+      } catch {
+        throw new WebSearchError('INVALID_RESPONSE')
+      }
+      const record = asRecord(data)
+      if (!record || !Array.isArray(record.results)) {
+        throw new WebSearchError('INVALID_RESPONSE')
+      }
+      return { results: normalizeWebSearchResults(record.results).slice(0, request.maxResults) }
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+}
