@@ -554,6 +554,16 @@ export class MemoryService {
     this.scheduleFlush(slot, batch, trigger)
   }
 
+  /** Diagnostic-only fail-closed path for an untrusted GROUP body claim. */
+  public reportUntrustedUserContentSpan(role: RequesterRole): void {
+    this.emit('MEMORY_TRIGGER', {
+      trigger: 'NONE',
+      role,
+      result: 'SKIPPED',
+      reason: 'USER_CONTENT_SPAN_UNTRUSTED',
+    })
+  }
+
   /**
    * Historical `RetrieveForChatAsync`, GROUP contract only, now returning the
    * CONTEXTUAL MEMORY WORKING SET.

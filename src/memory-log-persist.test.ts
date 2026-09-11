@@ -144,6 +144,7 @@ interface RawMessage {
   requesterSource: string
   requesterRole: string
   ownerConfigured: boolean
+  userContentSpan: { start: number; length: number }
 }
 
 function inbound(raw: RawMessage): string {
@@ -168,6 +169,7 @@ function groupMessage(msgId: string, content: string, isMentioned = true): RawMe
     requesterSource: 'Signature',
     requesterRole: 'MEMBER',
     ownerConfigured: false,
+    userContentSpan: { start: 0, length: content.length },
   }
 }
 

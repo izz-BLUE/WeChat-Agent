@@ -329,7 +329,6 @@ export function normalizePassiveContextMessage(raw: RawHookMessage): PassiveNorm
   const conversationId = normalized(raw.conversationId) || normalized(raw.from)
   const rawText = raw.content ?? ''
   const userContentSpan = resolveUserContentSpan(rawText, raw.userContentSpan)
-  const text = canonicalUserText(rawText, ABSENT_BOT_MENTION_SPANS, userContentSpan)
   const rawMessageType = raw.type
 
   if (!messageId) {
@@ -337,9 +336,6 @@ export function normalizePassiveContextMessage(raw: RawHookMessage): PassiveNorm
   }
   if (!conversationId) {
     return { status: 'INVALID', reason: 'CONVERSATION_ID_MISSING', rawMessageType }
-  }
-  if (!text) {
-    return { status: 'INVALID', reason: 'TEXT_EMPTY', rawMessageType }
   }
   if (!Number.isFinite(raw.timestamp) || raw.timestamp < 0) {
     return { status: 'INVALID', reason: 'TIMESTAMP_INVALID', rawMessageType }
@@ -352,6 +348,14 @@ export function normalizePassiveContextMessage(raw: RawHookMessage): PassiveNorm
   }
   if (raw.isMentioned !== false) {
     return { status: 'INVALID', reason: 'PASSIVE_CONTEXT_MENTION_FLAG_MISSING', rawMessageType }
+  }
+  if (userContentSpan.trust !== 'VALID') {
+    return { status: 'INVALID', reason: 'PASSIVE_CONTEXT_USER_CONTENT_SPAN_UNTRUSTED', rawMessageType }
+  }
+
+  const text = canonicalUserText(rawText, ABSENT_BOT_MENTION_SPANS, userContentSpan)
+  if (!text) {
+    return { status: 'INVALID', reason: 'TEXT_EMPTY', rawMessageType }
   }
 
   const senderId = normalized(raw.senderId)

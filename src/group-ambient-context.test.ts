@@ -93,13 +93,14 @@ function cleanup(): void {
 export function passiveRaw(overrides: Partial<RawHookMessage> = {}): RawHookMessage {
   const from = overrides.from ?? GROUP_A
   const signature = overrides.signature ?? SIGNATURE_A
+  const content = overrides.content ?? '普通群消息'
   return {
     msgId: overrides.msgId ?? 'passive-1',
     type: overrides.type ?? 1,
     timestamp: overrides.timestamp ?? Date.now(),
     from,
     wxid: 'shared-account-wxid',
-    content: overrides.content ?? '普通群消息',
+    content,
     signature,
     senderName: overrides.senderName ?? null,
     isMentioned: overrides.isMentioned ?? false,
@@ -108,19 +109,21 @@ export function passiveRaw(overrides: Partial<RawHookMessage> = {}): RawHookMess
     senderId: overrides.senderId ?? signature,
     requesterId: overrides.requesterId ?? overrides.senderId ?? signature,
     requesterSource: overrides.requesterSource ?? 'Signature',
+    userContentSpan: overrides.userContentSpan ?? { start: 0, length: content.length },
   }
 }
 
 export function activeRaw(overrides: Partial<RawHookMessage> = {}): RawHookMessage {
   const from = overrides.from ?? GROUP_A
   const signature = overrides.signature ?? SIGNATURE_C
+  const content = overrides.content ?? '@椰椰 你觉得是什么原因？'
   return {
     msgId: overrides.msgId ?? 'active-1',
     type: overrides.type ?? 1,
     timestamp: overrides.timestamp ?? Date.now(),
     from,
     wxid: 'shared-account-wxid',
-    content: overrides.content ?? '@椰椰 你觉得是什么原因？',
+    content,
     signature,
     senderName: overrides.senderName ?? null,
     isMentioned: overrides.isMentioned ?? true,
@@ -132,6 +135,7 @@ export function activeRaw(overrides: Partial<RawHookMessage> = {}): RawHookMessa
     requesterRole: overrides.requesterRole ?? 'MEMBER',
     ownerConfigured: overrides.ownerConfigured ?? false,
     ownerDisplayName: overrides.ownerDisplayName ?? null,
+    userContentSpan: overrides.userContentSpan ?? { start: 0, length: content.length },
   }
 }
 

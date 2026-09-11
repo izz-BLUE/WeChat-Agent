@@ -42,6 +42,24 @@ function guardValues(request: AgentRequest): string[] {
   return [request.requesterId, request.conversationId, request.senderId]
 }
 
+const UNTRUSTED_GROUP_ID_PLACEHOLDER = '[REDACTED_ID]'
+
+/**
+ * Privacy-only fallback for an older/invalid GROUP user-content claim.
+ * This replaces exact runtime-known identity values without attempting to
+ * infer where the user's body starts or interpreting any framing syntax.
+ */
+function redactUntrustedGroupIds(text: string, request: AgentRequest): string {
+  const values = [request.requesterId, request.senderId, request.conversationId]
+    .filter((value) => value.length > 0)
+    .sort((left, right) => right.length - left.length)
+  let redacted = text
+  for (const value of values) {
+    redacted = redacted.split(value).join(UNTRUSTED_GROUP_ID_PLACEHOLDER)
+  }
+  return redacted
+}
+
 export interface ProductionChatAgentOptions {
   /** Persistent memory. Absent means memory is disabled (tests, fake mode). */
   memory?: MemoryService | null
@@ -126,6 +144,10 @@ export class ProductionChatAgent implements AgentExecutor {
     // Spans are UTF-16 offsets into the WIRE body, so the projection starts there;
     // `request.text` is the trimmed view and would shift every offset.
     const wireBody = request.rawText ?? request.text
+    const canonicalText = canonicalUserText(wireBody, spanFacts, userContentSpan)
+    const questionText = request.conversationType === 'GROUP' && userContentSpan.trust !== 'VALID'
+      ? redactUntrustedGroupIds(canonicalText, request)
+      : canonicalText
     const question: GroupMessage = {
       senderId: request.senderId,
       // Never the raw runtime identity: the label is role/pseudonym based.
@@ -135,7 +157,7 @@ export class ProductionChatAgent implements AgentExecutor {
       // retrieval query, the transcript and the final current request. It removes
       // exactly the spans the runtime identified as the BOT's tokens, so a mention
       // of another member stays in the sentence as real user text.
-      text: canonicalUserText(wireBody, spanFacts, userContentSpan),
+      text: questionText,
       timestamp: request.timestamp,
     }
     const textShape = describeUserText(wireBody, spanFacts, userContentSpan)
@@ -202,17 +224,21 @@ export class ProductionChatAgent implements AgentExecutor {
         return explicit.reply
       }
 
-      this.memory.observeHumanMessage({
-        messageId: request.messageId,
-        conversationType: request.conversationType,
-        conversationId: request.conversationId,
-        requesterId: request.requesterId,
-        requesterRole: request.requesterRole,
-        speakerLabel: label,
-        text: question.text,
-        timestamp: request.timestamp,
-        chatTriggered: true,
-      })
+      if (request.conversationType === 'GROUP' && userContentSpan.trust !== 'VALID') {
+        this.memory.reportUntrustedUserContentSpan(request.requesterRole)
+      } else {
+        this.memory.observeHumanMessage({
+          messageId: request.messageId,
+          conversationType: request.conversationType,
+          conversationId: request.conversationId,
+          requesterId: request.requesterId,
+          requesterRole: request.requesterRole,
+          speakerLabel: label,
+          text: question.text,
+          timestamp: request.timestamp,
+          chatTriggered: true,
+        })
+      }
     }
 
     const memory = this.memory

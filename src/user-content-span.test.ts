@@ -30,16 +30,19 @@ const temporaryDirectories: string[] = []
 
 interface ProviderCall {
   ambient?: readonly { text: string }[]
+  questionText?: string
 }
 
 interface Harness {
   directory: string
   agent: ProductionChatAgent
+  ambient: GroupAmbientContext
   store: MemoryStore
   service: MemoryService
   mutationCalls: string[]
   finalCalls: ProviderCall[]
   logs: string[]
+  extractorCalls: { count: number }
 }
 
 function tempDir(): string {
@@ -58,14 +61,22 @@ function cleanup(): void {
   }
 }
 
-function createHarness(mutateResponse = '{"operation":"NONE"}', directory = tempDir()): Harness {
+function createHarness(
+  mutateResponse = '{"operation":"NONE"}',
+  directory = tempDir(),
+  extractorResponse = '[]',
+): Harness {
   const logs: string[] = []
   const mutationCalls: string[] = []
   const finalCalls: ProviderCall[] = []
+  const extractorCalls = { count: 0 }
   const store = new MemoryStore({ filePath: memoryFileIn(directory), log: (line) => logs.push(line), pathSource: 'TEST' })
   const service = new MemoryService({
     store,
-    extractor: new MemoryExtractor(async () => '[]'),
+    extractor: new MemoryExtractor(async () => {
+      extractorCalls.count += 1
+      return extractorResponse
+    }),
     mutate: async (_system, user) => {
       mutationCalls.push(user)
       return mutateResponse
@@ -74,16 +85,21 @@ function createHarness(mutateResponse = '{"operation":"NONE"}', directory = temp
     enableTimer: false,
   })
   const chat = {
-    async reply(_context: unknown, _question: unknown, request: ProviderCall): Promise<string> {
-      finalCalls.push(request)
+    async reply(_context: unknown, question: unknown, request: ProviderCall): Promise<string> {
+      const questionText = typeof question === 'object' && question !== null &&
+        'text' in question && typeof question.text === 'string'
+        ? question.text
+        : undefined
+      finalCalls.push({ ...request, questionText })
       return '收到。'
     },
   }
+  const ambient = new GroupAmbientContext({ sink: undefined, now: () => NOW })
   const agent = new ProductionChatAgent(chat as never, {
     memory: service,
-    ambientContext: new GroupAmbientContext({ sink: undefined, now: () => NOW }),
+    ambientContext: ambient,
   })
-  return { directory, agent, store, service, mutationCalls, finalCalls, logs }
+  return { directory, agent, ambient, store, service, mutationCalls, finalCalls, logs, extractorCalls }
 }
 
 function rawMessage(
@@ -306,6 +322,84 @@ async function testPassiveAmbientUsesTrustedBody(): Promise<void> {
   }
 }
 
+async function testUntrustedSpanBlocksAutomaticMemory(): Promise<void> {
+  const content = `${PREFIX}普通聊天`
+  const cases: Array<[string, unknown]> = [
+    ['absent', undefined],
+    ['invalid', { start: 0, length: content.length - 1 }],
+  ]
+  for (const [name, userContentSpan] of cases) {
+    const harness = createHarness(
+      '{"operation":"NONE"}',
+      tempDir(),
+      '[{"scope":"MEMBER","content":"不应被写入"}]',
+    )
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        await complete(harness, rawMessage(content, {
+          userContentSpan,
+          botMentionSpans: [],
+        }))
+      }
+      await harness.service.flushAll()
+      assert(harness.extractorCalls.count === 0, `${name}: untrusted span entered automatic extraction`)
+      assert(harness.store.liveRecordCount === 0, `${name}: untrusted span wrote persistent memory`)
+      assert(harness.finalCalls.length === 3, `${name}: ordinary chat did not continue`)
+      assert(
+        harness.logs.some((line) => line.includes('trigger=NONE') && line.includes('reason=USER_CONTENT_SPAN_UNTRUSTED')),
+        `${name}: missing untrusted-span diagnostic`,
+      )
+    } finally {
+      harness.service.close()
+    }
+  }
+}
+
+async function testUntrustedSpanRedactsRawIdsFromProviderQuestion(): Promise<void> {
+  const harness = createHarness()
+  const content = `${PREFIX}${BOT_TOKEN}你好`
+  try {
+    await complete(harness, rawMessage(content, {
+      userContentSpan: undefined,
+      botMentionSpans: [{ start: PREFIX.length, length: BOT_TOKEN.length }],
+    }))
+    assert(harness.finalCalls.length === 1, 'untrusted old wire did not make one normal chat provider call')
+    const question = harness.finalCalls[0]?.questionText ?? ''
+    assert(!question.includes(SIGNATURE), 'raw Signature reached the provider-visible question')
+    assert(!question.includes(ROOM), 'raw conversation id reached the provider-visible question')
+    assert(!question.includes('shared-account-synthetic'), 'raw wxid reached the provider-visible question')
+    assert(harness.mutationCalls.length === 0, 'untrusted old wire reached mutation')
+    assert(harness.extractorCalls.count === 0, 'untrusted old wire reached automatic extraction')
+    assert(harness.store.liveRecordCount === 0, 'untrusted old wire wrote persistent memory')
+  } finally {
+    harness.service.close()
+  }
+}
+
+async function testUntrustedPassiveSpanIsDropped(): Promise<void> {
+  const content = `${PREFIX}今晚吃火锅`
+  for (const [name, userContentSpan] of [
+    ['absent', undefined],
+    ['invalid', { start: 0, length: content.length - 1 }],
+  ] as const) {
+    const harness = createHarness()
+    try {
+      const result = await runRawPassiveContextPipeline(
+        rawMessage(content, { isMentioned: false, userContentSpan, botMentionSpans: [] }),
+        harness.agent,
+      )
+      assert(result.status === 'INVALID', `${name}: untrusted passive event was not dropped`)
+      assert(harness.finalCalls.length === 0, `${name}: untrusted passive event reached provider`)
+      assert(harness.mutationCalls.length === 0, `${name}: untrusted passive event reached mutation`)
+      assert(harness.extractorCalls.count === 0, `${name}: untrusted passive event reached extractor`)
+      assert(harness.store.liveRecordCount === 0, `${name}: untrusted passive event changed memory`)
+      assert(harness.ambient.count(ROOM) === 0, `${name}: untrusted passive event was appended`)
+    } finally {
+      harness.service.close()
+    }
+  }
+}
+
 const cases: Array<[string, () => Promise<void> | void]> = [
   ['real-shape-canonical-and-admitted', testRealShapeIsCanonicalAndAdmitted],
   ['persistence-restart-reads-memory', testPersistenceRestartReadsMemory],
@@ -315,6 +409,9 @@ const cases: Array<[string, () => Promise<void> | void]> = [
   ['bot-span-outside-body-invalidates-claim', testBotSpanOutsideTrustedBodyInvalidatesBotClaim],
   ['crlf-keeps-raw-bot-coordinates', testCrLfKeepsRawBotCoordinates],
   ['passive-ambient-uses-trusted-body', testPassiveAmbientUsesTrustedBody],
+  ['untrusted-span-blocks-automatic-memory', testUntrustedSpanBlocksAutomaticMemory],
+  ['untrusted-span-redacts-raw-ids-from-provider-question', testUntrustedSpanRedactsRawIdsFromProviderQuestion],
+  ['untrusted-passive-span-is-dropped', testUntrustedPassiveSpanIsDropped],
 ]
 
 let failures = 0
