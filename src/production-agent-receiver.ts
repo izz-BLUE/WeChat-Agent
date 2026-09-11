@@ -9,7 +9,7 @@ import {
 import { GroupContext, type GroupMessage } from './context.js'
 import { ASSISTANT_LABEL, GroupAmbientContext, type AmbientLine } from './group-ambient-context.js'
 import { config, validateChatConfig } from './config.js'
-import type { AgentExecutor, AgentPassiveContext, AgentRequest } from './agent-adapter.js'
+import type { AgentExecutor, AgentPassiveContext, AgentRequest, OutboundCommand } from './agent-adapter.js'
 import {
   PendingOutboundReplyStore,
   type OutboundDeliveryAck,
@@ -44,6 +44,12 @@ import {
 } from './persistent-runtime-log.js'
 import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from './runtime-time.js'
 import { observeGroupStyle } from './group-style.js'
+import { type OwnerDispatchPlannerLike, OwnerDispatchPlanner } from './owner-dispatch-planner.js'
+import {
+  DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
+  DEFAULT_PROACTIVE_QUEUE_TTL_MS,
+  ProactiveGroupQueue,
+} from './proactive-group-queue.js'
 
 /**
  * The mention fact handed to the model. A group message only reaches the Agent
@@ -108,6 +114,10 @@ export interface ProductionChatAgentOptions {
   runtimeTimeZone?: string
   pendingOutboundMaxEntries?: number
   pendingOutboundTtlMs?: number
+  ownerDispatchPlanner?: OwnerDispatchPlannerLike | null
+  proactiveQueue?: ProactiveGroupQueue
+  proactiveQueueMaxEntries?: number
+  proactiveQueueTtlMs?: number
 }
 
 export class ProductionChatAgent implements AgentExecutor {
@@ -124,6 +134,8 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly runtimeClock: RuntimeClock
   private readonly runtimeTimeZone: string | undefined
   private readonly pendingOutbound: PendingOutboundReplyStore
+  private readonly ownerDispatchPlanner: OwnerDispatchPlannerLike | null
+  private readonly proactiveQueue: ProactiveGroupQueue
 
   public constructor(
     private readonly chatService: ChatService,
@@ -145,6 +157,11 @@ export class ProductionChatAgent implements AgentExecutor {
       // Pending delivery is process-local wall-clock state. The request timestamp
       // remains the ambient event timestamp; it is not used as a TTL clock.
       now: () => Date.now(),
+    })
+    this.ownerDispatchPlanner = options.ownerDispatchPlanner ?? null
+    this.proactiveQueue = options.proactiveQueue ?? new ProactiveGroupQueue({
+      maxEntries: options.proactiveQueueMaxEntries ?? DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
+      ttlMs: options.proactiveQueueTtlMs ?? DEFAULT_PROACTIVE_QUEUE_TTL_MS,
     })
     this.context = new GroupContext(
       config.maxContextMessages,
@@ -187,6 +204,44 @@ export class ProductionChatAgent implements AgentExecutor {
   /** Returns the opaque identity staged for the exact generated answer. */
   public takeOutboundIdentity(request: AgentRequest, text: string): OutboundIdentity | null {
     return this.pendingOutbound.getIdentityFor(request.messageId, text)
+  }
+
+  /**
+   * Poll-only drain. Claiming happens before the command leaves this process and
+   * the pending delivery record is staged before the C# side can send it.
+   */
+  public pollProactiveOutbound(): OutboundCommand | null {
+    const expired = this.proactiveQueue.pruneExpired()
+    if (expired > 0) this.logProactiveQueue('EXPIRE', 'DROP', expired)
+
+    const item = this.proactiveQueue.claimReady()
+    if (item === null) return null
+
+    this.logProactiveQueue('CLAIM', 'PASS', this.proactiveQueue.size)
+    const requestMessageId = `proactive:${item.taskId}`
+    try {
+      const identity = this.pendingOutbound.stage({
+        requestMessageId,
+        conversationType: item.conversationType,
+        conversationId: item.conversationId,
+        text: item.text,
+        timestamp: item.createdAt,
+      })
+      this.proactiveQueue.finalize(item.taskId)
+      this.logProactiveQueue('FINALIZE', 'PASS', this.proactiveQueue.size)
+      return {
+        outboundId: identity.outboundId,
+        requestMessageId: identity.requestMessageId,
+        contentSha256: identity.contentSha256,
+        conversationType: item.conversationType,
+        conversationId: item.conversationId,
+        text: item.text,
+      }
+    } catch {
+      this.proactiveQueue.finalize(item.taskId)
+      this.logProactiveQueue('FINALIZE', 'DROP', this.proactiveQueue.size)
+      return null
+    }
   }
 
   /**
@@ -334,7 +389,13 @@ export class ProductionChatAgent implements AgentExecutor {
       if (explicit.handled) {
         return explicit.reply
       }
+    }
 
+    if (await this.tryOwnerDispatch(request, question.text)) {
+      return ''
+    }
+
+    if (this.memory) {
       if (request.conversationType === 'GROUP' && userContentSpan.trust !== 'VALID') {
         this.memory.reportUntrustedUserContentSpan(request.requesterRole)
       } else {
@@ -413,6 +474,65 @@ export class ProductionChatAgent implements AgentExecutor {
     }
 
     return answer
+  }
+
+  private async tryOwnerDispatch(request: AgentRequest, question: string): Promise<boolean> {
+    const authorized = request.conversationType === 'GROUP' &&
+      request.requesterRole === 'OWNER' &&
+      request.mentionState === 'MENTIONED' &&
+      request.botMentionSpans?.trust === 'VALID' &&
+      request.botMentionSpans.spans.length > 0 &&
+      request.userContentSpan?.trust === 'VALID'
+    if (!authorized || this.ownerDispatchPlanner === null) {
+      this.logOwnerDispatch('CHAT', 'FAIL', authorized ? 'PLANNER_UNAVAILABLE' : 'AUTHORIZATION')
+      return false
+    }
+
+    let plan
+    try {
+      plan = await this.ownerDispatchPlanner.plan(question, guardValues(request))
+    } catch {
+      this.logOwnerDispatch('CHAT', 'FAIL', 'PLANNER_EXCEPTION')
+      return false
+    }
+    if (plan.result !== 'PASS' || plan.decision.action !== 'DISPATCH_NOW' || !plan.decision.message) {
+      this.logOwnerDispatch('CHAT', plan.result === 'PASS' ? 'PASS' : 'FAIL', plan.failureReason ?? 'PLANNER_CHAT')
+      return false
+    }
+
+    const queued = this.proactiveQueue.enqueue({
+      conversationType: 'GROUP',
+      conversationId: request.conversationId,
+      text: plan.decision.message,
+    })
+    if (!queued.accepted) {
+      this.logOwnerDispatch('DISPATCH_NOW', 'FAIL', queued.reason)
+      this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size)
+      // A dispatch decision is still a handled command. Do not turn a full or
+      // invalid queue into a second normal bot reply in the same inbound turn.
+      return true
+    }
+    this.logOwnerDispatch('DISPATCH_NOW', 'PASS', 'ENQUEUED')
+    this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
+    return true
+  }
+
+  private logOwnerDispatch(action: 'CHAT' | 'DISPATCH_NOW', result: 'PASS' | 'FAIL', reason: string): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      'OWNER_DISPATCH',
+      { action, result, reason },
+    )
+  }
+
+  private logProactiveQueue(operation: 'ENQUEUE' | 'CLAIM' | 'FINALIZE' | 'EXPIRE', result: 'PASS' | 'DROP', queueSize: number): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      'PROACTIVE_QUEUE',
+      { operation, result, queueSize },
+    )
   }
 
   private async resolveWebSearch(
@@ -582,6 +702,7 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     webSearchTimeoutMs: config.webSearchTimeoutMs,
     webSearchMaxContextChars: config.webSearchMaxContextChars,
     runtimeTimeZone: config.agentTimeZone,
+    ownerDispatchPlanner: new OwnerDispatchPlanner((system, user) => chatService.completeStructured(system, user)),
   })
 }
 

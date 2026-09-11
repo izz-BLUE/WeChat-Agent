@@ -88,6 +88,9 @@ export interface AgentPassiveContext {
 export interface AgentExecutor {
   complete(request: AgentRequest): Promise<string | null | undefined>
 
+  /** Drain one already-authorized proactive command without entering any chat path. */
+  pollProactiveOutbound?(): OutboundCommand | null
+
   /**
    * Production agents stage a normal generated answer before returning it. The
    * adapter only needs the opaque identity that belongs to the final command.

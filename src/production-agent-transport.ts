@@ -61,6 +61,7 @@ export interface ProductionTransportSummaryEntry {
 type InboundEnvelope =
   | { kind: 'INBOUND_MESSAGE'; message: RawHookMessage }
   | { kind: typeof PASSIVE_CONTEXT_KIND; message: RawHookMessage }
+  | { kind: typeof PROACTIVE_OUTBOUND_POLL_KIND; pollId: string }
   | { kind: typeof OUTBOUND_DELIVERY_ACK_KIND; payload: OutboundDeliveryAck }
 
 type AgentResponse =
@@ -68,6 +69,8 @@ type AgentResponse =
   | { kind: 'ERROR'; code: string; message?: string }
   | { kind: 'CONTEXT_ACCEPTED' }
   | { kind: 'CONTEXT_NOT_ACCEPTED'; reason?: string }
+  | { kind: 'NO_PROACTIVE_OUTBOUND' }
+  | ({ kind: 'PROACTIVE_OUTBOUND_COMMAND' } & OutboundCommand)
   | { kind: 'DELIVERY_ACK_ACCEPTED'; reason: 'SENT_COMMITTED' | 'FAILED_DISCARDED' }
   | { kind: 'DELIVERY_ACK_REJECTED'; reason: DeliveryAckRejectReason }
   | ({ kind: 'OUTBOUND_COMMAND' } & OutboundCommand)
@@ -263,6 +266,11 @@ export class ProductionAgentTransportServer {
       return
     }
 
+    if (envelope.kind === PROACTIVE_OUTBOUND_POLL_KIND) {
+      await this.processProactivePoll(socket)
+      return
+    }
+
     this.messageCount += 1
     observeRawInbound(envelope.message)
     const identity = requesterIdentityFields(envelope.message)
@@ -354,6 +362,25 @@ export class ProductionAgentTransportServer {
     await writeResponse(socket, response)
   }
 
+  private async processProactivePoll(socket: Socket): Promise<void> {
+    let command: OutboundCommand | null = null
+    try {
+      command = this.options.agent.pollProactiveOutbound?.() ?? null
+    } catch {
+      command = null
+    }
+    if (command === null) {
+      await writeResponse(socket, { kind: 'NO_PROACTIVE_OUTBOUND' })
+      return
+    }
+    this.persistentSink?.writeStructured(
+      'PROACTIVE_POLL',
+      { result: 'COMMAND' },
+      `outboundToken=${this.persistentLog?.shortIdFor(command.outboundId) ?? 'NONE'}`,
+    )
+    await writeResponse(socket, { kind: 'PROACTIVE_OUTBOUND_COMMAND', ...command })
+  }
+
   /**
    * One passive ambient event.
    *
@@ -413,6 +440,12 @@ function parseInboundEnvelope(value: unknown): InboundEnvelope {
     throw new Error('Inbound kind is invalid')
   }
   const kind = value.kind
+  if (kind === PROACTIVE_OUTBOUND_POLL_KIND) {
+    if (typeof value.pollId !== 'string' || value.pollId.trim().length === 0 || value.pollId.length > 128) {
+      throw new Error('Proactive poll id is invalid')
+    }
+    return { kind, pollId: value.pollId }
+  }
   if (kind === OUTBOUND_DELIVERY_ACK_KIND) {
     if (!isRecord(value.payload)) {
       throw new Error('Delivery ACK payload is missing')
@@ -498,6 +531,8 @@ const WIRE_IDENTITY_FIELDS = [
   'requesterRole',
   'ownerDisplayName',
 ] as const
+
+const PROACTIVE_OUTBOUND_POLL_KIND = 'PROACTIVE_OUTBOUND_POLL' as const
 
 function requesterIdentityFields(raw: RawHookMessage): RequesterIdentityFields {
   const conversationId = (raw.conversationId ?? '').trim() || raw.from.trim()
