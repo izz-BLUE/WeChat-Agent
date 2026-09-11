@@ -6,7 +6,7 @@ import {
   describeUserText,
 } from './canonical-user-text.js'
 import { GroupContext, type GroupMessage } from './context.js'
-import { GroupAmbientContext, type AmbientLine } from './group-ambient-context.js'
+import { ASSISTANT_LABEL, GroupAmbientContext, type AmbientLine } from './group-ambient-context.js'
 import { config, validateChatConfig } from './config.js'
 import type { AgentExecutor, AgentPassiveContext, AgentRequest } from './agent-adapter.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
@@ -36,6 +36,7 @@ import {
   type TokenCorrelationState,
 } from './persistent-runtime-log.js'
 import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from './runtime-time.js'
+import { observeGroupStyle } from './group-style.js'
 
 /**
  * The mention fact handed to the model. A group message only reaches the Agent
@@ -227,6 +228,21 @@ export class ProductionChatAgent implements AgentExecutor {
         }).lines
       : []
 
+    const groupStyle = request.conversationType === 'GROUP'
+      ? observeGroupStyle({
+          recentGroupContext: window.messages.map((message) => ({
+            text: message.text,
+            speakerType: 'MEMBER' as const,
+            eventId: message.messageId,
+          })),
+          groupAmbientContext: ambient.map((line) => ({
+            text: line.text,
+            speakerType: line.label === ASSISTANT_LABEL ? 'ASSISTANT' as const : 'MEMBER' as const,
+            eventId: line.messageId,
+          })),
+        })
+      : undefined
+
     // A real mention is group history too: the next member to ask needs to see
     // that the question was already asked and what was answered.
     if (request.conversationType === 'GROUP') {
@@ -314,6 +330,7 @@ export class ProductionChatAgent implements AgentExecutor {
         // long-term memory that this process does not have.
         persistentMemoryAvailable: this.memory !== null && this.memory.isEnabled,
         runtimeTime,
+        groupStyle,
         webSearch,
       },
       guardValues(request),

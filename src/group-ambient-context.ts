@@ -68,6 +68,8 @@ export interface AmbientEntryInput {
 export interface AmbientLine {
   label: string
   text: string
+  /** Short-term event identity, never rendered into a provider prompt. */
+  messageId?: string
 }
 
 export interface AmbientRenderRequest {
@@ -249,7 +251,7 @@ export class GroupAmbientContext {
         break
       }
 
-      lines.unshift({ label, text: entry.text })
+      lines.unshift({ label, text: entry.text, messageId: entry.messageId })
       chars += lineChars
     }
 

@@ -5,6 +5,8 @@ export interface GroupMessage {
   senderName: string
   text: string
   timestamp: number
+  /** Short-term event identity, available only to structural de-duplication. */
+  messageId?: string
 }
 
 /**
@@ -101,7 +103,9 @@ export class GroupContext {
     )
 
     return {
-      messages: selected.map((entry) => entry.message),
+      messages: selected.map((entry) => entry.messageId === undefined
+        ? entry.message
+        : { ...entry.message, messageId: entry.messageId }),
       eventIds: selected
         .map((entry) => entry.messageId)
         .filter((id): id is string => id !== undefined),
