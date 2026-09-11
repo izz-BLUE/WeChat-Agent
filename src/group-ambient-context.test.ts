@@ -257,7 +257,18 @@ function createHarness(
     memoryStore: store,
     ask: async (raw: RawHookMessage) => {
       const normalized = validateActive(raw)
-      return agent.complete(toAgentRequest(normalized))
+      const request = toAgentRequest(normalized)
+      const answer = await agent.complete(request)
+      const identity = agent.takeOutboundIdentity(request, answer)
+      if (identity) {
+        agent.observeOutboundDelivery({
+          ...identity,
+          status: 'SENT',
+          errorCode: '',
+          contentSha256: identity.contentSha256,
+        })
+      }
+      return answer
     },
     passive: (raw: RawHookMessage) => runRawPassiveContextPipeline(raw, agent),
     restore: () => {
@@ -638,6 +649,16 @@ async function caseFifteenMentionPathStillReplies(): Promise<void> {
     assert(result.status === 'AGENT_RESULT', `expected AGENT_RESULT, got ${result.status}`)
     assert(result.status === 'AGENT_RESULT' && result.outboundCommand !== null, 'the mention produced no outbound command')
     assert(result.status === 'AGENT_RESULT' && result.agentResult.kind === 'SUCCESS_TEXT', 'the mention did not produce a reply')
+
+    if (result.outboundCommand) {
+      harness.agent.observeOutboundDelivery({
+        outboundId: result.outboundCommand.outboundId,
+        requestMessageId: result.outboundCommand.requestMessageId,
+        status: 'SENT',
+        contentSha256: result.outboundCommand.contentSha256,
+        errorCode: '',
+      })
+    }
 
     // The bot's own answer joins the transcript as ASSISTANT, so the next member
     // to ask sees the whole exchange.

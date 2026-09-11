@@ -208,7 +208,17 @@ async function mentionGateUnchanged(): Promise<void> {
 async function pipelineAndOutboundUnchanged(): Promise<void> {
   const baseline = await withEnv(undefined, () => runRawAgentPipeline(raw(), new FakeAgent()))
   const observed = await withEnv('1', () => runRawAgentPipeline(raw(), new FakeAgent()))
-  assert(JSON.stringify(baseline) === JSON.stringify(observed), 'observation changed the pipeline result')
+  const withoutOpaqueOutboundId = (value: typeof baseline): string => JSON.stringify(
+    value.status === 'AGENT_RESULT'
+      ? { ...value, outboundCommand: value.outboundCommand
+          ? { ...value.outboundCommand, outboundId: 'OPAQUE', contentSha256: 'HASH' }
+          : null }
+      : value,
+  )
+  assert(
+    withoutOpaqueOutboundId(baseline) === withoutOpaqueOutboundId(observed),
+    'observation changed the pipeline result',
+  )
   if (baseline.status !== 'AGENT_RESULT') {
     throw new Error(`pipeline did not reach an agent result: ${baseline.status}`)
   }

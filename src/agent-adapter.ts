@@ -1,4 +1,5 @@
 import { sanitizeFinalAnswer } from './final-answer.js'
+import { randomUUID } from 'node:crypto'
 import type { BotMentionSpanFacts, UserContentSpanFacts } from './canonical-user-text.js'
 import {
   normalizePassiveContextMessage,
@@ -11,6 +12,7 @@ import {
   type RawHookMessage,
   type RequesterRole,
 } from './message-contract.js'
+import { sha256Utf8, type OutboundDeliveryAck, type OutboundIdentity, type DeliveryAckResult } from './outbound-delivery.js'
 
 /** Runtime-decided mention fact; the Agent must never re-derive it from text. */
 export type MentionState = 'MENTIONED' | 'NOT_MENTIONED' | 'UNKNOWN'
@@ -51,6 +53,9 @@ export interface AgentRequest {
 }
 
 export interface OutboundCommand {
+  outboundId: string
+  requestMessageId: string
+  contentSha256: string
   conversationType: ConversationType
   conversationId: string
   text: string
@@ -82,6 +87,17 @@ export interface AgentPassiveContext {
 
 export interface AgentExecutor {
   complete(request: AgentRequest): Promise<string | null | undefined>
+
+  /**
+   * Production agents stage a normal generated answer before returning it. The
+   * adapter only needs the opaque identity that belongs to the final command.
+   * Legacy/fake executors omit this capability and still receive a complete wire
+   * command; their ACK is necessarily rejected because no pending entry exists.
+   */
+  takeOutboundIdentity?(request: AgentRequest, text: string): OutboundIdentity | null
+
+  /** Independent delivery settlement path; it must not invoke the chat pipeline. */
+  observeOutboundDelivery?(ack: OutboundDeliveryAck): Promise<DeliveryAckResult> | DeliveryAckResult
 
   /**
    * Ambience only: a group message that did not address the bot.
@@ -213,7 +229,11 @@ export function mapAgentError(): AgentResult {
  * re-checked here, so nothing can reach the WeChat send boundary with thinking
  * markup even if an executor bypasses `mapAgentResponse`.
  */
-export function toOutboundCommand(message: InboundMessage, result: AgentResult): OutboundCommand | null {
+export function toOutboundCommand(
+  message: InboundMessage,
+  result: AgentResult,
+  identity?: OutboundIdentity | null,
+): OutboundCommand | null {
   if (result.kind !== 'SUCCESS_TEXT') {
     return null
   }
@@ -224,6 +244,9 @@ export function toOutboundCommand(message: InboundMessage, result: AgentResult):
   }
 
   return {
+    outboundId: identity?.outboundId ?? randomUUID(),
+    requestMessageId: identity?.requestMessageId ?? message.messageId,
+    contentSha256: identity?.contentSha256 ?? sha256Utf8(sanitized.text),
     conversationType: message.conversationType,
     conversationId: message.conversationId,
     text: sanitized.text,
@@ -258,7 +281,13 @@ export async function runRawAgentPipeline(
     policy,
     request,
     agentResult,
-    outboundCommand: toOutboundCommand(normalization.message, agentResult),
+    outboundCommand: toOutboundCommand(
+      normalization.message,
+      agentResult,
+      agentResult.kind === 'SUCCESS_TEXT'
+        ? agent.takeOutboundIdentity?.(request, agentResult.text)
+        : null,
+    ),
   }
 }
 

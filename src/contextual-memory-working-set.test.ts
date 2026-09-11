@@ -298,7 +298,19 @@ function agentRequest(options: TurnOptions): AgentRequest {
 
 /** One active @-request through the real Agent. */
 async function ask(harness: Harness, options: TurnOptions): Promise<string> {
-  return harness.agent.complete(agentRequest(options))
+  const request = agentRequest(options)
+  const answer = await harness.agent.complete(request)
+  const identity = harness.agent.takeOutboundIdentity?.(request, answer)
+  if (identity) {
+    harness.agent.observeOutboundDelivery?.({
+      outboundId: identity.outboundId,
+      requestMessageId: identity.requestMessageId,
+      contentSha256: identity.contentSha256,
+      status: 'SENT',
+      errorCode: '',
+    })
+  }
+  return answer
 }
 
 /** One passive (non-mentioned) group message through the real Agent. */

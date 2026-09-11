@@ -9,6 +9,13 @@ import {
   type OutboundCommand,
   type PassivePipelineResult,
 } from './agent-adapter.js'
+import {
+  OUTBOUND_DELIVERY_ACK_KIND,
+  sha256Utf8,
+  type OutboundDeliveryAck,
+  type DeliveryAckResult,
+  type DeliveryAckRejectReason,
+} from './outbound-delivery.js'
 import { PASSIVE_CONTEXT_KIND, type RawHookMessage } from './message-contract.js'
 import {
   identityToken,
@@ -54,12 +61,15 @@ export interface ProductionTransportSummaryEntry {
 type InboundEnvelope =
   | { kind: 'INBOUND_MESSAGE'; message: RawHookMessage }
   | { kind: typeof PASSIVE_CONTEXT_KIND; message: RawHookMessage }
+  | { kind: typeof OUTBOUND_DELIVERY_ACK_KIND; payload: OutboundDeliveryAck }
 
 type AgentResponse =
   | { kind: 'NO_REPLY'; reason?: string }
   | { kind: 'ERROR'; code: string; message?: string }
   | { kind: 'CONTEXT_ACCEPTED' }
   | { kind: 'CONTEXT_NOT_ACCEPTED'; reason?: string }
+  | { kind: 'DELIVERY_ACK_ACCEPTED'; reason: 'SENT_COMMITTED' | 'FAILED_DISCARDED' }
+  | { kind: 'DELIVERY_ACK_REJECTED'; reason: DeliveryAckRejectReason }
   | ({ kind: 'OUTBOUND_COMMAND' } & OutboundCommand)
 
 /**
@@ -248,6 +258,11 @@ export class ProductionAgentTransportServer {
       return
     }
 
+    if (envelope.kind === OUTBOUND_DELIVERY_ACK_KIND) {
+      await this.processDeliveryAck(socket, envelope.payload)
+      return
+    }
+
     this.messageCount += 1
     observeRawInbound(envelope.message)
     const identity = requesterIdentityFields(envelope.message)
@@ -274,6 +289,9 @@ export class ProductionAgentTransportServer {
     if (this.options.invalidOutboundMessageId === envelope.message.msgId.toString()) {
       response = {
         kind: 'OUTBOUND_COMMAND',
+        outboundId: `invalid-${envelope.message.msgId.toString()}`,
+        requestMessageId: envelope.message.msgId.toString(),
+        contentSha256: sha256Utf8(''),
         conversationType: 'DIRECT',
         conversationId: envelope.message.from,
         text: '',
@@ -307,6 +325,33 @@ export class ProductionAgentTransportServer {
       socket.end()
       await this.stop()
     }
+  }
+
+  private async processDeliveryAck(socket: Socket, ack: OutboundDeliveryAck): Promise<void> {
+    let result: DeliveryAckResult
+    if (!this.options.agent.observeOutboundDelivery) {
+      result = { accepted: false, reason: 'UNKNOWN_OUTBOUND' }
+    } else {
+      try {
+        result = await this.options.agent.observeOutboundDelivery(ack)
+      } catch {
+        result = { accepted: false, reason: 'INVALID_ACK' }
+      }
+    }
+
+    const response: AgentResponse = result.accepted
+      ? { kind: 'DELIVERY_ACK_ACCEPTED', reason: result.reason }
+      : { kind: 'DELIVERY_ACK_REJECTED', reason: result.reason }
+    this.persistentSink?.writeStructured(
+      'OUTBOUND_DELIVERY_ACK',
+      {
+        result: response.kind,
+        status: ack.status,
+        reason: result.accepted ? '' : result.reason,
+      },
+      `outboundToken=${this.persistentLog?.shortIdFor(ack.outboundId) ?? 'NONE'}`,
+    )
+    await writeResponse(socket, response)
   }
 
   /**
@@ -368,6 +413,29 @@ function parseInboundEnvelope(value: unknown): InboundEnvelope {
     throw new Error('Inbound kind is invalid')
   }
   const kind = value.kind
+  if (kind === OUTBOUND_DELIVERY_ACK_KIND) {
+    if (!isRecord(value.payload)) {
+      throw new Error('Delivery ACK payload is missing')
+    }
+    const payload = value.payload
+    if (typeof payload.outboundId !== 'string' || payload.outboundId.trim().length === 0 ||
+        typeof payload.requestMessageId !== 'string' || payload.requestMessageId.trim().length === 0 ||
+        (payload.status !== 'SENT' && payload.status !== 'FAILED') ||
+        typeof payload.contentSha256 !== 'string' || !/^[0-9a-f]{64}$/u.test(payload.contentSha256) ||
+        typeof payload.errorCode !== 'string' || payload.errorCode.length > 128) {
+      throw new Error('Delivery ACK fields are invalid')
+    }
+    return {
+      kind,
+      payload: {
+        outboundId: payload.outboundId,
+        requestMessageId: payload.requestMessageId,
+        status: payload.status,
+        contentSha256: payload.contentSha256,
+        errorCode: payload.errorCode,
+      },
+    }
+  }
   if (kind !== 'INBOUND_MESSAGE' && kind !== PASSIVE_CONTEXT_KIND) {
     throw new Error('Inbound kind is invalid')
   }

@@ -1,4 +1,5 @@
 import { ChatService, type ChatMentionFact } from './chat.js'
+import { sanitizeFinalAnswer } from './final-answer.js'
 import {
   ABSENT_BOT_MENTION_SPANS,
   ABSENT_USER_CONTENT_SPAN,
@@ -9,6 +10,12 @@ import { GroupContext, type GroupMessage } from './context.js'
 import { ASSISTANT_LABEL, GroupAmbientContext, type AmbientLine } from './group-ambient-context.js'
 import { config, validateChatConfig } from './config.js'
 import type { AgentExecutor, AgentPassiveContext, AgentRequest } from './agent-adapter.js'
+import {
+  PendingOutboundReplyStore,
+  type OutboundDeliveryAck,
+  type OutboundIdentity,
+  type DeliveryAckResult,
+} from './outbound-delivery.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { MemoryExtractor } from './memory-extractor.js'
 import { MemoryService } from './memory-service.js'
@@ -99,6 +106,8 @@ export interface ProductionChatAgentOptions {
   webSearchMaxContextChars?: number
   runtimeClock?: RuntimeClock
   runtimeTimeZone?: string
+  pendingOutboundMaxEntries?: number
+  pendingOutboundTtlMs?: number
 }
 
 export class ProductionChatAgent implements AgentExecutor {
@@ -114,6 +123,7 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly webSearchMaxContextChars: number
   private readonly runtimeClock: RuntimeClock
   private readonly runtimeTimeZone: string | undefined
+  private readonly pendingOutbound: PendingOutboundReplyStore
 
   public constructor(
     private readonly chatService: ChatService,
@@ -129,6 +139,13 @@ export class ProductionChatAgent implements AgentExecutor {
     this.webSearchMaxContextChars = options.webSearchMaxContextChars ?? config.webSearchMaxContextChars
     this.runtimeClock = options.runtimeClock ?? { now: () => new Date() }
     this.runtimeTimeZone = options.runtimeTimeZone ?? config.agentTimeZone
+    this.pendingOutbound = new PendingOutboundReplyStore({
+      maxEntries: options.pendingOutboundMaxEntries,
+      ttlMs: options.pendingOutboundTtlMs,
+      // Pending delivery is process-local wall-clock state. The request timestamp
+      // remains the ambient event timestamp; it is not used as a TTL clock.
+      now: () => Date.now(),
+    })
     this.context = new GroupContext(
       config.maxContextMessages,
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
@@ -165,6 +182,44 @@ export class ProductionChatAgent implements AgentExecutor {
       text: passive.text,
       timestamp: passive.timestamp,
     })
+  }
+
+  /** Returns the opaque identity staged for the exact generated answer. */
+  public takeOutboundIdentity(request: AgentRequest, text: string): OutboundIdentity | null {
+    return this.pendingOutbound.getIdentityFor(request.messageId, text)
+  }
+
+  /**
+   * Delivery ACKs are a side channel. This method only settles the in-memory
+   * pending record and, for SENT, commits one already-generated line to ambient;
+   * it never calls the provider, memory service, planner or search provider.
+   */
+  public observeOutboundDelivery(ack: OutboundDeliveryAck): DeliveryAckResult {
+    const result = this.pendingOutbound.settle(ack, (pending) => {
+      if (pending.conversationType === 'GROUP') {
+        this.ambient.append(pending.conversationId, {
+          messageId: `assistant:${pending.requestMessageId}`,
+          speakerId: 'ASSISTANT',
+          speakerType: 'ASSISTANT',
+          text: pending.text,
+          timestamp: pending.timestamp,
+        })
+      }
+    })
+    if (this.persistentLog) {
+      new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver').writeStructured(
+        'DELIVERY_ACK',
+        {
+          status: ack.status,
+          result: result.accepted
+            ? result.reason === 'SENT_COMMITTED' ? 'COMMITTED' : 'DISCARDED'
+            : 'REJECTED',
+          reason: result.accepted ? '' : result.reason,
+        },
+        `outboundIdToken=${this.persistentLog.shortIdFor(ack.outboundId)}`,
+      )
+    }
+    return result
   }
 
   public async complete(request: AgentRequest): Promise<string> {
@@ -338,19 +393,23 @@ export class ProductionChatAgent implements AgentExecutor {
       request.messageId,
     )
 
-    // The bot's own line joins the ambient transcript so the next member to ask
-    // sees the whole exchange. This is GENERATED, not DELIVERY_ACKNOWLEDGED: the
-    // Agent forms the answer, the runtime delivers it, and the send ACK is not on
-    // this side of the boundary. A reply that passes the guard enters the
-    // transcript; a blocked or failed one throws above and enters nothing.
-    if (request.conversationType === 'GROUP') {
-      this.ambient.append(request.conversationId, {
-        messageId: `assistant:${request.messageId}`,
-        speakerId: 'ASSISTANT',
-        speakerType: 'ASSISTANT',
-        text: answer,
-        timestamp: request.timestamp,
-      })
+    const outboundText = sanitizeFinalAnswer(answer).text
+    if (!outboundText) {
+      return answer
+    }
+    const identity = this.pendingOutbound.stage({
+      requestMessageId: request.messageId,
+      conversationType: request.conversationType,
+      conversationId: request.conversationId,
+      text: outboundText,
+      timestamp: request.timestamp,
+    })
+    if (this.persistentLog) {
+      new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver').writeStructured(
+        'PENDING_OUTBOUND',
+        { result: 'STAGED', chars: outboundText.length },
+        `outboundIdToken=${this.persistentLog.shortIdFor(identity.outboundId)}`,
+      )
     }
 
     return answer
