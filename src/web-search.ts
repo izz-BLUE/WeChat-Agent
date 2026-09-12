@@ -2,7 +2,14 @@ export interface WebSearchRequest {
   query: string
   maxResults: number
   timeoutMs: number
+  mode: WebSearchMode
+  days?: 1 | 3
+  startDate?: string
+  endDate?: string
 }
+
+export type WebSearchMode = 'GENERAL' | 'NEWS_RECENT'
+export type WebSearchWindow = 'GENERAL' | 'DAY_1' | 'DAY_3'
 
 export interface WebSearchResult {
   sourceId: string
@@ -89,7 +96,8 @@ export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchR
       continue
     }
     seen.add(url)
-    const publishedAt = typeof record.publishedAt === 'string' ? record.publishedAt.slice(0, 80) : null
+    const publishedValue = record.publishedAt ?? record.published_date
+    const publishedAt = typeof publishedValue === 'string' ? publishedValue.slice(0, 80) : null
     results.push({ sourceId: `S${results.length + 1}`, title, url, snippet, publishedAt })
   }
   return results
@@ -118,7 +126,8 @@ export function buildWebSearchContext(results: readonly WebSearchResult[], maxCh
       truncated = true
       break
     }
-    const block = `[${item.sourceId}]\nTitle: ${item.title}\nSnippet: ${item.snippet}\n`
+    const publishedAt = item.publishedAt ? `PublishedAt: ${item.publishedAt}\n` : ''
+    const block = `[${item.sourceId}]\n${publishedAt}Title: ${item.title}\nSnippet: ${item.snippet}\n`
     const remaining = budget - text.length
     if (block.length <= remaining) {
       text += block
@@ -221,20 +230,28 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
     try {
       let response: Response
       try {
+        const body: Record<string, unknown> = {
+          query: request.query,
+          search_depth: 'basic',
+          max_results: request.maxResults,
+          include_answer: false,
+          include_raw_content: false,
+          include_images: false,
+        }
+        if (request.mode === 'NEWS_RECENT') {
+          body.topic = 'news'
+          body.include_published_date = true
+          body.filter_by_published_date = true
+          if (request.startDate !== undefined) body.start_date = request.startDate
+          if (request.endDate !== undefined) body.end_date = request.endDate
+        }
         response = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
-          body: JSON.stringify({
-            query: request.query,
-            search_depth: 'basic',
-            max_results: request.maxResults,
-            include_answer: false,
-            include_raw_content: false,
-            include_images: false,
-          }),
+          body: JSON.stringify(body),
           signal: controller.signal,
         })
       } catch (error) {

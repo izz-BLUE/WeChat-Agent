@@ -26,9 +26,11 @@ import {
   normalizeWebSearchResults,
   TavilyWebSearchProvider,
   WebSearchError,
+  type WebSearchMode,
   type WebSearchFailureReason,
   type WebSearchProvider,
   type WebSearchResult,
+  type WebSearchWindow,
 } from './web-search.js'
 import {
   formatWebSearchDecisionProtocol,
@@ -100,6 +102,21 @@ function redactUntrustedGroupIds(text: string, request: AgentRequest): string {
     redacted = redacted.split(value).join(UNTRUSTED_GROUP_ID_PLACEHOLDER)
   }
   return redacted
+}
+
+/** This only selects a bounded NEWS_RECENT window after Planner admission. */
+function isTodayScopedNewsQuestion(question: string): boolean {
+  const normalized = question.trim().toLocaleLowerCase()
+  return ['今天', '今日', 'today'].some((token) => normalized.includes(token))
+}
+
+function dateDaysBefore(localDate: string, days: number): string {
+  const date = new Date(`${localDate}T00:00:00Z`)
+  if (Number.isNaN(date.getTime())) {
+    return localDate
+  }
+  date.setUTCDate(date.getUTCDate() - days)
+  return date.toISOString().slice(0, 10)
 }
 
 export interface ProductionChatAgentOptions {
@@ -635,6 +652,8 @@ export class ProductionChatAgent implements AgentExecutor {
     status: 'PASS' | 'FAILED'
     results: readonly WebSearchResult[]
     maxContextChars: number
+    mode: WebSearchMode
+    window: WebSearchWindow
   } | undefined> {
     if (this.webSearchPlanner === null) {
       return undefined
@@ -656,7 +675,7 @@ export class ProductionChatAgent implements AgentExecutor {
     )
     const decision = planner.result === 'PASS' && revalidated.valid
       ? revalidated.decision
-      : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const }
+      : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const, mode: 'GENERAL' as const }
     const decisionResult = planner.result === 'PASS' && revalidated.valid ? 'PASS' : 'FAIL'
     const failureReason = planner.result === 'PASS' && !revalidated.valid
       ? revalidated.failureReason
@@ -679,45 +698,95 @@ export class ProductionChatAgent implements AgentExecutor {
       return undefined
     }
 
+    const mode = decision.mode
+    const primaryWindow: WebSearchWindow = mode === 'NEWS_RECENT'
+      ? isTodayScopedNewsQuestion(question) ? 'DAY_1' : 'DAY_3'
+      : 'GENERAL'
+    const windows = primaryWindow === 'DAY_1' ? ['DAY_1', 'DAY_3'] as const : [primaryWindow] as const
+    const failed = (window: WebSearchWindow) => ({
+      used: true as const,
+      status: 'FAILED' as const,
+      results: [] as const,
+      maxContextChars: this.webSearchMaxContextChars,
+      mode,
+      window,
+    })
+
     if (this.webSearchProvider === null) {
+      this.logWebSearchExecution(mode, primaryWindow, 1, 'FAILED', 0)
       this.logWebSearch('FAIL', 0, 'DISABLED')
       this.logWebSearchContext(0, 0, false)
-      return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
+      return failed(primaryWindow)
     }
 
-    try {
-      const response = await this.webSearchProvider.search({
-        query: decision.query,
-        maxResults: this.webSearchMaxResults,
-        timeoutMs: this.webSearchTimeoutMs,
-      })
-      const normalized = normalizeWebSearchResults(response.results)
-      if (normalized.length === 0) {
-        this.logWebSearch('FAIL', 0, 'NO_RESULTS')
+    for (const [index, window] of windows.entries()) {
+      const attempt = index + 1
+      try {
+        const days = window === 'DAY_1' ? 1 : window === 'DAY_3' ? 3 : undefined
+        const response = await this.webSearchProvider.search({
+          query: decision.query,
+          maxResults: this.webSearchMaxResults,
+          timeoutMs: this.webSearchTimeoutMs,
+          mode,
+          ...(days === undefined ? {} : {
+            days: days as 1 | 3,
+            startDate: dateDaysBefore(runtimeTime.localDate, days - 1),
+            endDate: runtimeTime.localDate,
+          }),
+        })
+        const normalized = normalizeWebSearchResults(response.results)
+        if (normalized.length === 0) {
+          this.logWebSearchExecution(mode, window, attempt, 'NO_RESULTS', 0)
+          this.logWebSearch('FAIL', 0, 'NO_RESULTS')
+          this.logWebSearchContext(0, 0, false)
+          if (attempt < windows.length) {
+            continue
+          }
+          return failed(window)
+        }
+
+        this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length)
+        const bounded = buildWebSearchContext(normalized, this.webSearchMaxContextChars)
+        this.logWebSearch('PASS', bounded.results.length, 'NONE')
+        this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated)
+        if (bounded.results.length === 0) {
+          return failed(window)
+        }
+        return {
+          used: true,
+          status: 'PASS',
+          results: bounded.results,
+          maxContextChars: this.webSearchMaxContextChars,
+          mode,
+          window,
+        }
+      } catch (error) {
+        const reason: WebSearchFailureReason = error instanceof WebSearchError
+          ? error.reason
+          : 'HTTP_ERROR'
+        this.logWebSearchExecution(mode, window, attempt, 'FAILED', 0)
+        this.logWebSearch('FAIL', 0, reason)
         this.logWebSearchContext(0, 0, false)
-        return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
+        return failed(window)
       }
-
-      const bounded = buildWebSearchContext(normalized, this.webSearchMaxContextChars)
-      this.logWebSearch('PASS', bounded.results.length, 'NONE')
-      this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated)
-      if (bounded.results.length === 0) {
-        return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
-      }
-      return {
-        used: true,
-        status: 'PASS',
-        results: bounded.results,
-        maxContextChars: this.webSearchMaxContextChars,
-      }
-    } catch (error) {
-      const reason: WebSearchFailureReason = error instanceof WebSearchError
-        ? error.reason
-        : 'HTTP_ERROR'
-      this.logWebSearch('FAIL', 0, reason)
-      this.logWebSearchContext(0, 0, false)
-      return { used: true, status: 'FAILED', results: [], maxContextChars: this.webSearchMaxContextChars }
     }
+
+    return failed(windows[windows.length - 1] ?? primaryWindow)
+  }
+
+  private logWebSearchExecution(
+    mode: WebSearchMode,
+    window: WebSearchWindow,
+    attempt: number,
+    result: 'PASS' | 'NO_RESULTS' | 'FAILED',
+    resultCount: number,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'WEB_SEARCH_EXECUTION',
+      { mode, window, attempt, result, resultCount },
+    )
   }
 
   private logWebSearch(result: 'PASS' | 'FAIL', resultCount: number, reason: WebSearchFailureReason | 'NONE'): void {
