@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { appendGroundedSources, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebSearchProvider, type WebSearchResult } from './web-search.js'
 import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
-import { ChatService } from './chat.js'
+import { buildSystemPrompt, ChatService } from './chat.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
@@ -700,6 +700,76 @@ async function main(): Promise<void> {
     check(final.calls[0]?.user.includes('上海公共信息'), 'result title was not injected')
     check(answer.includes('https://example.com/s1'), 'source URL was not runtime-grounded')
     final.restore()
+  })
+
+  await test('Final Web Search prompt requires natural synthesis and preserves explicit structure requests', async () => {
+    const final = fakeFinalChat('最近主要是模型能力和安全合作两条线在推进。[S1][S3]\n\n监管方面也有新的回应。[S2]')
+    const fake = fakeProvider([
+      result('S1', '模型能力'),
+      result('S2', '监管回应'),
+      result('S3', '安全合作'),
+      result('S4', '其他消息'),
+    ])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news'),
+      webSearchProvider: fake.provider,
+    })
+    const answer = await agent.complete(request({
+      text: '@椰椰 OpenAI 今天有什么新闻？',
+      rawText: '@椰椰 OpenAI 今天有什么新闻？',
+      userContentSpan: { trust: 'VALID', span: { start: 0, length: '@椰椰 OpenAI 今天有什么新闻？'.length } },
+    }))
+    const system = final.calls[0]?.system ?? ''
+    const body = answer.split('\n\n来源：')[0] ?? answer
+    check(system.includes('证据池') && system.includes('不是回答提纲'), 'search evidence-pool contract is missing')
+    check(system.includes('按用户问题组织') && system.includes('共同支持'), 'multi-source synthesis contract is missing')
+    check(system.includes('不要逐条复述') && system.includes('不要为了显得完整'), 'source-by-source report prohibition is missing')
+    check(system.includes('用户明确要求') && system.includes('列出条目') && system.includes('才允许结构化表达'), 'explicit structured-answer exception is missing')
+    check(system.includes('关键限定条件') && system.includes('不完全一致'), 'fact-preservation contract is missing')
+    check(final.calls[0]?.user.includes('[S1]') && final.calls[0]?.user.includes('[S4]'), 'all bounded search evidence was not available to Final Chat')
+    check(body.includes('[S1][S3]') && !/^\s*(?:\d+[.)]|[-*])\s/mu.test(body), 'ordinary search answer was not natural-paragraph oriented')
+    check(answer.includes('来源：') && answer.includes('模型能力'), 'runtime source grounding regressed')
+    final.restore()
+  })
+
+  await test('Final Web Search keeps natural one-result answers and allows explicit structure', async () => {
+    const final = scriptedFinalChat([
+      '核心变化是模型能力继续增强。[S1]',
+      '1. 第一条[S1]\n2. 第二条[S2]\n3. 第三条[S3]\n4. 第四条\n5. 第五条',
+      '- 模型能力：继续增强。[S1]\n- 监管环境：出现新的回应。[S2]',
+    ])
+    const fake = fakeProvider([
+      result('S1', '模型能力'),
+      result('S2', '监管回应'),
+      result('S3', '安全合作'),
+    ])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news'),
+      webSearchProvider: fake.provider,
+    })
+    const ask = (text: string): AgentRequest => request({
+      text,
+      rawText: text,
+      userContentSpan: { trust: 'VALID', span: { start: 0, length: text.length } },
+    })
+    try {
+      const ordinary = await agent.complete(ask('@椰椰 最近有什么重要变化？'))
+      const ordinaryBody = ordinary.split('\n\n来源：')[0] ?? ordinary
+      check(ordinaryBody.includes('核心变化是模型能力继续增强。'), 'one important result was not answered naturally')
+      check(!/^\s*(?:\d+[.)]|[-*])\s/mu.test(ordinaryBody), 'one important result was forced into a list')
+
+      const listed = await agent.complete(ask('@椰椰 列出5条最近的重要消息'))
+      const listedBody = listed.split('\n\n来源：')[0] ?? listed
+      check(listedBody.includes('1. 第一条') && listedBody.includes('5. 第五条'), 'explicit list request was not preserved')
+      check(listed.includes('来源：'), 'explicit list lost grounded sources')
+
+      const detailed = await agent.complete(ask('@椰椰 详细整理一下最近的情况'))
+      const detailedBody = detailed.split('\n\n来源：')[0] ?? detailed
+      check(detailedBody.includes('- 模型能力：') && detailedBody.includes('- 监管环境：'), 'explicit deep-dive structure was not preserved')
+      check(detailed.includes('来源：'), 'explicit deep-dive lost grounded sources')
+    } finally {
+      final.restore()
+    }
   })
 
   await test('one active turn can never recurse into a second search', async () => {
