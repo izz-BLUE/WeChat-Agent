@@ -33,6 +33,16 @@
 import { randomUUID } from 'node:crypto'
 import { sanitizeFinalAnswer } from './final-answer.js'
 import {
+  classifyMemoryKind,
+  classifyMemorySubject,
+  MEMORY_KINDS,
+  MEMORY_SUBJECTS,
+  isReadableMemoryKind,
+  memoryKindWriteRejection,
+  type MemoryKind,
+  type MemorySubject,
+} from './assistant-identity.js'
+import {
   containsRawIdentityMarker,
   MEMORY_MAX_CONTENT_CHARS,
   MEMORY_SCOPE_GROUP,
@@ -259,6 +269,8 @@ export interface MemoryMutation {
   target: string | null
   content: string | null
   scope: string | null
+  kind: MemoryKind | null
+  subject: MemorySubject | null
 }
 
 export type MutationParseResult =
@@ -607,7 +619,9 @@ export class MemoryService {
     const identityContext = { requesterId: request.requesterId, personalScopeType: scope }
     // Step 1: deterministic authorization/scope/visibility filtering. Everything
     // downstream of this line can only ever see records this request may read.
-    const eligible = this.store.retrieve(this.groupRetrievalRules(request), MEMORY_ELIGIBLE_LIMIT)
+    const eligible = this.readableRecords(
+      this.store.retrieve(this.groupRetrievalRules(request), MEMORY_ELIGIBLE_LIMIT),
+    )
     const personalCount = eligible.filter((record) => scopeClassOf(record) === 'PERSONAL').length
     const groupCount = eligible.length - personalCount
 
@@ -679,7 +693,9 @@ export class MemoryService {
     }
     this.emitAdmission(request, 'ADMITTED', 'EXPLICIT_COMMAND')
 
-    const candidates = this.store.retrieve(this.explicitCandidateRules(request), MEMORY_FINAL_LIMIT)
+    const candidates = this.readableRecords(
+      this.store.retrieve(this.explicitCandidateRules(request), MEMORY_FINAL_LIMIT),
+    )
     let parsedMutation: MemoryMutationParseDiagnostics
     try {
       request.requestDeadline?.throwIfExpired()
@@ -733,6 +749,14 @@ export class MemoryService {
       const scopeType: MemoryScopeType = groupScoped ? MEMORY_SCOPE_GROUP : this.personalScope(request.requesterRole)
       const scopeId = groupScoped ? request.conversationId : request.requesterId
       const content = normalizeContentForWrite(mutation.content ?? '', scopeType, request.requesterId)
+      const kind = classifyMemoryKind(content, mutation.kind)
+      const subject = classifyMemorySubject(scopeType, kind, mutation.subject)
+      const policyRejection = memoryKindWriteRejection(kind, subject)
+      if (policyRejection !== null) {
+        this.emitCandidatePolicy(subject, kind, policyRejection)
+        this.emit('MEMORY_WRITE', { scope: scopeType, visibility: 'SHARED', result: 'FAIL', reason: policyRejection })
+        return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
+      }
       const rejection = validateContent(content, [request.requesterId, request.conversationId])
       if (rejection !== null) {
         this.emit('MEMORY_WRITE', { scope: scopeType, visibility: 'SHARED', result: 'FAIL', reason: rejection })
@@ -742,6 +766,8 @@ export class MemoryService {
       const status = this.store.add({
         memoryId: this.idFactory(),
         scopeType,
+        subject,
+        kind,
         scopeId,
         content,
         contentHash: '',
@@ -771,12 +797,20 @@ export class MemoryService {
 
     if (mutation.operation === 'UPDATE') {
       const content = normalizeContentForWrite(mutation.content ?? '', candidate.scopeType, request.requesterId)
+      const kind = classifyMemoryKind(content, mutation.kind ?? candidate.kind)
+      const subject = classifyMemorySubject(candidate.scopeType, kind, mutation.subject ?? candidate.subject)
+      const policyRejection = memoryKindWriteRejection(kind, subject)
+      if (policyRejection !== null) {
+        this.emitCandidatePolicy(subject, kind, policyRejection)
+        this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: 'FAIL', reason: policyRejection })
+        return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
+      }
       const rejection = validateContent(content, [request.requesterId, request.conversationId])
       if (rejection !== null) {
         this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: 'FAIL', reason: rejection })
         return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
       }
-      const updated = this.store.update(candidate.memoryId, content, now)
+      const updated = this.store.update(candidate.memoryId, content, now, kind, subject)
       this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: updated ? 'WRITTEN' : 'FAILED' })
       this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: updated ? 'PASS' : 'FAIL' })
       return { handled: true, reply: updated ? '改好了。' : '这条记忆没有更新成功。' }
@@ -847,6 +881,12 @@ export class MemoryService {
       for (const candidate of candidates) {
         const built = this.buildAutomaticRecord(slot, candidate)
         if ('rejection' in built) {
+          const kind = classifyMemoryKind(candidate.content, candidate.kind)
+          const subject = classifyMemorySubject(candidate.scopeType, kind, candidate.subject)
+          const policyRejection = memoryKindWriteRejection(kind, subject)
+          if (policyRejection !== null) {
+            this.emitCandidatePolicy(subject, kind, policyRejection)
+          }
           this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: 'SKIPPED', reason: built.rejection })
           skipped += 1
           continue
@@ -880,6 +920,13 @@ export class MemoryService {
     slot: PendingSlot,
     candidate: MemoryCandidate,
   ): { record: MemoryRecord } | { rejection: MemoryCandidateRejection } {
+    const kind = classifyMemoryKind(candidate.content, candidate.kind)
+    const subject = classifyMemorySubject(candidate.scopeType, kind, candidate.subject)
+    const policyRejection = memoryKindWriteRejection(kind, subject)
+    if (policyRejection !== null) {
+      return { rejection: policyRejection }
+    }
+
     let scopeType: MemoryScopeType
     if (candidate.scopeType === MEMORY_SCOPE_GROUP) {
       scopeType = MEMORY_SCOPE_GROUP
@@ -907,6 +954,8 @@ export class MemoryService {
       record: {
         memoryId: this.idFactory(),
         scopeType,
+        subject,
+        kind,
         scopeId,
         content,
         contentHash: '',
@@ -932,6 +981,23 @@ export class MemoryService {
         visibility: 'SHARED',
       },
     ]
+  }
+
+  private readableRecords(records: readonly MemoryRecord[]): MemoryRecord[] {
+    return records.filter((record) => isReadableMemoryKind(record.kind, record.content, record.subject))
+  }
+
+  private emitCandidatePolicy(
+    subject: MemorySubject,
+    kind: MemoryKind,
+    reason: Exclude<MemoryCandidateRejection, 'EMPTY_FACT' | 'CONTENT_TOO_LONG' | 'RAW_IDENTITY_IN_CONTENT' | 'SCOPE_NOT_ALLOWED_FOR_ROLE' | 'SCOPE_IDENTITY_MISSING'>,
+  ): void {
+    emitDiagnostic(this.log, this.sink, 'MEMORY_CANDIDATE_POLICY', {
+      subject,
+      kind,
+      result: 'REJECT',
+      reason,
+    })
   }
 
   private explicitCandidateRules(request: ExplicitMemoryRequest): MemoryAccessRule[] {
@@ -1000,11 +1066,12 @@ function explicitAddReply(status: MemoryWriteStatus): string {
 export function mutationSystemPrompt(): string {
   return (
     '你是长期记忆变更解析器。只输出一个严格 JSON 对象，不要 Markdown，不要解释，不要输出思考过程。'
-    + '格式必须是：{"operation":"ADD|UPDATE|DELETE|NONE","target":"M1","content":"...","scope":"OWNER|GROUP"}；target 可为 M1 或 null。'
+    + '格式必须是：{"operation":"ADD|UPDATE|DELETE|NONE","target":"M1","subject":"CURRENT_REQUESTER|OTHER_MEMBER|GROUP|ASSISTANT","content":"...","scope":"OWNER|GROUP","kind":"SELF_FACT|ADDRESS_PREFERENCE|CONTENT_PREFERENCE|SOFT_STYLE_PREFERENCE|THIRD_PARTY_ASSERTION|ASSISTANT_RULE|ASSISTANT_IDENTITY_ASSERTION|ASSISTANT_RELATIONSHIP_ASSERTION|EPHEMERAL_CONVENTION"}；target 可为 M1 或 null。'
     + '当 userRequest 明确要求记住一个当前请求者自己的事实时，operation 必须是 ADD，target 必须是 null；'
     + '“记住我叫某个名字”“记住我是某个名字”“记住我的代号是某个代号”都属于 ADD，'
     + '此时输出示例为 {"operation":"ADD","target":null,"content":"我叫某个名字","scope":"OWNER"}；'
     + 'content 只写无身份标识的自然事实，例如“我叫某个名字”，不要写 wxid、Signature、requesterId、senderId、conversationId 或其他内部 ID。'
+    + '“叫我妈妈”只能是 subject=CURRENT_REQUESTER、kind=ADDRESS_PREFERENCE；任何关于 Assistant 是谁、叫什么、是谁的亲属/主人/宠物的断言都必须标为 subject=ASSISTANT 的对应 ASSISTANT_* 类型，运行时会拒绝保存。'
     + '没有候选记忆不会阻止 ADD。只有无法确定是何种记忆变更时才输出 operation=NONE。'
   )
 }
@@ -1015,7 +1082,7 @@ export function mutationUserPrompt(question: string, candidates: readonly Memory
     : candidates
         .map(
           (candidate, index) =>
-            `M${index + 1}: scope=${candidate.scopeType} visibility=${candidate.visibility} content=${MemoryText.forModel(candidate.content)}`,
+            `M${index + 1}: subject=${candidate.subject ?? 'CURRENT_REQUESTER'} scope=${candidate.scopeType} kind=${candidate.kind ?? 'SELF_FACT'} visibility=${candidate.visibility} content=${MemoryText.forModel(candidate.content)}`,
         )
         .join('\n')
   return `conversationType=GROUP\ntrigger=EXPLICIT_REMEMBER\ncandidates:\n${candidateText}\n\nuserRequest:\n${question}`
@@ -1093,7 +1160,13 @@ export function parseMemoryMutationDetailed(response: string): MemoryMutationPar
 
   if (!hasValidMutationFieldTypes(record) ||
       ((operation === 'ADD' || operation === 'UPDATE') && typeof record.content !== 'string') ||
-      ((operation === 'UPDATE' || operation === 'DELETE') && typeof record.target !== 'string')) {
+      ((operation === 'UPDATE' || operation === 'DELETE') && typeof record.target !== 'string') ||
+      (record.kind !== undefined && record.kind !== null &&
+        (typeof record.kind !== 'string' ||
+          !MEMORY_KINDS.includes(record.kind.trim().toUpperCase() as MemoryKind))) ||
+      (record.subject !== undefined && record.subject !== null &&
+        (typeof record.subject !== 'string' ||
+          !MEMORY_SUBJECTS.includes(record.subject.trim().toUpperCase() as MemorySubject)))) {
     return {
       mutation: noneMutation(),
       mutationParseResult: 'SCHEMA_INVALID',
@@ -1108,6 +1181,12 @@ export function parseMemoryMutationDetailed(response: string): MemoryMutationPar
     target: typeof record.target === 'string' ? record.target : null,
     content: typeof record.content === 'string' ? record.content : null,
     scope: typeof record.scope === 'string' ? record.scope : null,
+    kind: typeof record.kind === 'string' && MEMORY_KINDS.includes(record.kind.trim().toUpperCase() as MemoryKind)
+      ? record.kind.trim().toUpperCase() as MemoryKind
+      : null,
+    subject: typeof record.subject === 'string' && MEMORY_SUBJECTS.includes(record.subject.trim().toUpperCase() as MemorySubject)
+      ? record.subject.trim().toUpperCase() as MemorySubject
+      : null,
   }
   return {
     mutation,
@@ -1131,11 +1210,11 @@ function sanitizeMutationText(response: string): string {
 }
 
 function noneMutation(): MemoryMutation {
-  return { operation: 'NONE', target: null, content: null, scope: null }
+  return { operation: 'NONE', target: null, content: null, scope: null, kind: null, subject: null }
 }
 
 function hasValidMutationFieldTypes(record: Record<string, unknown>): boolean {
-  return ['target', 'content', 'scope'].every((field) => {
+  return ['target', 'content', 'scope', 'kind', 'subject'].every((field) => {
     if (!(field in record)) {
       return true
     }

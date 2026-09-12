@@ -20,6 +20,7 @@
  */
 import { createHash } from 'node:crypto'
 import type { ConversationType } from './message-contract.js'
+import type { MemoryKind, MemorySubject } from './assistant-identity.js'
 
 /** Personal scope of the owner requester. */
 export const MEMORY_SCOPE_OWNER = 'OWNER'
@@ -42,6 +43,10 @@ export type MemoryWriteStatus = 'WRITTEN' | 'SKIPPED' | 'FAILED' | 'DISABLED' | 
 export interface MemoryRecord {
   memoryId: string
   scopeType: MemoryScopeType
+  /** Semantic subject/kind for the memory policy; absent only on legacy records. */
+  kind?: MemoryKind
+  /** Semantic subject for the memory policy; absent only on legacy records. */
+  subject?: MemorySubject
   /** OWNER/MEMBER: canonical requester id. GROUP: conversation id. */
   scopeId: string
   content: string
@@ -71,6 +76,7 @@ export interface MemoryAccessRule {
 export interface MemoryContextItem {
   scope: 'PERSONAL' | 'GROUP'
   content: string
+  kind?: MemoryKind
 }
 
 /** One buffered message feeding the automatic extractor. */
@@ -84,6 +90,8 @@ export interface MemoryInputMessage {
 /** Extractor output candidate, before scope/identity validation. */
 export interface MemoryCandidate {
   scopeType: MemoryScopeType
+  subject: MemorySubject
+  kind: MemoryKind
   content: string
 }
 
@@ -94,6 +102,11 @@ export type MemoryCandidateRejection =
   | 'RAW_IDENTITY_IN_CONTENT'
   | 'SCOPE_NOT_ALLOWED_FOR_ROLE'
   | 'SCOPE_IDENTITY_MISSING'
+  | 'ASSISTANT_IDENTITY_NOT_WRITABLE'
+  | 'ASSISTANT_RELATIONSHIP_NOT_WRITABLE'
+  | 'ASSISTANT_RULE_NOT_WRITABLE'
+  | 'THIRD_PARTY_ASSERTION_NOT_WRITABLE'
+  | 'EPHEMERAL_CONVENTION_NOT_WRITABLE'
 
 export const MEMORY_TEXT_MARKER = 'wxid_'
 export const MEMORY_MAX_CONTENT_CHARS = 500

@@ -53,6 +53,7 @@
  * depends on a threshold.
  */
 import { evaluateMemoryRelevance, type MemoryRetrievalIdentityContext } from './memory-relevance.js'
+import { classifyMemoryKind } from './assistant-identity.js'
 import {
   MEMORY_SCOPE_GROUP,
   MemoryText,
@@ -133,7 +134,11 @@ export function buildAuthorizedMemoryWorkingSet(
     if (items.length > 0 && chars + content.length > maxChars) {
       break
     }
-    items.push({ scope: scopeClassOf(record), content })
+    items.push({
+      scope: scopeClassOf(record),
+      content,
+      kind: classifyMemoryKind(record.content, record.kind),
+    })
     chars += content.length
   }
 

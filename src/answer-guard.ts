@@ -25,6 +25,11 @@
  */
 import { ASSISTANT_LABEL, CURRENT_REQUESTER_LABEL } from './group-ambient-context.js'
 import { isInternalSpeakerLabel } from './speaker-labels.js'
+import {
+  classifyAssistantIdentityClaims,
+  createTrustedAssistantRuntimeFacts,
+  type AssistantRuntimeFacts,
+} from './assistant-identity.js'
 
 /** Why a draft was touched. Kinds are safe to log; values are not. */
 export type InternalLeakKind =
@@ -34,6 +39,10 @@ export type InternalLeakKind =
   | 'PUBLIC_DISPLAY_ALIAS'
   | 'INTERNAL_FIELD_NAME'
   | 'UNGROUNDED_IDENTITY_CLAIM'
+  | 'UNSUPPORTED_ASSISTANT_IDENTITY_MUTATION'
+  | 'UNSUPPORTED_ASSISTANT_RELATIONSHIP_CLAIM'
+  | 'UNSUPPORTED_RELATIONSHIP_RECIPROCITY'
+  | 'UNSUPPORTED_IDENTITY_PROVENANCE'
   | 'INTERNAL_VALUE'
 
 export interface InternalLeakCount {
@@ -53,6 +62,12 @@ export interface AnswerGuardFacts {
   /** Grounding facts for the narrow current-requester identity path. */
   selfIdentityQuery?: boolean
   retrievedPersonalMemoryCount?: number
+  /** Trusted Assistant identity facts; absent means the conservative defaults. */
+  assistantRuntime?: AssistantRuntimeFacts
+  /** The current question explicitly asks about the Assistant's identity. */
+  assistantIdentityQuery?: boolean
+  /** Provider-safe presentation label, never an authorization or relationship fact. */
+  requesterAddressPreference?: string | null
   /** Exact provider-only duplicate-name labels generated for this prompt. */
   publicDisplayAliases?: readonly PublicDisplayAlias[]
 }
@@ -138,6 +153,10 @@ const DETECTION_ORDER: readonly InternalLeakKind[] = [
   'PUBLIC_DISPLAY_ALIAS',
   'INTERNAL_FIELD_NAME',
   'UNGROUNDED_IDENTITY_CLAIM',
+  'UNSUPPORTED_ASSISTANT_IDENTITY_MUTATION',
+  'UNSUPPORTED_ASSISTANT_RELATIONSHIP_CLAIM',
+  'UNSUPPORTED_RELATIONSHIP_RECIPROCITY',
+  'UNSUPPORTED_IDENTITY_PROVENANCE',
   'INTERNAL_VALUE',
 ]
 
@@ -378,6 +397,17 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
       bump('UNGROUNDED_IDENTITY_CLAIM', claims)
       blocked = true
     }
+  }
+
+  const assistantRuntime = facts.assistantRuntime ?? createTrustedAssistantRuntimeFacts('椰椰')
+  for (const claim of classifyAssistantIdentityClaims(
+    text,
+    assistantRuntime,
+    facts.requesterAddressPreference,
+    facts.assistantIdentityQuery,
+  )) {
+    bump(claim.kind, claim.count)
+    blocked = true
   }
 
   // Re-scan: nothing rewritten above may survive, and nothing may be re-created by

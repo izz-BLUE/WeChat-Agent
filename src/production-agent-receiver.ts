@@ -64,6 +64,7 @@ import {
 import { isGroupConversationId, isVerifiedOwnerDirect } from './message-contract.js'
 import { isRequestDeadlineExceeded, RequestDeadline, withRequestDeadline } from './request-deadline.js'
 import { identityToken } from './identity-observer.js'
+import { createTrustedAssistantRuntimeFacts } from './assistant-identity.js'
 import {
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
@@ -599,6 +600,7 @@ export class ProductionChatAgent implements AgentExecutor {
       question,
       {
         botDisplayName: config.botDisplayName,
+        assistantRuntime: createTrustedAssistantRuntimeFacts(config.botDisplayName),
         mention: mentionFact(request),
         requesterRole: request.requesterRole,
         ownerConfigured: request.ownerConfigured,

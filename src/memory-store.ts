@@ -28,6 +28,12 @@ import {
   type PersistentRuntimeLogSink,
 } from './persistent-runtime-log.js'
 import {
+  MEMORY_KINDS,
+  MEMORY_SUBJECTS,
+  type MemoryKind,
+  type MemorySubject,
+} from './assistant-identity.js'
+import {
   MemoryText,
   type MemoryAccessRule,
   type MemoryRecord,
@@ -140,7 +146,13 @@ export class MemoryStore {
     return 'WRITTEN'
   }
 
-  public update(memoryId: string, content: string, updatedAt: number): boolean {
+  public update(
+    memoryId: string,
+    content: string,
+    updatedAt: number,
+    kind?: MemoryKind,
+    subject?: MemorySubject,
+  ): boolean {
     if (!this.enabled) {
       return false
     }
@@ -161,6 +173,8 @@ export class MemoryStore {
       content: normalized,
       contentHash: MemoryText.hash(normalized),
       updatedAt,
+      ...(kind === undefined ? {} : { kind }),
+      ...(subject === undefined ? {} : { subject }),
     }
     if (!this.save()) {
       this.records[index] = previous
@@ -355,6 +369,10 @@ function parseRecord(value: unknown): MemoryRecord | null {
   if (typeof record.contentHash !== 'string' || record.contentHash.length === 0) return null
   if (typeof visibility !== 'string' || !VISIBILITIES.includes(visibility as MemoryVisibility)) return null
   if (record.origin !== 'AUTOMATIC' && record.origin !== 'EXPLICIT_OWNER') return null
+  if (record.kind !== undefined &&
+      (typeof record.kind !== 'string' || !MEMORY_KINDS.includes(record.kind as MemoryKind))) return null
+  if (record.subject !== undefined &&
+      (typeof record.subject !== 'string' || !MEMORY_SUBJECTS.includes(record.subject as MemorySubject))) return null
   if (record.sourceConversationType !== null && record.sourceConversationType !== 'GROUP' && record.sourceConversationType !== 'DIRECT') return null
   if (record.sourceConversationId !== null && typeof record.sourceConversationId !== 'string') return null
   if (record.sourceSenderId !== null && typeof record.sourceSenderId !== 'string') return null
@@ -364,6 +382,8 @@ function parseRecord(value: unknown): MemoryRecord | null {
   return {
     memoryId: record.memoryId,
     scopeType: scopeType as MemoryScopeType,
+    kind: record.kind as MemoryKind | undefined,
+    subject: record.subject as MemorySubject | undefined,
     scopeId: record.scopeId,
     content: record.content,
     contentHash: record.contentHash,
