@@ -209,6 +209,12 @@ export function isExplicitMemoryCommand(text: string): boolean {
 /** Historical GROUP keywords that route an explicit add to the group scope. */
 export const GROUP_SCOPE_KEYWORDS = ['这个群', '本群', '群里', '以后这个群'] as const
 
+const REQUESTER_LOCAL_PREFERENCE_KINDS: readonly MemoryKind[] = [
+  'ADDRESS_PREFERENCE',
+  'CONTENT_PREFERENCE',
+  'SOFT_STYLE_PREFERENCE',
+]
+
 export interface MemoryObservation {
   messageId: string
   conversationType: ConversationType
@@ -746,11 +752,15 @@ export class MemoryService {
       // else is the requester's own personal scope. The model's `scope` field is
       // informational only, exactly as in v02.
       const groupScoped = GROUP_SCOPE_KEYWORDS.some((keyword) => request.question.includes(keyword))
-      const scopeType: MemoryScopeType = groupScoped ? MEMORY_SCOPE_GROUP : this.personalScope(request.requesterRole)
-      const scopeId = groupScoped ? request.conversationId : request.requesterId
+      const requestedScopeType: MemoryScopeType = groupScoped ? MEMORY_SCOPE_GROUP : this.personalScope(request.requesterRole)
+      const requestedContent = normalizeContentForWrite(mutation.content ?? '', requestedScopeType, request.requesterId)
+      const kind = classifyMemoryKind(requestedContent, mutation.kind)
+      const subject = classifyMemorySubject(requestedScopeType, kind, mutation.subject)
+      const scopeType = isRequesterLocalPreference(subject, kind)
+        ? this.personalScope(request.requesterRole)
+        : requestedScopeType
+      const scopeId = scopeType === MEMORY_SCOPE_GROUP ? request.conversationId : request.requesterId
       const content = normalizeContentForWrite(mutation.content ?? '', scopeType, request.requesterId)
-      const kind = classifyMemoryKind(content, mutation.kind)
-      const subject = classifyMemorySubject(scopeType, kind, mutation.subject)
       const policyRejection = memoryKindWriteRejection(kind, subject)
       if (policyRejection !== null) {
         this.emitCandidatePolicy(subject, kind, policyRejection)
@@ -928,7 +938,12 @@ export class MemoryService {
     }
 
     let scopeType: MemoryScopeType
-    if (candidate.scopeType === MEMORY_SCOPE_GROUP) {
+    if (isRequesterLocalPreference(subject, kind)) {
+      // The semantic subject is authoritative for requester-local preferences:
+      // a malformed extractor scope must not turn one person's preference into
+      // a conversation-wide memory.
+      scopeType = this.personalScope(slot.requesterRole)
+    } else if (candidate.scopeType === MEMORY_SCOPE_GROUP) {
       scopeType = MEMORY_SCOPE_GROUP
     } else if (candidate.scopeType === MEMORY_SCOPE_OWNER && slot.requesterRole === 'OWNER') {
       scopeType = MEMORY_SCOPE_OWNER
@@ -984,7 +999,10 @@ export class MemoryService {
   }
 
   private readableRecords(records: readonly MemoryRecord[]): MemoryRecord[] {
-    return records.filter((record) => isReadableMemoryKind(record.kind, record.content, record.subject))
+    return records.filter((record) =>
+      isReadableMemoryKind(record.kind, record.content, record.subject) &&
+      !isDirtyRequesterLocalPreference(record),
+    )
   }
 
   private emitCandidatePolicy(
@@ -1053,6 +1071,18 @@ function normalizeContentForWrite(content: string, scopeType: MemoryScopeType, r
     : normalizeCurrentRequesterSelfReference(normalized, requesterId)
 }
 
+function isRequesterLocalPreference(subject: MemorySubject, kind: MemoryKind): boolean {
+  return subject === 'CURRENT_REQUESTER' && REQUESTER_LOCAL_PREFERENCE_KINDS.includes(kind)
+}
+
+function isDirtyRequesterLocalPreference(record: MemoryRecord): boolean {
+  if (record.scopeType !== MEMORY_SCOPE_GROUP || record.subject !== 'CURRENT_REQUESTER') {
+    return false
+  }
+  const kind = classifyMemoryKind(record.content, record.kind)
+  return isRequesterLocalPreference(record.subject, kind)
+}
+
 function explicitAddReply(status: MemoryWriteStatus): string {
   if (status === 'WRITTEN') {
     return '记住了。'
@@ -1072,6 +1102,7 @@ export function mutationSystemPrompt(): string {
     + '此时输出示例为 {"operation":"ADD","target":null,"content":"我叫某个名字","scope":"OWNER"}；'
     + 'content 只写无身份标识的自然事实，例如“我叫某个名字”，不要写 wxid、Signature、requesterId、senderId、conversationId 或其他内部 ID。'
     + '“叫我妈妈”只能是 subject=CURRENT_REQUESTER、kind=ADDRESS_PREFERENCE；任何关于 Assistant 是谁、叫什么、是谁的亲属/主人/宠物的断言都必须标为 subject=ASSISTANT 的对应 ASSISTANT_* 类型，运行时会拒绝保存。'
+    + '当前请求者自己的称呼、内容或回答风格偏好必须 subject=CURRENT_REQUESTER；“这个群/本群”的整体偏好必须 subject=GROUP。scope 字段仅供解析，运行时会按请求文本和可信 requester role 决定实际范围。'
     + '没有候选记忆不会阻止 ADD。只有无法确定是何种记忆变更时才输出 operation=NONE。'
   )
 }

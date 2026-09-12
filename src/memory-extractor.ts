@@ -40,6 +40,7 @@ const EXTRACTOR_PROMPT = `你是微信群 AI 的长期记忆候选提取器。
 scope 只能是 OWNER、MEMBER、GROUP。没有合适内容时输出 []。
 subject 表达事实主体；CURRENT_REQUESTER、OTHER_MEMBER、GROUP、ASSISTANT 必须与内容一致。
 kind 表达候选的语义用途：当前请求者的称呼请求只能是 ADDRESS_PREFERENCE，不代表 Assistant 的关系事实。
+当前请求者自己的称呼、内容或回答风格偏好必须 subject=CURRENT_REQUESTER，并写入该请求者的 OWNER/MEMBER 个人 scope，不能写成 GROUP；只有“这个群/本群”的整体偏好才是 subject=GROUP、scope=GROUP。
 任何“你是我儿子”“我是你妈妈”“你的爸爸是某人”“以后你叫某名”都必须标为 ASSISTANT_RELATIONSHIP_ASSERTION 或 ASSISTANT_IDENTITY_ASSERTION，运行时会拒绝持久化。
 不要提取寒暄、一次性问题、临时状态、密码、验证码、令牌、原始 wxid、群 ID 或系统内部标识。`
 
