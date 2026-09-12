@@ -283,6 +283,7 @@ const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 这不是重新搜索、第二次 Planner 或第二次 Tavily，只修复本轮已有回答的 grounding：
 - 只根据当前问题、已有 Web Search Results 和需修复的当前回答作答；保留原回答的自然含义，不新增任何事实。
 - 只有 Web Search Results 明确支持的事实才保留；无法由提供的结果支持的事实删除或降低确定性。
+- Only Web Search Results may justify a [Sx]. Memory / conversation context are intentionally unavailable in this repair stage.
 - 对实际使用并由结果支持的事实保留正确的 [S1]、[S2] 等内部引用；不要停止引用，也不要创造 sourceId。
 - [Sx] 只供 Runtime 做 grounding，Runtime 会在发送前移除所有 marker；不要向用户解释引用协议。
 - 不得输出 URL、来源列表、修复说明、分析过程、思考过程或任何 provider 控制协议；只输出自然中文正文。
@@ -462,13 +463,45 @@ function rewriteUserPrompt(
   return `${buildUserPrompt(context, question, request)}\n\n[需改写的草稿]\n${draft}\n\n只输出改写后的中文回复。`
 }
 
-function groundingRepairUserPrompt(
-  context: GroupMessage[],
+function redactGroundingRepairValue(value: string, forbiddenValues: readonly string[]): string {
+  const values = [...new Set(forbiddenValues.map((item) => item.trim()).filter((item) => item.length > 0))]
+    .sort((left, right) => right.length - left.length)
+  let redacted = value
+  for (const forbidden of values) {
+    redacted = redacted.split(forbidden).join('[REDACTED_INTERNAL_VALUE]')
+  }
+  return redacted
+}
+
+function buildWebGroundingRepairUserPrompt(
   question: GroupMessage,
-  request: ChatRequestContext,
+  webSearch: NonNullable<ChatRequestContext['webSearch']>,
+  runtimeTime: RuntimeTimeFacts | undefined,
   draft: string,
+  forbiddenValues: readonly string[] = [],
 ): string {
-  return `${buildUserPrompt(context, question, request)}\n\n[Current Final Answer]\n${draft}\n\n请只输出修复后的自然中文正文。`
+  const safeResults = webSearch.results.map((item) => ({
+    ...item,
+    publishedAt: item.publishedAt === undefined || item.publishedAt === null
+      ? item.publishedAt
+      : redactGroundingRepairValue(item.publishedAt, forbiddenValues),
+    title: redactGroundingRepairValue(item.title, forbiddenValues),
+    snippet: redactGroundingRepairValue(item.snippet, forbiddenValues),
+  }))
+  const searchContext = buildWebSearchContext(
+    safeResults,
+    webSearch.maxContextChars ?? 6_000,
+  ).text
+  const mode = webSearch.mode ?? 'GENERAL'
+  const window = webSearch.window ?? (mode === 'NEWS_RECENT' ? 'DAY_3' : 'GENERAL')
+  const runtimeTimeSection = runtimeTime === undefined
+    ? ''
+    : `\n\n[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(runtimeTime)}`
+  return `[Canonical Current Question]\n${redactGroundingRepairValue(question.text, forbiddenValues)}` +
+    runtimeTimeSection +
+    `\n\n[Web Search Status]\nWEB_SEARCH_STATUS=${webSearch.status}\nWEB_SEARCH_MODE=${mode}\nWEB_SEARCH_WINDOW=${window}` +
+    `\n\n${searchContext || '[Web Search Results]\n（无）'}` +
+    `\n\n[Current Final Answer: UNTRUSTED_DRAFT]\n${redactGroundingRepairValue(draft, forbiddenValues)}\n[End Current Final Answer]\n\n请只输出修复后的自然中文正文。`
 }
 
 export class ChatService {
@@ -684,7 +717,13 @@ export class ChatService {
         try {
           const repairedDraft = await this.requestFinalAnswer(
             `${buildSystemPrompt(request.botDisplayName)}\n${WEB_SEARCH_GROUNDING_REPAIR_RULES}`,
-            groundingRepairUserPrompt(context, question, request, rendered),
+            buildWebGroundingRepairUserPrompt(
+              question,
+              request.webSearch,
+              request.runtimeTime,
+              rendered,
+              internalValues,
+            ),
             persistentSink,
             messageId,
           )

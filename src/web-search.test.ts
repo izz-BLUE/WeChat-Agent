@@ -1,7 +1,8 @@
 import { strict as assert } from 'node:assert'
 import { appendGroundedSources, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
 import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
-import { buildSystemPrompt, ChatService } from './chat.js'
+import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
+import type { GroupMessage } from './context.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
@@ -1027,7 +1028,86 @@ async function main(): Promise<void> {
       check(!answer.includes('https://evil.example/fabricated'), 'repair raw URL survived final grounding')
       check(answer.includes('来源：\n1. 来源二 https://example.com/s2') && !answer.includes('来源一'), 'repair grounded the wrong source')
       check(final.calls[1]?.system.includes('Web Search Grounding Repair'), 'grounding repair contract was not used')
-      check(final.calls[1]?.user.includes('[Current Final Answer]\n原始搜索事实，没有引用。'), 'current answer was not provided to grounding repair')
+      check(final.calls[1]?.user.includes('[Current Final Answer: UNTRUSTED_DRAFT]\n原始搜索事实，没有引用。'), 'current answer was not provided to grounding repair')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('grounding repair prompt is limited to question, time, bounded evidence, and draft', async () => {
+    const final = scriptedFinalChat(['原始搜索事实', '可靠结论[S1]'])
+    const context: GroupMessage[] = [{
+      senderId: 'recent-sender-secret',
+      senderName: 'MEMBER_1',
+      text: 'recent-context-secret',
+      timestamp: 1,
+    }]
+    const question: GroupMessage = {
+      senderId: 'current-sender-secret',
+      senderName: 'CURRENT_REQUESTER',
+      text: '当前新闻问题',
+      timestamp: 2,
+    }
+    const webSearch: NonNullable<ChatRequestContext['webSearch']> = {
+      used: true,
+      status: 'PASS',
+      results: [result('S1', 'bounded title', 'https://example.com/bounded', '2026-09-11')],
+      maxContextChars: 6_000,
+      mode: 'NEWS_RECENT',
+      window: 'DAY_3',
+    }
+    const memory: ChatRequestContext['memory'] = [
+      { scope: 'PERSONAL', content: 'personal-memory-secret' },
+      { scope: 'GROUP', content: 'group-memory-secret' },
+    ]
+    const ambient: ChatRequestContext['ambient'] = [{
+      label: 'AMBIENT_SPEAKER_1',
+      text: 'ambient-context-secret',
+      messageId: 'ambient-1',
+    }]
+    const groupStyle: NonNullable<ChatRequestContext['groupStyle']> = {
+      sampleCount: 1,
+      messageLength: 'SHORT',
+      lineBreakDensity: 'LOW',
+      emojiDensity: 'NONE',
+      punctuationDensity: 'LOW',
+      latinMix: 'LOW',
+    }
+    try {
+      const answer = await final.chat.reply(
+        context,
+        question,
+        {
+          botDisplayName: '椰椰',
+          mention: 'MENTIONED',
+          requesterRole: 'MEMBER',
+          ownerConfigured: true,
+          memory,
+          ambient,
+          currentSpeakerLabel: 'MEMBER_1',
+          persistentMemoryAvailable: true,
+          runtimeTime: RUNTIME_TIME,
+          groupStyle,
+          webSearch,
+        },
+        [REQUESTER_ID, CONVERSATION_ID, 'current-sender-secret', 'target-secret'],
+        undefined,
+        'repair-boundary-message',
+      )
+      const initialUser = final.calls[0]?.user ?? ''
+      const repairUser = final.calls[1]?.user ?? ''
+      const repairSystem = final.calls[1]?.system ?? ''
+      check(initialUser.includes('personal-memory-secret') && initialUser.includes('ambient-context-secret'), 'initial final prompt stopped receiving normal context')
+      check(repairUser.includes('[Canonical Current Question]\n当前新闻问题'), 'repair prompt omitted canonical question')
+      check(repairUser.includes('[S1]') && repairUser.includes('PublishedAt: 2026-09-11') && repairUser.includes('Title: bounded title') && repairUser.includes('Snippet: 来源摘要'), 'repair prompt omitted bounded search evidence')
+      check(repairUser.includes('[Runtime Time: TRUSTED_RUNTIME_FACT]') && repairUser.includes('CURRENT_LOCAL_DATE=2026-09-11'), 'repair prompt omitted runtime time')
+      check(repairUser.includes('[Current Final Answer: UNTRUSTED_DRAFT]\n原始搜索事实'), 'repair prompt omitted untrusted current draft')
+      for (const forbidden of ['personal-memory-secret', 'group-memory-secret', 'ambient-context-secret', 'recent-context-secret', 'MEMBER_1', 'CURRENT_REQUESTER', REQUESTER_ID, CONVERSATION_ID, 'current-sender-secret', 'target-secret', 'https://example.com/bounded']) {
+        check(!repairUser.includes(forbidden), `repair prompt leaked excluded value: ${forbidden}`)
+      }
+      check(!repairUser.includes('CurrentSpeakerLabel') && !repairUser.includes('[Runtime Facts]') && !repairUser.includes('Group Conversation Style'), 'repair prompt leaked runtime/context sections')
+      check(repairSystem.includes('Only Web Search Results may justify a [Sx]') && repairSystem.includes('Memory / conversation context are intentionally unavailable'), 'repair system evidence-only boundary is missing')
+      check(answer.includes('来源：\n1. bounded title https://example.com/bounded') && !/\[S\d+\]/u.test(answer.split('\n\n来源：')[0] ?? answer), 'repair boundary changed final grounding')
     } finally {
       final.restore()
     }
