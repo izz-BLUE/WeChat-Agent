@@ -18,7 +18,6 @@ import {
   type OwnerPrivateDispatchPlannerLike,
 } from './owner-private-dispatch-planner.js'
 import type { OwnerDispatchPlannerLike } from './owner-dispatch-planner.js'
-import { OwnerPrivateDispatchTarget } from './owner-private-dispatch-target.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { sha256Utf8 } from './outbound-delivery.js'
@@ -190,28 +189,25 @@ async function main(): Promise<void> {
 
   const noopCalls = { count: 0 }
   const noopPlannerCalls = { count: 0 }
-  const noopTarget = new OwnerPrivateDispatchTarget()
   const noopAgent = new ProductionChatAgent(chat(noopCalls), {
-    ownerPrivateDispatchTarget: noopTarget,
     ownerPrivateDispatchPlanner: privatePlanner('NOOP', null, noopPlannerCalls),
   })
-  noopTarget.bind(ROOM_A)
-  assert.equal(await noopAgent.complete(directRequest()), '')
+  assert.equal(await noopAgent.complete(directRequest({ privateDispatchTargetConversationId: ROOM_A })), '')
   assert.equal(noopCalls.count, 0)
   assert.equal(noopPlannerCalls.count, 1)
   assert.equal(noopAgent.pollProactiveOutbound(), null)
 
   const dispatchCalls = { count: 0 }
   const dispatchPlannerCalls = { count: 0 }
-  const dispatchTarget = new OwnerPrivateDispatchTarget()
   const dispatchAmbient = new GroupAmbientContext({ now: () => Date.now() })
   const dispatchAgent = new ProductionChatAgent(chat(dispatchCalls), {
-    ownerPrivateDispatchTarget: dispatchTarget,
     ownerPrivateDispatchPlanner: privatePlanner('DISPATCH', '大家今晚十点开会，别迟到', dispatchPlannerCalls),
     ambientContext: dispatchAmbient,
   })
-  dispatchTarget.bind(ROOM_A)
-  assert.equal(await dispatchAgent.complete(directRequest({ messageId: 'dispatch-1' })), '')
+  assert.equal(await dispatchAgent.complete(directRequest({
+    messageId: 'dispatch-1',
+    privateDispatchTargetConversationId: ROOM_A,
+  })), '')
   assert.equal(dispatchCalls.count, 0)
   assert.equal(dispatchPlannerCalls.count, 1)
   const command = dispatchAgent.pollProactiveOutbound()
@@ -230,14 +226,14 @@ async function main(): Promise<void> {
   assert.equal(dispatchAmbient.entries(ROOM_A).filter((line) => line.speakerType === 'ASSISTANT').length, 1)
 
   const failedAmbient = new GroupAmbientContext({ now: () => Date.now() })
-  const failedTarget = new OwnerPrivateDispatchTarget()
   const failedAgent = new ProductionChatAgent(chat({ count: 0 }), {
-    ownerPrivateDispatchTarget: failedTarget,
     ownerPrivateDispatchPlanner: privatePlanner('DISPATCH', '失败不应进群'),
     ambientContext: failedAmbient,
   })
-  failedTarget.bind(ROOM_A)
-  await failedAgent.complete(directRequest({ messageId: 'dispatch-failed' }))
+  await failedAgent.complete(directRequest({
+    messageId: 'dispatch-failed',
+    privateDispatchTargetConversationId: ROOM_A,
+  }))
   const failedCommand = failedAgent.pollProactiveOutbound()
   assert(failedCommand)
   assert.equal(failedAgent.observeOutboundDelivery({
@@ -249,24 +245,21 @@ async function main(): Promise<void> {
   }).reason, 'FAILED_DISCARDED')
   assert.equal(failedAmbient.entries(ROOM_A).some((line) => line.speakerType === 'ASSISTANT'), false)
 
-  const bindTarget = new OwnerPrivateDispatchTarget()
   const groupAgent = new ProductionChatAgent(chat({ count: 0 }), {
     ownerDispatchPlanner: groupPlanner(),
-    ownerPrivateDispatchTarget: bindTarget,
   })
   await groupAgent.complete(groupRequest(ROOM_A, 'group-bind'))
-  assert.equal(bindTarget.conversationId, ROOM_A)
   await groupAgent.complete(groupRequest(ROOM_B, 'group-rebind'))
-  assert.equal(bindTarget.conversationId, ROOM_B)
-  assert(groupAgent.pollProactiveOutbound())
-  assert(groupAgent.pollProactiveOutbound())
-  const restartedTarget = new OwnerPrivateDispatchTarget()
-  assert.equal(restartedTarget.conversationId, null)
+  const groupCommandA = groupAgent.pollProactiveOutbound()
+  const groupCommandB = groupAgent.pollProactiveOutbound()
+  assert(groupCommandA)
+  assert(groupCommandB)
+  assert.equal(groupCommandA.conversationId, ROOM_A)
+  assert.equal(groupCommandB.conversationId, ROOM_B)
+  assert.equal(groupAgent.pollProactiveOutbound(), null)
 
   const captured: { question: string; forbidden: readonly string[] } = { question: '', forbidden: [] }
-  const captureTarget = new OwnerPrivateDispatchTarget()
   const captureAgent = new ProductionChatAgent(chat({ count: 0 }), {
-    ownerPrivateDispatchTarget: captureTarget,
     ownerPrivateDispatchPlanner: {
       plan: async (question, forbiddenValues = []) => {
         captured.question = question
@@ -275,19 +268,65 @@ async function main(): Promise<void> {
       },
     },
   })
-  captureTarget.bind(ROOM_A)
-  await captureAgent.complete(directRequest({ text: '问一下最近怎么样', rawText: '问一下最近怎么样' }))
+  await captureAgent.complete(directRequest({
+    text: '问一下最近怎么样',
+    rawText: '问一下最近怎么样',
+    privateDispatchTargetConversationId: ROOM_A,
+  }))
   assert.equal(captured.question, '问一下最近怎么样')
-  assert.equal(captured.forbidden.includes(ROOM_A), false)
+  assert.equal(captured.forbidden.includes(ROOM_A), true)
   assert.equal(captured.forbidden.includes(OWNER), true)
   assert.equal(captured.forbidden.includes(PEER), true)
 
-  const transportTarget = new OwnerPrivateDispatchTarget()
+  let plannerSystem = ''
+  let plannerUser = ''
+  const promptAgent = new ProductionChatAgent(chat({ count: 0 }), {
+    ownerPrivateDispatchPlanner: new OwnerPrivateDispatchPlanner(async (system, user) => {
+      plannerSystem = system
+      plannerUser = user
+      return 'ACTION=NOOP\nMESSAGE='
+    }),
+  })
+  await promptAgent.complete(directRequest({
+    messageId: 'prompt-privacy',
+    privateDispatchTargetConversationId: ROOM_A,
+  }))
+  assert.equal(plannerSystem.includes(ROOM_A), false)
+  assert.equal(plannerUser.includes(ROOM_A), false)
+
+  let invalidTargetPlannerCalls = 0
+  const invalidTargetAgent = new ProductionChatAgent(chat({ count: 0 }), {
+    ownerPrivateDispatchPlanner: privatePlanner('DISPATCH', 'invalid target', {
+      get count() { return invalidTargetPlannerCalls },
+      set count(value: number) { invalidTargetPlannerCalls = value },
+    }),
+  })
+  await invalidTargetAgent.complete(directRequest({
+    messageId: 'invalid-target',
+    privateDispatchTargetConversationId: 'not-a-group',
+  }))
+  assert.equal(invalidTargetPlannerCalls, 0)
+
+  let groupPrivatePlannerCalls = 0
+  const forgedGroupRequest = {
+    ...groupRequest(ROOM_A, 'group-forged-target'),
+    privateDispatchTargetConversationId: ROOM_B,
+  }
+  const forgedGroupAgent = new ProductionChatAgent(chat({ count: 0 }), {
+    ownerPrivateDispatchPlanner: {
+      plan: async () => {
+        groupPrivatePlannerCalls += 1
+        return { result: 'PASS' as const, decision: { action: 'NOOP' as const, message: null }, attempts: 1 }
+      },
+    },
+  })
+  await forgedGroupAgent.complete(forgedGroupRequest)
+  assert.equal(groupPrivatePlannerCalls, 0)
+  assert.equal(forgedGroupAgent.pollProactiveOutbound(), null)
+
   const transportAgent = new ProductionChatAgent(chat({ count: 0 }), {
-    ownerPrivateDispatchTarget: transportTarget,
     ownerPrivateDispatchPlanner: privatePlanner('DISPATCH', 'transport private dispatch'),
   })
-  transportTarget.bind(ROOM_A)
   const transport = new ProductionAgentTransportServer({
     pipeName: `owner-private-${process.pid}-${Date.now()}`,
     agent: transportAgent,
@@ -300,7 +339,13 @@ async function main(): Promise<void> {
       socket.once('connect', () => resolve())
       socket.once('error', reject)
     })
-    socket.write(`${JSON.stringify({ kind: 'INBOUND_MESSAGE', message: rawDirect({ msgId: 'transport-private' }) })}\n`)
+    socket.write(`${JSON.stringify({
+      kind: 'INBOUND_MESSAGE',
+      message: rawDirect({
+        msgId: 'transport-private',
+        privateDispatchTargetConversationId: ROOM_A,
+      }),
+    })}\n`)
     assert.equal((await readLine(socket, state)).kind, 'NO_REPLY')
     socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-1"}\n')
     const proactive = await readLine(socket, state)

@@ -51,8 +51,7 @@ import {
   parseOwnerPrivateDispatchProtocol,
   type OwnerPrivateDispatchPlannerLike,
 } from './owner-private-dispatch-planner.js'
-import { OwnerPrivateDispatchTarget } from './owner-private-dispatch-target.js'
-import { isVerifiedOwnerDirect } from './message-contract.js'
+import { isGroupConversationId, isVerifiedOwnerDirect } from './message-contract.js'
 import {
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
@@ -77,7 +76,12 @@ function mentionFact(request: AgentRequest): ChatMentionFact {
  * closed instead of sending an internal identity to the group.
  */
 function guardValues(request: AgentRequest): string[] {
-  return [request.requesterId, request.conversationId, request.senderId]
+  return [
+    request.requesterId,
+    request.conversationId,
+    request.senderId,
+    request.privateDispatchTargetConversationId ?? '',
+  ]
 }
 
 const UNTRUSTED_GROUP_ID_PLACEHOLDER = '[REDACTED_ID]'
@@ -124,7 +128,6 @@ export interface ProductionChatAgentOptions {
   pendingOutboundTtlMs?: number
   ownerDispatchPlanner?: OwnerDispatchPlannerLike | null
   ownerPrivateDispatchPlanner?: OwnerPrivateDispatchPlannerLike | null
-  ownerPrivateDispatchTarget?: OwnerPrivateDispatchTarget
   proactiveQueue?: ProactiveGroupQueue
   proactiveQueueMaxEntries?: number
   proactiveQueueTtlMs?: number
@@ -146,7 +149,6 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly pendingOutbound: PendingOutboundReplyStore
   private readonly ownerDispatchPlanner: OwnerDispatchPlannerLike | null
   private readonly ownerPrivateDispatchPlanner: OwnerPrivateDispatchPlannerLike | null
-  private readonly ownerPrivateDispatchTarget: OwnerPrivateDispatchTarget
   private readonly proactiveQueue: ProactiveGroupQueue
 
   public constructor(
@@ -172,10 +174,6 @@ export class ProductionChatAgent implements AgentExecutor {
     })
     this.ownerDispatchPlanner = options.ownerDispatchPlanner ?? null
     this.ownerPrivateDispatchPlanner = options.ownerPrivateDispatchPlanner ?? null
-    this.ownerPrivateDispatchTarget = options.ownerPrivateDispatchTarget ?? new OwnerPrivateDispatchTarget(
-      (operation, result, targetToken) => this.logOwnerPrivateTarget(operation, result, targetToken),
-    )
-    this.ownerPrivateDispatchTarget.clearForRestart()
     this.proactiveQueue = options.proactiveQueue ?? new ProactiveGroupQueue({
       maxEntries: options.proactiveQueueMaxEntries ?? DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
       ttlMs: options.proactiveQueueTtlMs ?? DEFAULT_PROACTIVE_QUEUE_TTL_MS,
@@ -535,18 +533,17 @@ export class ProductionChatAgent implements AgentExecutor {
     }
     this.logOwnerDispatch('DISPATCH_NOW', 'PASS', 'ENQUEUED')
     this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
-    const targetOperation = this.ownerPrivateDispatchTarget.bind(request.conversationId)
-    if (targetOperation === null) {
-      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'TARGET_BIND_INVALID')
-      return true
-    }
     return true
   }
 
   private async tryOwnerPrivateDispatch(request: AgentRequest): Promise<string> {
-    const target = this.ownerPrivateDispatchTarget.conversationId
-    if (target === null) {
+    const target = request.privateDispatchTargetConversationId?.trim() ?? ''
+    if (!target) {
       this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'TARGET_UNBOUND')
+      return ''
+    }
+    if (!isGroupConversationId(target)) {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'TARGET_INVALID')
       return ''
     }
     if (this.ownerPrivateDispatchPlanner === null) {
@@ -604,19 +601,6 @@ export class ProductionChatAgent implements AgentExecutor {
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
       'OWNER_PRIVATE_DISPATCH',
       { action, result, reason },
-    )
-  }
-
-  private logOwnerPrivateTarget(
-    operation: 'BIND' | 'REBIND' | 'RESTART',
-    result: 'PASS' | 'UNBOUND',
-    targetToken: string,
-  ): void {
-    emitDiagnostic(
-      (line: string) => console.log(line),
-      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
-      'OWNER_PRIVATE_TARGET',
-      { operation, result, targetToken },
     )
   }
 

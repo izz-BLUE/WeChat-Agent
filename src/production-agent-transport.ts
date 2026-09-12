@@ -530,6 +530,7 @@ const WIRE_IDENTITY_FIELDS = [
   'requesterSource',
   'requesterRole',
   'ownerDisplayName',
+  'privateDispatchTargetConversationId',
 ] as const
 
 const PROACTIVE_OUTBOUND_POLL_KIND = 'PROACTIVE_OUTBOUND_POLL' as const

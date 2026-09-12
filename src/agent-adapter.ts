@@ -29,9 +29,11 @@ export interface AgentRequest {
   requesterSource: string
   /** Runtime-decided role fact; consumed as-is, never re-derived here. */
   requesterRole: RequesterRole
-  ownerConfigured: boolean
-  /** Display metadata only; never an authorization input. */
-  ownerDisplayName: string | null
+    ownerConfigured: boolean
+    /** Display metadata only; never an authorization input. */
+    ownerDisplayName: string | null
+    /** C#-only target; only verified OWNER DIRECT may consume it. */
+    privateDispatchTargetConversationId?: string | null
   senderName: string | null
   text: string
   /**
@@ -193,6 +195,9 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     requesterRole: message.requesterRole,
     ownerConfigured: message.ownerConfigured,
     ownerDisplayName: message.ownerDisplayName,
+    privateDispatchTargetConversationId: message.conversationType === 'DIRECT'
+      ? message.privateDispatchTargetConversationId
+      : null,
     senderName: message.senderName,
     text: message.text,
     rawText: message.rawText,

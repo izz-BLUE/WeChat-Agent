@@ -45,6 +45,8 @@ export interface RawHookMessage {
   senderId?: string | null
   requesterId?: string | null
   requesterSource?: string | null
+  /** C#-only trusted target for a verified OWNER DIRECT request. */
+  privateDispatchTargetConversationId?: string | null
   /**
    * Owner decision carried on the wire. The role is compared by the runtime
    * against operator configuration; the Agent states the fact and never
@@ -78,6 +80,8 @@ export interface InboundMessage {
   requesterRole: RequesterRole
   ownerConfigured: boolean
   ownerDisplayName: string | null
+  /** Optional C# runtime target; only verified OWNER DIRECT may consume it. */
+  privateDispatchTargetConversationId?: string | null
   senderName: string | null
   text: string
   /**
@@ -309,6 +313,7 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       requesterRole: identity.requesterRole,
       ownerConfigured: identity.ownerConfigured,
       ownerDisplayName: identity.ownerDisplayName,
+      privateDispatchTargetConversationId: normalized(raw.privateDispatchTargetConversationId) || null,
       senderName: normalized(raw.senderName) || null,
       text,
       rawText,
@@ -336,6 +341,14 @@ export function isVerifiedOwnerDirect(message: Pick<InboundMessage,
     message.senderId === message.requesterId &&
     message.conversationId.length > 0 &&
     message.conversationId !== message.requesterId
+}
+
+/** The existing GROUP conversation shape used by the runtime wire contract. */
+export function isGroupConversationId(value: string | null | undefined): boolean {
+  const target = normalized(value)
+  return target.length > '@chatroom'.length &&
+    target.endsWith('@chatroom') &&
+    ![...target].some((character) => /\s/u.test(character) || /[\u0000-\u001f\u007f]/u.test(character))
 }
 
 /**
