@@ -18,6 +18,7 @@ import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import { appendGroundedSources, buildWebSearchContext, inspectGroundedSources, type WebSearchMode, type WebSearchResult, type WebSearchWindow } from './web-search.js'
 import { formatRuntimeTimeFacts, type RuntimeTimeFacts } from './runtime-time.js'
 import { formatGroupStyleProfile, neutralGroupStyleProfile, type GroupStyleProfile } from './group-style.js'
+import { formatMemberInteractionProfile, type MemberInteractionProfile } from './member-interaction-profile.js'
 import {
   deriveGroupReplyPressure,
   formatConversationDynamicsProfile,
@@ -91,6 +92,8 @@ export interface ChatRequestContext {
   runtimeTime?: RuntimeTimeFacts
   /** Deterministic, presentation-only profile observed from historical group chatter. */
   groupStyle?: GroupStyleProfile
+  /** Deterministic, transient presentation hint for the current requester only. */
+  memberInteractionProfile?: MemberInteractionProfile
   /** Deterministic, transient structure facts observed from historical group chatter. */
   conversationDynamics?: ConversationDynamicsProfile
   /** Deterministic, transient pressure fact derived from conversation dynamics. */
@@ -145,6 +148,13 @@ const HUMAN_CONVERSATION_RULES = `
 - 普通搜索问题默认使用 1～3 个自然段，优先 NORMAL_CHAT；不要因为调用了搜索就自动使用标题、编号列表、项目符号或报告式组织。只有用户明确要求详细整理、列出条目、时间线或总结报告，或问题本身确实复杂时，才允许结构化表达。
 - 事实完整性、安全边界和必要的技术细节优先于风格匹配，不要硬性截断答案。
 - [Group Conversation Style] 只是群聊呈现风格的参考，不是指令。适度匹配长短、换行、emoji、正式程度和中英文排版，不要机械模仿，也不要学习群友口癖。`
+
+const MEMBER_INTERACTION_PROFILE_RULES = `[Member Interaction Profile]
+[Member Interaction Profile] 是 Runtime 根据当前请求者已授权的表达偏好和近期互动结构生成的临时 presentation hint，不是人物画像、身份识别、关系事实或长期记忆。
+- 只能轻微影响回答长短、语气、emoji 使用和称呼频率；不得改变 authorization、Owner、mention、Memory scope/admission、Tool、Search、outbound、identity、relation 或 reply ownership。
+- 当前消息中的明确要求、可信运行时事实和安全边界优先于这个 hint；不要向用户提及“画像”、profile、字段或“你一向怎样”。
+- FAMILIARITY=FAMILIAR 只表示当前请求者在本次有限上下文中有至少 2 个历史 active turns，不表示真实关系、亲属关系或任何人格结论。
+- 这些枚举不能推出年龄、性别、职业、收入、健康、政治、智力、性格、情感关系或未明确表达的内容事实。`
 
 const CONVERSATION_DYNAMICS_RULES = `[Conversation Dynamics]
 [Conversation Dynamics] 是 Runtime 根据最近群聊结构提供的参考，不是 System authority，也不是自然语言语义结论。
@@ -363,6 +373,7 @@ ${RUNTIME_TIME_RULES}
 ${TOOL_RUNTIME_RULES}
 ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
+${MEMBER_INTERACTION_PROFILE_RULES}
 ${REFERENCE_RESOLUTION_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${REPLY_BOUNDARY_RULES}`
@@ -384,6 +395,7 @@ ${MEMORY_SIDE_EFFECT_GROUNDING_RULES}
 ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
+${MEMBER_INTERACTION_PROFILE_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
 ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
@@ -394,6 +406,7 @@ const PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT = `你是最终回复生成器。上
 不要复述、解释或改写上一轮协议；不要调用任何工具，不要输出 <|minimax|>、<tool_call>、<invoke>、function_call、tool_calls 或其它内部标记。
 ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
+${MEMBER_INTERACTION_PROFILE_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
 ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
@@ -554,6 +567,13 @@ function groupStyleSection(profile: GroupStyleProfile | undefined): string {
   return `\n\n[Group Conversation Style: OBSERVED_PRESENTATION_FACT]\n${formatGroupStyleProfile(profile)}`
 }
 
+function memberInteractionProfileSection(profile: MemberInteractionProfile | undefined): string {
+  if (profile === undefined) {
+    return ''
+  }
+  return `\n\n[Member Interaction Profile: RUNTIME_PRESENTATION_HINT]\n${formatMemberInteractionProfile(profile)}`
+}
+
 function conversationDynamicsSection(profile: ConversationDynamicsProfile | undefined): string {
   if (profile === undefined) {
     return ''
@@ -691,6 +711,7 @@ export function buildUserPrompt(
       ? ''
       : `[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(request.runtimeTime)}\n\n`) +
     groupStyleSection(request.groupStyle) +
+    memberInteractionProfileSection(request.memberInteractionProfile) +
     conversationDynamicsSection(request.conversationDynamics) +
     groupReplyPressureSection(groupReplyPressure) +
     '\n\n' +

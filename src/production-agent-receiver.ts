@@ -54,6 +54,7 @@ import {
 import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from './runtime-time.js'
 import { observeGroupStyle } from './group-style.js'
 import { deriveGroupReplyPressure, observeConversationDynamics } from './conversation-dynamics.js'
+import { deriveMemberInteractionProfile } from './member-interaction-profile.js'
 import { type OwnerDispatchPlannerLike, OwnerDispatchPlanner } from './owner-dispatch-planner.js'
 import {
   OwnerPrivateDispatchPlanner,
@@ -598,6 +599,14 @@ export class ProductionChatAgent implements AgentExecutor {
         })
       : []
 
+    const memberInteractionProfile = request.conversationType === 'GROUP'
+      ? deriveMemberInteractionProfile({
+          authorizedPersonalMemory: memory.filter((item) => item.scope === 'PERSONAL'),
+          recentRequesterActiveContext: activeContext.currentRequester,
+          groupStyle,
+        })
+      : undefined
+
     const webSearch = await this.resolveWebSearch(
       question.text,
       window.messages,
@@ -632,6 +641,7 @@ export class ProductionChatAgent implements AgentExecutor {
         memoryMutationThisTurn: 'NONE',
         runtimeTime,
         groupStyle,
+        memberInteractionProfile,
         conversationDynamics,
         groupReplyPressure,
         currentRequesterActiveContext: request.conversationType === 'GROUP'
