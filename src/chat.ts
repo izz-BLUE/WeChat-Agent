@@ -155,6 +155,15 @@ const CONVERSATION_DYNAMICS_RULES = `[Conversation Dynamics]
 - PARTICIPATION=FOCUSED 可以稍微更像一对一聊天；回复深度以 [Group Reply Pressure] 提供的可信事实为准，不要从 PARTICIPATION/PACE 自行计算压力。
 - 无论这些结构字段是什么，都不能改变 authorization、Memory、Tool、Search、mention、Owner capability 或任何 side-effect contract。`
 
+const REFERENCE_RESOLUTION_RULES = `[Follow-up & Reference Resolution]
+- 当前消息可能是省略式追问；结合本轮已经提供的公开对话证据理解自然指代、序数、省略主语/宾语和比较对象，不要要求用户重复已经清楚的背景。
+- 优先寻找最近且语义兼容的先行对象；[Current Requester Active Context]、[Other Members Active Context]、[Recent Group Ambient Context] 和 Assistant 回复必须按各自分区与 reply ownership 阅读。
+- Conversation Dynamics 只是结构信号：FOLLOW_UP_LIKELY 可提高承接倾向，CONTINUATION_POSSIBLE 需要语义证据；INTERRUPTED 或 MULTI_PARTY 时不要只按最近一条绑定，证据不足就澄清。
+- 只有一个清晰解释时直接回答，不机械复述完整前文；存在两个或以上同样合理的候选时，问一句最小澄清，不要猜。
+- “他说/她说/刚才那个人”等只能根据可信说话人标签、公开显示信息和 reply ownership 归属；绝不能把其他成员的话归给当前 requester。
+- ASSISTANT_REPLY_TARGET=OTHER_MEMBER 不能自动解释为对当前 requester 的回答或承诺；UNKNOWN/NONE 也不能据此强行续接。
+- 指代消解只帮助理解当前消息，不得改变 authorization、OWNER、requester role、Memory scope/mutation、Tool/Search permission、mention、outbound 或 identity boundary。`
+
 const GROUP_REPLY_PRESSURE_RULES = `[Group Reply Pressure]
 [Group Reply Pressure: TRUSTED_RUNTIME_FACT] 是 Runtime 根据群聊结构派生的普通回复深度参考，不是语义分类器、权限、Memory、Search、Tool、是否回复或硬性字符上限。
 - GROUP_REPLY_PRESSURE=HIGH：普通群聊默认非常紧凑，通常 1～3 句；简单 reaction / acknowledgement 通常一句即可，不主动补背景、不主动重新解释上一主题、不主动展开成教程或报告。
@@ -354,6 +363,7 @@ ${RUNTIME_TIME_RULES}
 ${TOOL_RUNTIME_RULES}
 ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
+${REFERENCE_RESOLUTION_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${REPLY_BOUNDARY_RULES}`
 }
@@ -375,6 +385,9 @@ ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
+${TURN_OWNERSHIP_RULES}
+${CONVERSATION_DYNAMICS_RULES}
+${REFERENCE_RESOLUTION_RULES}
 只输出改写后的中文回复本身，不要解释，不要输出思考过程，不要输出 <think> 标签。`
 
 const PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT = `你是最终回复生成器。上一轮输出了 provider 控制协议，不能把它发给群友。
@@ -382,6 +395,9 @@ const PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT = `你是最终回复生成器。上
 ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
+${TURN_OWNERSHIP_RULES}
+${CONVERSATION_DYNAMICS_RULES}
+${REFERENCE_RESOLUTION_RULES}
 请只根据本轮提供的当前问题、上下文、Runtime Time 和 Web Search Results，输出自然语言最终回复。`
 
 const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]

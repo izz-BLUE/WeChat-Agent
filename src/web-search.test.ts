@@ -794,7 +794,7 @@ async function main(): Promise<void> {
     assert.deepEqual(planned.decision, { action: 'DIRECT', query: null, reasonCode: 'DIRECT_SUFFICIENT', mode: 'GENERAL', recencyWindow: 'NONE' })
   })
 
-  await test('planner search is LLM decided and receives no identity fields', async () => {
+  await test('planner search receives bounded speaker evidence without raw identity fields', async () => {
     let prompt = ''
     const planner = new WebSearchPlanner(async (_system, user) => {
       prompt = user
@@ -803,7 +803,7 @@ async function main(): Promise<void> {
     const planned = await planner.plan(BASE_INPUT)
     check(planned.decision.action === 'SEARCH', 'planner did not choose SEARCH')
     check(!prompt.includes(REQUESTER_ID) && !prompt.includes(CONVERSATION_ID), 'planner prompt contains runtime identity')
-    check(!prompt.includes('SPEAKER_1') && !prompt.includes('AMBIENT_SPEAKER_1'), 'planner prompt contains internal labels')
+    check(prompt.includes('speaker=SPEAKER_1') && prompt.includes('speaker=AMBIENT_SPEAKER_1'), 'planner prompt lost speaker evidence')
   })
 
   await test('planner marks historical conversation as untrusted data', async () => {

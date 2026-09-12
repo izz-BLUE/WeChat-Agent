@@ -603,6 +603,8 @@ export class ProductionChatAgent implements AgentExecutor {
       window.messages,
       ambient,
       memory,
+      activeContext,
+      conversationDynamics,
       request,
       runtimeTime,
       deadline,
@@ -819,6 +821,8 @@ export class ProductionChatAgent implements AgentExecutor {
     recentContext: readonly GroupMessage[],
     ambient: readonly AmbientLine[],
     authorizedMemory: readonly MemoryPromptItem[],
+    activeContext: ActiveContextSplit,
+    conversationDynamics: ReturnType<typeof observeConversationDynamics> | undefined,
     request: AgentRequest,
     runtimeTime: RuntimeTimeFacts,
     deadline: RequestDeadline,
@@ -843,6 +847,13 @@ export class ProductionChatAgent implements AgentExecutor {
         ambient,
         authorizedMemory,
         runtimeTime,
+        currentRequesterActiveContext: request.conversationType === 'GROUP'
+          ? activeContext.currentRequester
+          : undefined,
+        otherMemberActiveContext: request.conversationType === 'GROUP'
+          ? activeContext.otherMembers
+          : undefined,
+        conversationDynamics,
       },
       guardValues(request),
       deadline,
