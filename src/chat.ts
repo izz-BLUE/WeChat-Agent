@@ -389,6 +389,8 @@ const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 - 只根据当前问题、已有 Web Search Results 和需修复的当前回答作答；保留原回答的自然含义，不新增任何事实。
 - 只有 Web Search Results 明确支持的事实才保留；无法由提供的结果支持的事实删除或降低确定性。
 - Only Web Search Results may justify a [Sx]. Memory / conversation context are intentionally unavailable in this repair stage.
+- 保持原回答的信息范围、回答深度和大致长度，只修复 grounding，不新增主题、背景或解释。
+- GROUP_REPLY_PRESSURE 是可信的运行时事实：HIGH 保持紧凑，不因搜索结果更完整而展开；LOW/MEDIUM 也不能把短答改成报告；用户明确要求详细说明时，可以保持原回答已有的详细程度。
 - 对实际使用并由结果支持的事实保留正确的 [S1]、[S2] 等内部引用；不要停止引用，也不要创造 sourceId。
 - [Sx] 只供 Runtime 做 grounding，Runtime 会在发送前移除所有 marker；不要向用户解释引用协议。
 - 不得输出 URL、来源列表、修复说明、分析过程、思考过程或任何 provider 控制协议；只输出自然中文正文。
@@ -521,7 +523,11 @@ function webSearchSection(webSearch: ChatRequestContext['webSearch']): string {
   const context = status === 'PASS'
     ? buildWebSearchContext(webSearch.results, webSearch.maxContextChars ?? 6_000).text
     : ''
+  const groundingContract = status === 'PASS'
+    ? '\n\n[Web Search Grounding Requirement: RUNTIME_CONTRACT]\nGROUNDING_REQUIRED=true\n- 只保留 Web Search Results 明确支持的事实。\n- 使用搜索事实时，正文至少包含一个对应的有效 [Sx]；不要创造 sourceId，不要附加随机引用。'
+    : ''
   return `\n\n[Web Search Status]\nWEB_SEARCH_STATUS=${status}\nWEB_SEARCH_MODE=${mode}\nWEB_SEARCH_WINDOW=${window}\n` +
+    groundingContract +
     (context.length > 0 ? `\n${context}` : '')
 }
 
@@ -545,6 +551,14 @@ function groupReplyPressureSection(
   return pressure === undefined
     ? ''
     : `\n\n[Group Reply Pressure: TRUSTED_RUNTIME_FACT]\nGROUP_REPLY_PRESSURE=${pressure}`
+}
+
+function resolveGroupReplyPressure(request: ChatRequestContext): GroupReplyPressure | undefined {
+  return request.groupReplyPressure ?? (
+    request.conversationDynamics === undefined
+      ? undefined
+      : deriveGroupReplyPressure(request.conversationDynamics)
+  )
 }
 
 function discloseWebSearchFailure(answer: string): string {
@@ -640,11 +654,7 @@ export function buildUserPrompt(
   const currentRequesterActiveContext = request.currentRequesterActiveContext ?? []
   const otherMemberActiveContext = request.otherMemberActiveContext ?? []
   const assistantRuntime = request.assistantRuntime ?? createTrustedAssistantRuntimeFacts(request.botDisplayName)
-  const groupReplyPressure = request.groupReplyPressure ?? (
-    request.conversationDynamics === undefined
-      ? undefined
-      : deriveGroupReplyPressure(request.conversationDynamics)
-  )
+  const groupReplyPressure = resolveGroupReplyPressure(request)
   const memoryTruthfulnessSection = request.memoryMutationThisTurn === undefined
     ? ''
     : `\n\n[Memory Truthfulness Runtime Fact]\nMEMORY_MUTATION_THIS_TURN=${request.memoryMutationThisTurn}`
@@ -703,6 +713,7 @@ function buildWebGroundingRepairUserPrompt(
   question: GroupMessage,
   webSearch: NonNullable<ChatRequestContext['webSearch']>,
   runtimeTime: RuntimeTimeFacts | undefined,
+  groupReplyPressure: GroupReplyPressure | undefined,
   draft: string,
   forbiddenValues: readonly string[] = [],
 ): string {
@@ -723,8 +734,10 @@ function buildWebGroundingRepairUserPrompt(
   const runtimeTimeSection = runtimeTime === undefined
     ? ''
     : `\n\n[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(runtimeTime)}`
+  const pressureSection = groupReplyPressureSection(groupReplyPressure)
   return `[Canonical Current Question]\n${redactGroundingRepairValue(question.text, forbiddenValues)}` +
     runtimeTimeSection +
+    pressureSection +
     `\n\n[Web Search Status]\nWEB_SEARCH_STATUS=${webSearch.status}\nWEB_SEARCH_MODE=${mode}\nWEB_SEARCH_WINDOW=${window}` +
     `\n\n${searchContext || '[Web Search Results]\n（无）'}` +
     `\n\n[Current Final Answer: UNTRUSTED_DRAFT]\n${redactGroundingRepairValue(draft, forbiddenValues)}\n[End Current Final Answer]\n\n请只输出修复后的自然中文正文。`
@@ -1027,6 +1040,7 @@ export class ChatService {
       )
     }
 
+    const groupReplyPressure = resolveGroupReplyPressure(request)
     if (request.webSearch?.status === 'FAILED') {
       if (request.webSearch.mode === 'NEWS_RECENT') {
         return '当前没有查到足够近期信息，无法可靠确认最新情况。'
@@ -1054,6 +1068,7 @@ export class ChatService {
               result: 'SKIPPED',
               reason: 'REQUEST_DEADLINE_BUDGET',
               remainingBucket: remainingBudgetBucket(remainingMs),
+              groupReplyPressure: groupReplyPressure ?? 'NONE',
               validReferencedSourceCount: initialUsage.validReferencedSourceCount,
               msgIdToken,
             },
@@ -1072,6 +1087,7 @@ export class ChatService {
               question,
               request.webSearch,
               request.runtimeTime,
+              groupReplyPressure,
               rendered,
               internalValues,
             ),
@@ -1103,6 +1119,7 @@ export class ChatService {
           {
             attempt: 1,
             result: repairPassed ? 'PASS' : 'FAIL',
+            groupReplyPressure: groupReplyPressure ?? 'NONE',
             validReferencedSourceCount: repairedUsage.validReferencedSourceCount,
             msgIdToken,
           },

@@ -902,6 +902,7 @@ async function main(): Promise<void> {
     })
     const answer = await agent.complete(request())
     check(fake.calls === 1, `expected one search, got ${fake.calls}`)
+    check(final.calls.length === 1, 'cited Web Search answer unexpectedly entered grounding repair')
     check(final.calls[0]?.user.includes('[Web Search Results]'), 'search results were not injected')
     check(final.calls[0]?.user.includes('上海公共信息'), 'result title was not injected')
     check(answer.includes('https://example.com/s1'), 'source URL was not runtime-grounded')
@@ -926,6 +927,7 @@ async function main(): Promise<void> {
       userContentSpan: { trust: 'VALID', span: { start: 0, length: '@椰椰 OpenAI 今天有什么新闻？'.length } },
     }))
     const system = final.calls[0]?.system ?? ''
+    const initialUser = final.calls[0]?.user ?? ''
     const body = answer.split('\n\n来源：')[0] ?? answer
     check(system.includes('证据池') && system.includes('不是回答提纲'), 'search evidence-pool contract is missing')
     check(system.includes('按用户问题组织') && system.includes('共同支持'), 'multi-source synthesis contract is missing')
@@ -934,6 +936,17 @@ async function main(): Promise<void> {
     check(system.includes('关键限定条件') && system.includes('不完全一致'), 'fact-preservation contract is missing')
     check(system.includes('内部引用协议') && system.includes('发送前移除') && system.includes('不要停止引用'), 'internal citation protocol contract is missing')
     check(system.includes('NEWS_RECENT') && system.includes('不要为了凑满') && system.includes('一是/二是/三是'), 'news natural-chat contract is missing')
+    const groundingContractPosition = initialUser.indexOf('[Web Search Grounding Requirement: RUNTIME_CONTRACT]')
+    const searchResultsPosition = initialUser.indexOf('[Web Search Results]')
+    check(
+      groundingContractPosition >= 0 &&
+        searchResultsPosition > groundingContractPosition &&
+        searchResultsPosition - groundingContractPosition < 500 &&
+        initialUser.includes('GROUNDING_REQUIRED=true') &&
+        initialUser.includes('有效 [Sx]') &&
+        initialUser.includes('不要创造 sourceId'),
+      'initial Web Search prompt is missing the local grounding contract',
+    )
     check(final.calls[0]?.user.includes('[S1]') && final.calls[0]?.user.includes('[S4]'), 'all bounded search evidence was not available to Final Chat')
     check(final.calls[0]?.user.includes('WEB_SEARCH_MODE=NEWS_RECENT') && final.calls[0]?.user.includes('WEB_SEARCH_WINDOW=DAY_1'), 'news mode was not handed to Final Chat')
     check(body.includes('最近主要是模型能力和安全合作两条线在推进。') && !/\[S\d+\]/u.test(body) && !/^\s*(?:\d+[.)]|[-*])\s/mu.test(body), 'ordinary search answer was not natural-paragraph oriented')
@@ -1110,6 +1123,80 @@ async function main(): Promise<void> {
       check(answer.includes('来源：\n1. bounded title https://example.com/bounded') && !/\[S\d+\]/u.test(answer.split('\n\n来源：')[0] ?? answer), 'repair boundary changed final grounding')
     } finally {
       final.restore()
+    }
+  })
+
+  await test('grounding repair inherits pressure and preserves the original answer depth', async () => {
+    const pressureCases = [
+      {
+        expected: 'LOW' as const,
+        request: { groupReplyPressure: 'LOW' as const },
+      },
+      {
+        expected: 'MEDIUM' as const,
+        request: {
+          conversationDynamics: {
+            activeTurnCount: 2,
+            ambientLineCount: 1,
+            lastActiveRequester: 'SAME_REQUESTER' as const,
+            assistantRecent: false,
+            lastAssistantReplyTarget: 'NONE' as const,
+            membersAfterAssistant: 0,
+            participation: 'MULTI_PARTY' as const,
+            pace: 'LOW' as const,
+            continuity: 'CONTINUATION_POSSIBLE' as const,
+          },
+        },
+      },
+      {
+        expected: 'HIGH' as const,
+        request: {
+          conversationDynamics: {
+            activeTurnCount: 3,
+            ambientLineCount: 3,
+            lastActiveRequester: 'OTHER_REQUESTER' as const,
+            assistantRecent: true,
+            lastAssistantReplyTarget: 'CURRENT_REQUESTER' as const,
+            membersAfterAssistant: 2,
+            participation: 'MULTI_PARTY' as const,
+            pace: 'HIGH' as const,
+            continuity: 'FOLLOW_UP_LIKELY' as const,
+          },
+        },
+      },
+    ]
+    for (const pressureCase of pressureCases) {
+      const final = scriptedFinalChat([
+        '第一段保留事实范围，第二段保留原有的限定条件。',
+        '第一段保留事实范围，第二段保留原有的限定条件。[S1]',
+      ])
+      try {
+        const answer = await final.chat.reply(
+          [],
+          { senderId: 'current-sender', senderName: 'CURRENT_REQUESTER', text: '请详细说明这个问题', timestamp: 1 },
+          {
+            botDisplayName: '椰椰',
+            mention: 'MENTIONED',
+            requesterRole: 'MEMBER',
+            ownerConfigured: false,
+            webSearch: {
+              used: true,
+              status: 'PASS',
+              results: [result('S1', 'bounded title')],
+            },
+            ...pressureCase.request,
+          },
+        )
+        const repairUser = final.calls[1]?.user ?? ''
+        const repairSystem = final.calls[1]?.system ?? ''
+        check(final.calls.length === 2, `${pressureCase.expected} pressure did not use exactly one grounding repair`)
+        check(repairUser.includes(`[Group Reply Pressure: TRUSTED_RUNTIME_FACT]\nGROUP_REPLY_PRESSURE=${pressureCase.expected}`), `${pressureCase.expected} pressure was not inherited by grounding repair`)
+        check(repairUser.includes('[Current Final Answer: UNTRUSTED_DRAFT]\n第一段保留事实范围，第二段保留原有的限定条件。'), `${pressureCase.expected} repair lost the original answer depth`)
+        check(repairSystem.includes('保持原回答的信息范围、回答深度和大致长度') && repairSystem.includes('只修复 grounding，不新增主题、背景或解释'), `${pressureCase.expected} repair depth contract is missing`)
+        check(answer.includes('第一段保留事实范围') && answer.includes('第二段保留原有的限定条件。'), `${pressureCase.expected} repair expanded or dropped the original answer`)
+      } finally {
+        final.restore()
+      }
     }
   })
 
