@@ -46,6 +46,14 @@ import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from
 import { observeGroupStyle } from './group-style.js'
 import { type OwnerDispatchPlannerLike, OwnerDispatchPlanner } from './owner-dispatch-planner.js'
 import {
+  OwnerPrivateDispatchPlanner,
+  formatOwnerPrivateDispatchProtocol,
+  parseOwnerPrivateDispatchProtocol,
+  type OwnerPrivateDispatchPlannerLike,
+} from './owner-private-dispatch-planner.js'
+import { OwnerPrivateDispatchTarget } from './owner-private-dispatch-target.js'
+import { isVerifiedOwnerDirect } from './message-contract.js'
+import {
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
   ProactiveGroupQueue,
@@ -115,6 +123,8 @@ export interface ProductionChatAgentOptions {
   pendingOutboundMaxEntries?: number
   pendingOutboundTtlMs?: number
   ownerDispatchPlanner?: OwnerDispatchPlannerLike | null
+  ownerPrivateDispatchPlanner?: OwnerPrivateDispatchPlannerLike | null
+  ownerPrivateDispatchTarget?: OwnerPrivateDispatchTarget
   proactiveQueue?: ProactiveGroupQueue
   proactiveQueueMaxEntries?: number
   proactiveQueueTtlMs?: number
@@ -135,6 +145,8 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly runtimeTimeZone: string | undefined
   private readonly pendingOutbound: PendingOutboundReplyStore
   private readonly ownerDispatchPlanner: OwnerDispatchPlannerLike | null
+  private readonly ownerPrivateDispatchPlanner: OwnerPrivateDispatchPlannerLike | null
+  private readonly ownerPrivateDispatchTarget: OwnerPrivateDispatchTarget
   private readonly proactiveQueue: ProactiveGroupQueue
 
   public constructor(
@@ -159,6 +171,11 @@ export class ProductionChatAgent implements AgentExecutor {
       now: () => Date.now(),
     })
     this.ownerDispatchPlanner = options.ownerDispatchPlanner ?? null
+    this.ownerPrivateDispatchPlanner = options.ownerPrivateDispatchPlanner ?? null
+    this.ownerPrivateDispatchTarget = options.ownerPrivateDispatchTarget ?? new OwnerPrivateDispatchTarget(
+      (operation, result, targetToken) => this.logOwnerPrivateTarget(operation, result, targetToken),
+    )
+    this.ownerPrivateDispatchTarget.clearForRestart()
     this.proactiveQueue = options.proactiveQueue ?? new ProactiveGroupQueue({
       maxEntries: options.proactiveQueueMaxEntries ?? DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
       ttlMs: options.proactiveQueueTtlMs ?? DEFAULT_PROACTIVE_QUEUE_TTL_MS,
@@ -278,6 +295,10 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   public async complete(request: AgentRequest): Promise<string> {
+    if (isVerifiedOwnerDirect(request)) {
+      return this.tryOwnerPrivateDispatch(request)
+    }
+
     // One immutable snapshot is shared by the Planner and final-answer prompt.
     const runtimeTime = createRuntimeTimeFacts(this.runtimeClock, this.runtimeTimeZone)
     const label = this.speakerLabels.labelFor({
@@ -514,7 +535,89 @@ export class ProductionChatAgent implements AgentExecutor {
     }
     this.logOwnerDispatch('DISPATCH_NOW', 'PASS', 'ENQUEUED')
     this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
+    const targetOperation = this.ownerPrivateDispatchTarget.bind(request.conversationId)
+    if (targetOperation === null) {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'TARGET_BIND_INVALID')
+      return true
+    }
     return true
+  }
+
+  private async tryOwnerPrivateDispatch(request: AgentRequest): Promise<string> {
+    const target = this.ownerPrivateDispatchTarget.conversationId
+    if (target === null) {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'TARGET_UNBOUND')
+      return ''
+    }
+    if (this.ownerPrivateDispatchPlanner === null) {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'PLANNER_UNAVAILABLE')
+      return ''
+    }
+
+    let plan
+    try {
+      plan = await this.ownerPrivateDispatchPlanner.plan(request.text, guardValues(request))
+    } catch {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'PLANNER_EXCEPTION')
+      return ''
+    }
+
+    if (plan.result !== 'PASS') {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', plan.failureReason ?? 'PLANNER_FAILED')
+      return ''
+    }
+    const parsed = parseOwnerPrivateDispatchProtocol(
+      formatOwnerPrivateDispatchProtocol(plan.decision),
+      guardValues(request),
+    )
+    if (!parsed.valid) {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', parsed.failureReason)
+      return ''
+    }
+    if (parsed.decision.action === 'NOOP') {
+      this.logOwnerPrivateDispatch('NOOP', 'PASS', 'NOOP')
+      return ''
+    }
+
+    const queued = this.proactiveQueue.enqueue({
+      conversationType: 'GROUP',
+      conversationId: target,
+      text: parsed.decision.message ?? '',
+    })
+    if (!queued.accepted) {
+      this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', queued.reason)
+      this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size)
+      return ''
+    }
+    this.logOwnerPrivateDispatch('DISPATCH', 'PASS', 'ENQUEUED')
+    this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
+    return ''
+  }
+
+  private logOwnerPrivateDispatch(
+    action: 'NOOP' | 'DISPATCH',
+    result: 'PASS' | 'FAIL',
+    reason: string,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      'OWNER_PRIVATE_DISPATCH',
+      { action, result, reason },
+    )
+  }
+
+  private logOwnerPrivateTarget(
+    operation: 'BIND' | 'REBIND' | 'RESTART',
+    result: 'PASS' | 'UNBOUND',
+    targetToken: string,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      'OWNER_PRIVATE_TARGET',
+      { operation, result, targetToken },
+    )
   }
 
   private logOwnerDispatch(action: 'CHAT' | 'DISPATCH_NOW', result: 'PASS' | 'FAIL', reason: string): void {
@@ -703,6 +806,9 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     webSearchMaxContextChars: config.webSearchMaxContextChars,
     runtimeTimeZone: config.agentTimeZone,
     ownerDispatchPlanner: new OwnerDispatchPlanner((system, user) => chatService.completeStructured(system, user)),
+    ownerPrivateDispatchPlanner: new OwnerPrivateDispatchPlanner(
+      (system, user) => chatService.completeStructured(system, user),
+    ),
   })
 }
 

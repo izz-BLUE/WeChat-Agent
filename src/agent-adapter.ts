@@ -4,6 +4,7 @@ import type { BotMentionSpanFacts, UserContentSpanFacts } from './canonical-user
 import {
   normalizePassiveContextMessage,
   normalizeRawHookMessage,
+  isVerifiedOwnerDirect,
   type ConversationType,
   type InboundMessage,
   type NormalizationResult,
@@ -63,6 +64,7 @@ export interface OutboundCommand {
 
 export type MentionPolicyResult =
   | { status: 'PROCESS' }
+  | { status: 'PROCESS_PRIVATE_OWNER' }
   | { status: 'IGNORED'; reason: 'GROUP_MENTION_REQUIRED' | 'DIRECT_IDENTITY_UNVERIFIED' }
 
 export type AgentResult =
@@ -126,7 +128,7 @@ export type AgentPipelineResult =
   | {
       status: 'AGENT_RESULT'
       normalization: Extract<NormalizationResult, { status: 'VALID' }>
-      policy: Extract<MentionPolicyResult, { status: 'PROCESS' }>
+      policy: Extract<MentionPolicyResult, { status: 'PROCESS' | 'PROCESS_PRIVATE_OWNER' }>
       request: AgentRequest
       agentResult: AgentResult
       outboundCommand: OutboundCommand | null
@@ -150,18 +152,18 @@ export function toPassiveContext(message: PassiveContextMessage): AgentPassiveCo
 }
 
 /**
- * The single admission decision. GROUP + a runtime-confirmed mention is the only
- * form the product has verified: everything else fails closed.
+ * The single admission decision. GROUP + a runtime-confirmed mention and the
+ * additive verified owner DIRECT contract are the only admitted forms.
  *
- * DIRECT is refused outright. Its conversation, requester and self contracts are
- * unverified — a DIRECT envelope cannot be told apart from a publish-account
- * push, a system notification or an echo of our own message, and its conversation
- * identity may not resolve back to the originating conversation. Until that
- * contract passes a real field acceptance, a DIRECT inbound must not invoke the
- * Agent or produce a reply, so no service message can reach the provider.
+ * Ordinary DIRECT remains refused. Its conversation, requester and self contracts
+ * are unverified; only the explicit DIRECT_OWNER_FIELD_VERIFIED wire source can
+ * enter the private-owner command channel.
  */
 export function applyMentionPolicy(message: InboundMessage): MentionPolicyResult {
   if (message.conversationType === 'DIRECT') {
+    if (isVerifiedOwnerDirect(message)) {
+      return { status: 'PROCESS_PRIVATE_OWNER' }
+    }
     return { status: 'IGNORED', reason: 'DIRECT_IDENTITY_UNVERIFIED' }
   }
 

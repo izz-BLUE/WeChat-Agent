@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto'
+import { DIRECT_OWNER_FIELD_VERIFIED } from './message-contract.js'
 
 /**
  * Observation-only identity probe.
@@ -219,7 +220,8 @@ export interface RequesterIdentityObservation {
 /**
  * Formal requester identity diagnostic. It reports whether the wire identity is
  * internally consistent; it never decides identity and never logs a raw value.
- * DIRECT stays explicitly UNVERIFIED because its semantics are still unproven.
+ * Ordinary DIRECT stays explicitly UNVERIFIED; the additive verified owner source
+ * is the only DIRECT shape that can report PASS.
  */
 export function observeRequesterIdentity(fields: RequesterIdentityFields): RequesterIdentityObservation {
   const source = rawValue(fields.source) || 'UNKNOWN'
@@ -234,6 +236,10 @@ export function observeRequesterIdentity(fields: RequesterIdentityFields): Reque
   let result: RequesterIdentityObservation['result']
   if (conversationType === 'GROUP') {
     result = senderRequesterMatch && conversationRequesterSeparated ? 'PASS' : 'FAIL'
+  } else if (conversationType === 'DIRECT' &&
+             source === DIRECT_OWNER_FIELD_VERIFIED &&
+             senderRequesterMatch && conversationRequesterSeparated) {
+    result = 'PASS'
   } else {
     result = 'UNVERIFIED'
   }

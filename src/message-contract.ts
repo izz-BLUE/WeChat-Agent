@@ -18,6 +18,7 @@ import {
  * as a request. The active kind stays exactly what it was.
  */
 export const PASSIVE_CONTEXT_KIND = 'PASSIVE_CONTEXT_ONLY'
+export const DIRECT_OWNER_FIELD_VERIFIED = 'DIRECT_OWNER_FIELD_VERIFIED'
 
 export type ConversationType = 'DIRECT' | 'GROUP'
 
@@ -220,6 +221,29 @@ function resolveIdentity(
     }
   }
 
+  // DIRECT owner admission is an additive trusted wire contract. The Agent may
+  // consume this fact, but it may not recreate it from the legacy fields, text or
+  // display metadata. Any incomplete claim falls through to ordinary unverified
+  // DIRECT semantics.
+  const directRole = wireRequesterRole(raw.requesterRole)
+  if (wireSource === DIRECT_OWNER_FIELD_VERIFIED &&
+      wireSenderId.length > 0 &&
+      wireRequesterId.length > 0 &&
+      wireSenderId === wireRequesterId &&
+      directRole === 'OWNER' &&
+      raw.ownerConfigured === true &&
+      conversationId !== wireRequesterId) {
+    return {
+      status: 'VALID',
+      senderId: wireSenderId,
+      requesterId: wireRequesterId,
+      requesterSource: DIRECT_OWNER_FIELD_VERIFIED,
+      requesterRole: 'OWNER',
+      ownerConfigured: true,
+      ownerDisplayName,
+    }
+  }
+
   // DIRECT identity semantics are still unverified. The legacy derivation stays
   // here, isolated from the GROUP contract and explicitly labelled as legacy.
   // An unverified identity can never claim the owner role, whatever the wire says.
@@ -298,6 +322,20 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       userContentSpan,
     },
   }
+}
+
+export function isVerifiedOwnerDirect(message: Pick<InboundMessage,
+  'conversationType' | 'senderId' | 'requesterId' | 'requesterSource' | 'requesterRole' |
+  'ownerConfigured' | 'conversationId'>): boolean {
+  return message.conversationType === 'DIRECT' &&
+    message.requesterSource === DIRECT_OWNER_FIELD_VERIFIED &&
+    message.requesterRole === 'OWNER' &&
+    message.ownerConfigured === true &&
+    message.senderId.length > 0 &&
+    message.requesterId.length > 0 &&
+    message.senderId === message.requesterId &&
+    message.conversationId.length > 0 &&
+    message.conversationId !== message.requesterId
 }
 
 /**
