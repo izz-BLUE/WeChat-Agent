@@ -77,7 +77,7 @@ await runCase('source-grounding-happens-after-renderer', () => {
   const rendered = renderHumanChat('刚查了下 **这个比较重要** [S1]')
   const grounded = appendGroundedSources(rendered, results)
   assert(!grounded.includes('**'), 'renderer left decorative bold markup')
-  check(grounded.includes('这个比较重要 [S1]'), 'source id was not preserved')
+  check(grounded.includes('这个比较重要') && !grounded.includes('[S1]'), 'internal source id remained visible')
   check(grounded.includes('https://real.example/source'), 'runtime source URL was not appended')
 })
 
@@ -128,7 +128,7 @@ await runCase('chat-service-renders-before-grounded-source-append', async () => 
         },
       },
     )
-    check(answer.startsWith('刚查了下 这个比较重要 [S1]'), 'renderer did not run before source append')
+    check(answer.startsWith('刚查了下 这个比较重要') && !answer.includes('[S1]'), 'renderer did not run before internal source cleanup')
     check(answer.includes('https://real.example/source'), 'grounded source was lost')
   } finally {
     provider.restore()

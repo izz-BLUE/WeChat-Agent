@@ -195,13 +195,15 @@ async function main(): Promise<void> {
       ...results,
       result('S4', '来源四', 'https://example.com/four'),
     ], [], (diagnostic) => usage.push(diagnostic))
-    check(four.includes('A[S2] B[S1] C[S3] D'), 'the first three source markers were not preserved')
+    check(four.startsWith('A B C D'), 'internal source markers were not removed from the body')
+    check(!/\[S\d+\]/u.test(four), 'a visible source marker survived the source cap')
     check(!four.includes('[S4]'), 'a dangling source marker survived the source cap')
     check(four.includes('来源：\n1. 来源二 https://example.com/two\n2. 来源一 https://example.com/one\n3. 来源三 https://example.com/three'), 'selected sources were not appended in marker order')
     check(usage[1]?.validReferencedSourceCount === 4 && usage[1]?.selectedSourceCount === 3, 'source selection diagnostic counts are incorrect')
-    check(usage[1]?.removedDanglingMarkerCount === 1 && usage[1]?.appendedSourceCount === 3, 'dangling marker diagnostic count is incorrect')
+    check(usage[1]?.removedDanglingMarkerCount === 1 && usage[1]?.visibleMarkerCount === 0 && usage[1]?.appendedSourceCount === 3, 'dangling marker diagnostic count is incorrect')
 
     const first = appendGroundedSources('结论[S1]', results)
+    check(first.startsWith('结论') && !/\[S\d+\]/u.test(first), 'selected source marker remained visible')
     check(first.includes('来源一 https://example.com/one'), 'referenced S1 was not appended')
     check(!first.includes('来源二') && !first.includes('来源三'), 'unreferenced sources were appended with S1')
 
@@ -210,21 +212,26 @@ async function main(): Promise<void> {
     check(!second.includes('来源一') && !second.includes('来源三'), 'unreferenced sources were appended with S2')
 
     const ordered = appendGroundedSources('结论[S2][S1]', results)
+    check(!/\[S\d+\]/u.test(ordered), 'source markers remained visible in ordered answer')
     check(ordered.indexOf('来源二') < ordered.indexOf('来源一'), 'source order did not follow answer references')
 
     const duplicate = appendGroundedSources('结论[S1][S1]', results)
+    check(!/\[S\d+\]/u.test(duplicate), 'duplicate source markers remained visible')
     check(duplicate.split('来源一').length === 2, 'duplicate source was appended more than once')
 
     const invalid = appendGroundedSources('结论[S99]', results)
     check(invalid === '结论', 'unknown source marker survived cleanup')
 
     const mixed = appendGroundedSources('结论[S1][S99]', results)
-    check(mixed.includes('结论[S1]') && !mixed.includes('[S99]'), 'valid and unknown source markers were not separated')
+    check(mixed === '结论\n\n来源：\n1. 来源一 https://example.com/one', 'valid and unknown source markers were not grounded exactly once')
     check(mixed.includes('来源一 https://example.com/one') && !mixed.includes('来源二'), 'mixed marker sources were not grounded exactly once')
 
     const rawUrl = appendGroundedSources('结论[S1] https://evil.example/fabricated', results)
     check(!rawUrl.includes('https://evil.example/fabricated'), 'model-created URL survived grounding')
-    check(rawUrl.includes('[S1]'), 'valid source marker was removed from answer body')
+    check(!/\[S\d+\]/u.test(rawUrl), 'valid source marker remained in answer body')
+
+    const spacing = appendGroundedSources('结论 。  [S1]  另外还有一个变化。[]', results)
+    check(spacing.startsWith('结论。另外还有一个变化。'), 'citation cleanup left unnatural spacing or brackets')
 
     const forbidden = appendGroundedSources('结论[S1]', [result('S1', REQUESTER_ID, 'https://example.com/private')], [REQUESTER_ID])
     check(forbidden === '结论', 'forbidden identity-bearing source marker survived cleanup')
@@ -726,8 +733,9 @@ async function main(): Promise<void> {
     check(system.includes('不要逐条复述') && system.includes('不要为了显得完整'), 'source-by-source report prohibition is missing')
     check(system.includes('用户明确要求') && system.includes('列出条目') && system.includes('才允许结构化表达'), 'explicit structured-answer exception is missing')
     check(system.includes('关键限定条件') && system.includes('不完全一致'), 'fact-preservation contract is missing')
+    check(system.includes('内部引用协议') && system.includes('发送前移除') && system.includes('不要停止引用'), 'internal citation protocol contract is missing')
     check(final.calls[0]?.user.includes('[S1]') && final.calls[0]?.user.includes('[S4]'), 'all bounded search evidence was not available to Final Chat')
-    check(body.includes('[S1][S3]') && !/^\s*(?:\d+[.)]|[-*])\s/mu.test(body), 'ordinary search answer was not natural-paragraph oriented')
+    check(body.includes('最近主要是模型能力和安全合作两条线在推进。') && !/\[S\d+\]/u.test(body) && !/^\s*(?:\d+[.)]|[-*])\s/mu.test(body), 'ordinary search answer was not natural-paragraph oriented')
     check(answer.includes('来源：') && answer.includes('模型能力'), 'runtime source grounding regressed')
     final.restore()
   })
@@ -756,16 +764,19 @@ async function main(): Promise<void> {
       const ordinary = await agent.complete(ask('@椰椰 最近有什么重要变化？'))
       const ordinaryBody = ordinary.split('\n\n来源：')[0] ?? ordinary
       check(ordinaryBody.includes('核心变化是模型能力继续增强。'), 'one important result was not answered naturally')
+      check(!/\[S\d+\]/u.test(ordinaryBody), 'ordinary answer exposed internal source marker')
       check(!/^\s*(?:\d+[.)]|[-*])\s/mu.test(ordinaryBody), 'one important result was forced into a list')
 
       const listed = await agent.complete(ask('@椰椰 列出5条最近的重要消息'))
       const listedBody = listed.split('\n\n来源：')[0] ?? listed
       check(listedBody.includes('1. 第一条') && listedBody.includes('5. 第五条'), 'explicit list request was not preserved')
+      check(!/\[S\d+\]/u.test(listedBody), 'explicit list exposed internal source marker')
       check(listed.includes('来源：'), 'explicit list lost grounded sources')
 
       const detailed = await agent.complete(ask('@椰椰 详细整理一下最近的情况'))
       const detailedBody = detailed.split('\n\n来源：')[0] ?? detailed
       check(detailedBody.includes('- 模型能力：') && detailedBody.includes('- 监管环境：'), 'explicit deep-dive structure was not preserved')
+      check(!/\[S\d+\]/u.test(detailedBody), 'explicit deep-dive exposed internal source marker')
       check(detailed.includes('来源：'), 'explicit deep-dive lost grounded sources')
     } finally {
       final.restore()

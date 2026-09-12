@@ -23,6 +23,7 @@ export interface GroundedSourceUsage {
   validReferencedSourceCount: number
   selectedSourceCount: number
   removedDanglingMarkerCount: number
+  visibleMarkerCount: number
   appendedSourceCount: number
   result: 'PASS' | 'NO_REFERENCED_SOURCE'
 }
@@ -140,7 +141,18 @@ function containsForbiddenValue(value: string, forbiddenValues: readonly string[
   return forbiddenValues.some((forbidden) => forbidden.length > 0 && value.includes(forbidden))
 }
 
-/** Keep source references grounded in the provider response and remove model-created URLs. */
+function cleanupCitationPresentation(answer: string): string {
+  return answer
+    .replace(/\[\]/gu, '')
+    .replace(/[ \t]+([,，。！？；：.!?;:])/gu, '$1')
+    .replace(/([。！？；])[ \t]+(?=[\p{Script=Han}])/gu, '$1')
+    .replace(/[ \t]{2,}/gu, ' ')
+    .replace(/[ \t]+\n/gu, '\n')
+    .replace(/\n[ \t]+/gu, '\n')
+    .trim()
+}
+
+/** Ground source selection before hiding internal markers and remove model-created URLs. */
 export function appendGroundedSources(
   answer: string,
   results: readonly WebSearchResult[],
@@ -157,17 +169,16 @@ export function appendGroundedSources(
   const selectedIds = new Set(selected.map((item) => item.sourceId))
   let removedDanglingMarkerCount = 0
 
-  const groundedAnswer = answer
+  const groundedAnswer = cleanupCitationPresentation(answer
     .replace(/https?:\/\/[^\s)\]}>]+/gu, (url) => {
       return safeResults.some((item) => item.url === url) ? url : ''
     })
     .replace(/\[(S\d+)\]/gu, (marker, sourceId: string) => {
-      if (selectedIds.has(sourceId)) {
-        return marker
+      if (!selectedIds.has(sourceId)) {
+        removedDanglingMarkerCount += 1
       }
-      removedDanglingMarkerCount += 1
       return ''
-    })
+    }))
 
   if (reportUsage !== undefined) {
     reportUsage({
@@ -177,6 +188,7 @@ export function appendGroundedSources(
       validReferencedSourceCount: groundedIds.length,
       selectedSourceCount: selected.length,
       removedDanglingMarkerCount,
+      visibleMarkerCount: 0,
       appendedSourceCount: selected.length,
       result: selected.length > 0 ? 'PASS' : 'NO_REFERENCED_SOURCE',
     })
