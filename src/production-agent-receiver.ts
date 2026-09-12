@@ -610,6 +610,10 @@ export class ProductionChatAgent implements AgentExecutor {
         // A disabled or absent store is a runtime fact: the model may not claim a
         // long-term memory that this process does not have.
         persistentMemoryAvailable: this.memory !== null && this.memory.isEnabled,
+        // An explicit mutation that succeeds returns above with its deterministic
+        // Store-backed reply, so every ordinary Chat turn reaches this boundary
+        // with no successful mutation evidence.
+        memoryMutationThisTurn: 'NONE',
         runtimeTime,
         groupStyle,
         conversationDynamics,

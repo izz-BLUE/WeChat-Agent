@@ -43,12 +43,16 @@ export type InternalLeakKind =
   | 'UNSUPPORTED_ASSISTANT_RELATIONSHIP_CLAIM'
   | 'UNSUPPORTED_RELATIONSHIP_RECIPROCITY'
   | 'UNSUPPORTED_IDENTITY_PROVENANCE'
+  | 'UNSUPPORTED_MEMORY_MUTATION_CLAIM'
   | 'INTERNAL_VALUE'
 
 export interface InternalLeakCount {
   kind: InternalLeakKind
   count: number
 }
+
+/** Trusted result of this turn's persistent-memory mutation path. */
+export type MemoryMutationThisTurn = 'NONE' | 'ADD' | 'UPDATE' | 'DELETE'
 
 export type AnswerGuardOutcome = 'CLEAN' | 'REWRITTEN' | 'BLOCKED'
 
@@ -70,6 +74,8 @@ export interface AnswerGuardFacts {
   requesterAddressPreference?: string | null
   /** Exact provider-only duplicate-name labels generated for this prompt. */
   publicDisplayAliases?: readonly PublicDisplayAlias[]
+  /** Runtime-only memory side-effect fact; absent for legacy direct callers. */
+  memoryMutationThisTurn?: MemoryMutationThisTurn
 }
 
 /** A generated duplicate-name label and the safe public name it may collapse to. */
@@ -146,6 +152,49 @@ const FIELD_ANY_PATTERN = new RegExp(`(?:${FIELD_ALTERNATION})`, 'i')
 /** These terms are unsafe only for an ungrounded self-identity answer. */
 const UNGROUNDED_IDENTITY_CLAIM_PATTERN = /主人|群主|管理员|老板/gu
 
+/**
+ * High-confidence memory mutation claims only. These patterns intentionally
+ * require a completed/promise-like form and a memory-specific target where the
+ * wording is otherwise ambiguous. Quoted examples, conditionals, explanations,
+ * and code discussions are removed/skipped before these patterns run.
+ */
+const MEMORY_MUTATION_CLAIM_PATTERNS: readonly RegExp[] = [
+  /(?<!不)(?<!没)(?<!未)记(?:住|下|好)了(?:吧|呢|哦|啦)?/u,
+  /(?:已经|已)帮你保存(?:好|下来)?了/u,
+  /(?:已经|已)(?:帮你)?(?:存进|存到)(?:长期)?记忆了/u,
+  /(?:以后|下次).{0,8}(?:我)?(?:都会|还会|会).{0,8}记得/u,
+  /(?:已经|已).{0,12}(?:从(?:长期)?记忆|词库|记忆|记录|偏好).{0,8}(?:删|删掉|删除|移除)了?/u,
+  /(?:记忆|记录|偏好).{0,12}(?:已经|已).{0,12}(?:删|删掉|删除|移除)(?:了|的)?/u,
+  /(?:已经|已)忘掉了.{0,12}(?:记录|记忆|这条)/u,
+  /(?:已经|已)(?:把|将).{0,20}(?:称呼|偏好|记忆|长期记忆).{0,12}(?:更新|修改|改成|改好)(?:了|的)?/u,
+  /(?:称呼|偏好|记忆|长期记忆).{0,12}(?:已经|已).{0,12}(?:更新|修改|改成|改好)(?:了|的)?/u,
+  /(?:已经|已).{0,20}(?:更新|修改).{0,20}(?:称呼|偏好|记忆|长期记忆)/u,
+]
+
+const MEMORY_MUTATION_NON_CLAIM_CONTEXT = /(?:如果|假如|若是|除非|应该|可以|能够|请|不要|不能|不得|容易|误以为|这句话|这个词|问的是|怎么|如何|是否|有没有|代码|函数|方法|返回|文案|文本|文字|改写|编辑|示例|例如|说明|解释)/u
+
+function withoutQuotedOrCodeText(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/gu, ' ')
+    .replace(/`[^`\n]*`/gu, ' ')
+    .replace(/“[^”]*”|「[^」]*」|『[^』]*』|"[^"]*"|'[^']*'/gu, ' ')
+}
+
+function countUnsupportedMemoryMutationClaims(text: string): number {
+  const candidate = withoutQuotedOrCodeText(text)
+  const clauses = candidate.split(/[。！？!?；;\n]+/u).map((clause) => clause.trim()).filter(Boolean)
+  let count = 0
+  for (const clause of clauses) {
+    if (MEMORY_MUTATION_NON_CLAIM_CONTEXT.test(clause)) {
+      continue
+    }
+    if (MEMORY_MUTATION_CLAIM_PATTERNS.some((pattern) => pattern.test(clause))) {
+      count += 1
+    }
+  }
+  return count
+}
+
 const DETECTION_ORDER: readonly InternalLeakKind[] = [
   'SPEAKER_LABEL_CURRENT',
   'SPEAKER_LABEL_OTHER',
@@ -157,6 +206,7 @@ const DETECTION_ORDER: readonly InternalLeakKind[] = [
   'UNSUPPORTED_ASSISTANT_RELATIONSHIP_CLAIM',
   'UNSUPPORTED_RELATIONSHIP_RECIPROCITY',
   'UNSUPPORTED_IDENTITY_PROVENANCE',
+  'UNSUPPORTED_MEMORY_MUTATION_CLAIM',
   'INTERNAL_VALUE',
 ]
 
@@ -395,6 +445,14 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
     const claims = [...text.matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
     if (claims > 0) {
       bump('UNGROUNDED_IDENTITY_CLAIM', claims)
+      blocked = true
+    }
+  }
+
+  if (facts.memoryMutationThisTurn === 'NONE') {
+    const claims = countUnsupportedMemoryMutationClaims(text)
+    if (claims > 0) {
+      bump('UNSUPPORTED_MEMORY_MUTATION_CLAIM', claims)
       blocked = true
     }
   }

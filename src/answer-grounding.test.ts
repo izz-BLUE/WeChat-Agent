@@ -274,7 +274,7 @@ async function expectRefusal(run: () => Promise<unknown>, message: string): Prom
  */
 async function testCurrentSpeakerIsDescribedNotLabelled(): Promise<void> {
   const fixture = createFixture({
-    answers: [{ content: '好，我记住了。' }, { content: '你是 MEMBER_1。' }],
+    answers: [{ content: '好，笨笨这个名字听起来挺可爱的。' }, { content: '你是 MEMBER_1。' }],
   })
   try {
     await fixture.ask({ msgId: 'label-1', text: '@椰椰 我给你取名叫笨笨' })
@@ -617,7 +617,7 @@ async function testRawIdentityEchoIsNeverSent(): Promise<void> {
 async function testNoInternalLabelReachesTheOutboundReply(): Promise<void> {
   const fixture = createFixture({
     answers: [
-      { content: '好，我记住了。' },
+      { content: '好，AlphaTest 这个代号我听到了。' },
       { content: '你好 MEMBER_1，刚才 MEMBER_2 问我叫什么。' },
     ],
   })

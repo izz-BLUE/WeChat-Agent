@@ -1,4 +1,9 @@
-import { formatGuardDetections, guardFinalAnswer, type PublicDisplayAlias } from './answer-guard.js'
+import {
+  formatGuardDetections,
+  guardFinalAnswer,
+  type MemoryMutationThisTurn,
+  type PublicDisplayAlias,
+} from './answer-guard.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
 import type { GroupMessage } from './context.js'
 import {
@@ -75,6 +80,8 @@ export interface ChatRequestContext {
    * `unknown` instead of inventing an answer.
    */
   persistentMemoryAvailable?: boolean
+  /** Trusted runtime fact for the final-answer Memory truthfulness boundary. */
+  memoryMutationThisTurn?: MemoryMutationThisTurn
   /** One trusted runtime-time snapshot shared by Planner and final answer. */
   runtimeTime?: RuntimeTimeFacts
   /** Deterministic, presentation-only profile observed from historical group chatter. */
@@ -338,6 +345,7 @@ const REWRITE_SYSTEM_PROMPT = `你是回复安全改写器。把给你的草稿�
 - 身份问题没有可信个人记忆时，不得输出主人、群主、管理员或老板等授权/社会关系称呼。
 - 不得补充草稿之外的能力、时长、条数或记忆内容。
 ${ASSISTANT_IDENTITY_BOUNDARY_RULES}
+${MEMORY_SIDE_EFFECT_GROUNDING_RULES}
 ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
@@ -598,6 +606,9 @@ export function buildUserPrompt(
   const currentRequesterActiveContext = request.currentRequesterActiveContext ?? []
   const otherMemberActiveContext = request.otherMemberActiveContext ?? []
   const assistantRuntime = request.assistantRuntime ?? createTrustedAssistantRuntimeFacts(request.botDisplayName)
+  const memoryTruthfulnessSection = request.memoryMutationThisTurn === undefined
+    ? ''
+    : `\n\n[Memory Truthfulness Runtime Fact]\nMEMORY_MUTATION_THIS_TURN=${request.memoryMutationThisTurn}`
   const activeContextSection = splitActiveContext && (
     currentRequesterActiveContext.length > 0 || otherMemberActiveContext.length > 0
   )
@@ -618,7 +629,8 @@ export function buildUserPrompt(
     conversationDynamicsSection(request.conversationDynamics) +
     '\n\n' +
     `[Trusted Assistant Runtime Facts]\n${formatAssistantRuntimeFacts(assistantRuntime)}\n\n` +
-    `[Runtime Facts]\n${runtimeFacts(context, request, selfIdentityQuery)}\n\n` +
+    `[Runtime Facts]\n${runtimeFacts(context, request, selfIdentityQuery)}` +
+    `${memoryTruthfulnessSection}\n\n` +
     `${mentionFact(request.mention)}\n` +
     (request.currentSpeakerLabel
       ? `CurrentSpeakerLabel=${request.currentSpeakerLabel}（运行时内部假名，只用于区分说话人，禁止出现在回复中）\n`
@@ -813,9 +825,14 @@ export class ChatService {
         (item) => item.scope === 'PERSONAL' && item.kind === 'ADDRESS_PREFERENCE',
       )?.content,
       publicDisplayAliases: presentation.aliases,
+      memoryMutationThisTurn: request.memoryMutationThisTurn,
     }
 
     let guard = guardFinalAnswer(draft, guardFacts)
+    const memoryTruthfulnessKind = 'UNSUPPORTED_MEMORY_MUTATION_CLAIM'
+    const hasMemoryTruthfulnessDetection = (result: typeof guard): boolean =>
+      result.detections.some((entry) => entry.kind === memoryTruthfulnessKind)
+    const initialMemoryTruthfulnessDetection = hasMemoryTruthfulnessDetection(guard)
     const assistantIdentityKinds = new Set([
       'UNSUPPORTED_ASSISTANT_IDENTITY_MUTATION',
       'UNSUPPORTED_ASSISTANT_RELATIONSHIP_CLAIM',
@@ -860,6 +877,26 @@ export class ChatService {
     }
 
     const finalAssistantIdentityBoundaryDetection = hasAssistantIdentityBoundaryDetection(guard)
+    const finalMemoryTruthfulnessDetection = hasMemoryTruthfulnessDetection(guard)
+    const memoryTruthfulnessResult = finalMemoryTruthfulnessDetection
+      ? 'FAIL_CLOSED'
+      : initialMemoryTruthfulnessDetection
+        ? 'REGENERATED'
+        : 'CLEAN'
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      persistentSink,
+      'MEMORY_TRUTHFULNESS_BOUNDARY',
+      {
+        mutationThisTurn: guardFacts.memoryMutationThisTurn ?? 'UNKNOWN',
+        claimDetected: initialMemoryTruthfulnessDetection || finalMemoryTruthfulnessDetection,
+        result: memoryTruthfulnessResult,
+        reason: (initialMemoryTruthfulnessDetection || finalMemoryTruthfulnessDetection)
+          ? 'UNSUPPORTED_MEMORY_MUTATION_CLAIM'
+          : 'NONE',
+        msgIdToken,
+      },
+    )
     const assistantIdentityBoundaryResult = !initialAssistantIdentityBoundaryDetection
       ? 'CLEAN'
       : finalAssistantIdentityBoundaryDetection
