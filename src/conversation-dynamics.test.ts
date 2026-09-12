@@ -38,6 +38,7 @@ function ambient(label: string, messageId?: string, text = 'ambient history'): A
   return {
     label,
     text,
+    ...(label === 'ASSISTANT' ? { replyTarget: 'CURRENT_REQUESTER' as const } : {}),
     ...(messageId === undefined ? {} : { messageId }),
   }
 }

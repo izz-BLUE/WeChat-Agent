@@ -56,6 +56,9 @@ export const ASSISTANT_LABEL = 'ASSISTANT'
 
 export type AmbientSpeakerType = 'MEMBER' | 'ASSISTANT'
 
+/** Provider-safe relation between an assistant line and the current turn. */
+export type AmbientReplyTarget = 'CURRENT_REQUESTER' | 'OTHER_MEMBER' | 'UNKNOWN' | 'NONE'
+
 /** One ambient entry as captured. `speakerId` is trusted and in-memory only. */
 export interface AmbientEntryInput {
   messageId: string
@@ -63,6 +66,11 @@ export interface AmbientEntryInput {
   speakerType: AmbientSpeakerType
   /** Local public display metadata; never used as a correlation key. */
   publicDisplayName?: string | null
+  /**
+   * Trusted requester identity for an assistant reply. This is process-local
+   * correlation state only: it is never rendered, logged or persisted.
+   */
+  replyToSpeakerId?: string
   text: string
   timestamp: number
 }
@@ -75,6 +83,8 @@ export interface AmbientLine {
   text: string
   /** Short-term event identity, never rendered into a provider prompt. */
   messageId?: string
+  /** Provider-safe assistant ownership relation; never a raw identity. */
+  replyTarget?: AmbientReplyTarget
 }
 
 export interface AmbientRenderRequest {
@@ -261,7 +271,15 @@ export class GroupAmbientContext {
         break
       }
 
-      lines.unshift({ label, publicDisplayName: entry.publicDisplayName, text: entry.text, messageId: entry.messageId })
+      lines.unshift({
+        label,
+        publicDisplayName: entry.publicDisplayName,
+        text: entry.text,
+        messageId: entry.messageId,
+        ...(entry.speakerType === 'ASSISTANT'
+          ? { replyTarget: resolveReplyTarget(entry.replyToSpeakerId, request.currentRequesterId) }
+          : {}),
+      })
       chars += lineChars
     }
 
@@ -382,8 +400,24 @@ function isUsableEntry(entry: AmbientEntryInput): boolean {
     typeof entry.text === 'string' &&
     entry.text.trim().length > 0 &&
     Number.isFinite(entry.timestamp) &&
-    entry.timestamp > 0
+    entry.timestamp > 0 &&
+    (entry.replyToSpeakerId === undefined || (
+      typeof entry.replyToSpeakerId === 'string' && entry.replyToSpeakerId.trim().length > 0
+    ))
   )
+}
+
+function resolveReplyTarget(replyToSpeakerId: string | undefined, currentRequesterId: string | undefined): AmbientReplyTarget {
+  if (replyToSpeakerId === undefined || replyToSpeakerId.trim().length === 0) {
+    return 'UNKNOWN'
+  }
+  if (currentRequesterId === undefined || currentRequesterId.trim().length === 0) {
+    return 'UNKNOWN'
+  }
+  if (replyToSpeakerId === currentRequesterId) {
+    return 'CURRENT_REQUESTER'
+  }
+  return 'OTHER_MEMBER'
 }
 
 /** True when a rendered label is an ambient-transcript pseudonym. */

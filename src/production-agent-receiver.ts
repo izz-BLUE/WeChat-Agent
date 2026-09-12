@@ -1,4 +1,4 @@
-import { ChatService, type ChatMentionFact, type MemoryPromptItem } from './chat.js'
+import { ChatService, type ChatMentionFact, type ChatPromptMessage, type MemoryPromptItem } from './chat.js'
 import { sanitizeFinalAnswer } from './final-answer.js'
 import {
   ABSENT_BOT_MENTION_SPANS,
@@ -104,6 +104,42 @@ function redactUntrustedGroupIds(text: string, request: AgentRequest): string {
     redacted = redacted.split(value).join(UNTRUSTED_GROUP_ID_PLACEHOLDER)
   }
   return redacted
+}
+
+interface ActiveContextSplit {
+  currentRequester: ChatPromptMessage[]
+  otherMembers: ChatPromptMessage[]
+}
+
+/**
+ * Split only the already-selected active transcript. The comparison uses the
+ * trusted requester identity when available and the stable internal label as a
+ * compatibility anchor; display names and message text never participate.
+ */
+function splitActiveContext(
+  messages: readonly GroupMessage[],
+  requesterId: string,
+  senderId: string,
+  currentSpeakerLabel: string,
+): ActiveContextSplit {
+  const currentRequester: ChatPromptMessage[] = []
+  const otherMembers: ChatPromptMessage[] = []
+  for (const message of messages) {
+    const belongsToCurrentRequester =
+      message.senderId === requesterId ||
+      message.senderId === senderId ||
+      message.senderName === currentSpeakerLabel
+    if (belongsToCurrentRequester) {
+      // Rebase historical current-requester entries to the current stable label
+      // without changing GroupContext storage or exposing any identity.
+      const { senderId: _senderId, ...providerSafeMessage } = message
+      currentRequester.push({ ...providerSafeMessage, senderName: currentSpeakerLabel })
+    } else {
+      const { senderId: _senderId, ...providerSafeMessage } = message
+      otherMembers.push(providerSafeMessage)
+    }
+  }
+  return { currentRequester, otherMembers }
 }
 
 function dateDaysBefore(localDate: string, days: number): string {
@@ -287,6 +323,7 @@ export class ProductionChatAgent implements AgentExecutor {
           speakerType: 'ASSISTANT',
           text: pending.text,
           timestamp: pending.timestamp,
+          ...(pending.replyToSpeakerId === undefined ? {} : { replyToSpeakerId: pending.replyToSpeakerId }),
         })
       }
     })
@@ -355,6 +392,9 @@ export class ProductionChatAgent implements AgentExecutor {
       config.maxContextChars,
       request.messageId,
     )
+    const activeContext = request.conversationType === 'GROUP'
+      ? splitActiveContext(window.messages, request.requesterId, request.senderId, label)
+      : { currentRequester: [], otherMembers: [] }
 
     // Ambient is read before this message is appended, and the message id is
     // excluded as well: the request being answered right now is the active
@@ -392,6 +432,7 @@ export class ProductionChatAgent implements AgentExecutor {
           recentGroupContext: window.messages,
           groupAmbientContext: ambient,
           currentSpeakerLabel: label,
+          currentRequesterId: request.requesterId,
         })
       : undefined
 
@@ -404,6 +445,7 @@ export class ProductionChatAgent implements AgentExecutor {
           activeTurnCount: conversationDynamics.activeTurnCount,
           ambientLineCount: conversationDynamics.ambientLineCount,
           assistantRecent: conversationDynamics.assistantRecent,
+          lastAssistantReplyTarget: conversationDynamics.lastAssistantReplyTarget,
           membersAfterAssistant: conversationDynamics.membersAfterAssistant,
           lastActiveRequester: conversationDynamics.lastActiveRequester,
           participation: conversationDynamics.participation,
@@ -511,6 +553,12 @@ export class ProductionChatAgent implements AgentExecutor {
         runtimeTime,
         groupStyle,
         conversationDynamics,
+        currentRequesterActiveContext: request.conversationType === 'GROUP'
+          ? activeContext.currentRequester
+          : undefined,
+        otherMemberActiveContext: request.conversationType === 'GROUP'
+          ? activeContext.otherMembers
+          : undefined,
         webSearch,
       },
       guardValues(request),
@@ -528,6 +576,7 @@ export class ProductionChatAgent implements AgentExecutor {
       conversationId: request.conversationId,
       text: outboundText,
       timestamp: request.timestamp,
+      ...(request.conversationType === 'GROUP' ? { replyToSpeakerId: request.requesterId } : {}),
     })
     if (this.persistentLog) {
       new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver').writeStructured(

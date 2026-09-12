@@ -26,6 +26,11 @@ export interface PendingOutboundReply extends OutboundIdentity {
   text: string
   /** The inbound request timestamp; this preserves the existing event semantics. */
   timestamp: number
+  /**
+   * Trusted requester identity for a normal group reply. Process-local only;
+   * ACKs and diagnostics never carry or render this value.
+   */
+  replyToSpeakerId?: string
 }
 
 export type DeliveryAckRejectReason =
@@ -53,7 +58,7 @@ interface PendingState extends PendingOutboundReply {
 
 export type PendingOutboundReplyInput = Pick<
   PendingOutboundReply,
-  'conversationType' | 'conversationId' | 'requestMessageId' | 'text' | 'timestamp'
+  'conversationType' | 'conversationId' | 'requestMessageId' | 'text' | 'timestamp' | 'replyToSpeakerId'
 >
 
 /** SHA-256 of the exact UTF-8 text crossing the Agent outbound boundary. */
@@ -79,7 +84,10 @@ export class PendingOutboundReplyStore {
 
   public stage(input: PendingOutboundReplyInput): OutboundIdentity {
     if (!isConversationType(input.conversationType) || !input.conversationId.trim() ||
-        !input.requestMessageId.trim() || !input.text.trim() || !Number.isFinite(input.timestamp)) {
+        !input.requestMessageId.trim() || !input.text.trim() || !Number.isFinite(input.timestamp) ||
+        (input.replyToSpeakerId !== undefined && (
+          typeof input.replyToSpeakerId !== 'string' || !input.replyToSpeakerId.trim()
+        ))) {
       throw new Error('pending outbound fields are invalid')
     }
 

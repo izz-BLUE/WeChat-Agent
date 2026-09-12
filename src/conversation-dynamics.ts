@@ -10,6 +10,7 @@ import type { GroupMessage } from './context.js'
 import {
   ASSISTANT_LABEL,
   CURRENT_REQUESTER_LABEL,
+  type AmbientReplyTarget,
   type AmbientLine,
 } from './group-ambient-context.js'
 
@@ -28,6 +29,7 @@ export interface ConversationDynamicsProfile {
   ambientLineCount: number
   lastActiveRequester: 'SAME_REQUESTER' | 'OTHER_REQUESTER' | 'NONE'
   assistantRecent: boolean
+  lastAssistantReplyTarget: AmbientReplyTarget
   membersAfterAssistant: number
   participation: ConversationParticipation
   pace: ConversationPace
@@ -41,6 +43,8 @@ export interface ConversationDynamicsObservationInput {
   groupAmbientContext: readonly AmbientLine[]
   /** The current requester's runtime pseudonymous speaker label. */
   currentSpeakerLabel: string
+  /** Trusted requester identity, used only to classify historical active turns. */
+  currentRequesterId?: string
 }
 
 /** Explicit bounds keep the profile small, explainable and deterministic. */
@@ -58,6 +62,8 @@ interface ObservedEvent {
   speaker: ObservedSpeaker
   /** A label is used only for the in-memory participant count. */
   speakerLabel: string
+  /** Present only for assistant events; provider-safe and never a raw id. */
+  replyTarget?: AmbientReplyTarget
 }
 
 /**
@@ -80,6 +86,8 @@ export function observeConversationDynamics(
       : 'OTHER_REQUESTER'
   const recentAmbientEvents = ambientEvents.slice(-CONVERSATION_DYNAMICS_THRESHOLDS.assistantRecentLineLimit)
   const assistantRecent = recentAmbientEvents.some((event) => event.speaker === 'ASSISTANT')
+  const lastAssistantEvent = ambientEvents[findLastIndex(ambientEvents, (event) => event.speaker === 'ASSISTANT')]
+  const lastAssistantReplyTarget = lastAssistantEvent?.replyTarget ?? 'NONE'
   const lastAssistantIndex = findLastIndex(ambientEvents, (event) => event.speaker === 'ASSISTANT')
   const membersAfterAssistant = lastAssistantIndex < 0
     ? 0
@@ -94,6 +102,7 @@ export function observeConversationDynamics(
     ambientLineCount: ambientEvents.length,
     lastActiveRequester,
     assistantRecent,
+    lastAssistantReplyTarget,
     membersAfterAssistant,
     participation,
     pace,
@@ -112,6 +121,7 @@ export function formatConversationDynamicsProfile(profile: ConversationDynamicsP
     `AMBIENT_LINE_COUNT=${profile.ambientLineCount}`,
     `LAST_ACTIVE_REQUESTER=${profile.lastActiveRequester}`,
     `ASSISTANT_RECENT=${profile.assistantRecent}`,
+    `LAST_ASSISTANT_REPLY_TARGET=${profile.lastAssistantReplyTarget}`,
     `MEMBERS_AFTER_ASSISTANT=${profile.membersAfterAssistant}`,
     `PARTICIPATION=${profile.participation}`,
     `PACE=${profile.pace}`,
@@ -128,7 +138,7 @@ function collectEvents(input: ConversationDynamicsObservationInput): ObservedEve
       events.push({
         source: 'ACTIVE',
         speaker: 'MEMBER',
-        speakerLabel: message.senderName,
+        speakerLabel: isCurrentRequester(message, input) ? input.currentSpeakerLabel : message.senderName,
       })
     }
   }
@@ -139,6 +149,7 @@ function collectEvents(input: ConversationDynamicsObservationInput): ObservedEve
         source: 'AMBIENT',
         speaker: line.label === ASSISTANT_LABEL ? 'ASSISTANT' : 'MEMBER',
         speakerLabel: line.label,
+        replyTarget: line.label === ASSISTANT_LABEL ? line.replyTarget ?? 'UNKNOWN' : undefined,
       })
     }
   }
@@ -157,6 +168,13 @@ function shouldKeepEvent(eventId: string | undefined, seenEventIds: Set<string>)
   }
   seenEventIds.add(normalized)
   return true
+}
+
+function isCurrentRequester(message: GroupMessage, input: ConversationDynamicsObservationInput): boolean {
+  return (
+    (input.currentRequesterId !== undefined && message.senderId === input.currentRequesterId) ||
+    message.senderName === input.currentSpeakerLabel
+  )
 }
 
 function classifyParticipation(
@@ -208,12 +226,16 @@ function classifyContinuity(
   if (
     profile.lastActiveRequester === 'SAME_REQUESTER' &&
     profile.assistantRecent &&
+    profile.lastAssistantReplyTarget === 'CURRENT_REQUESTER' &&
     profile.membersAfterAssistant === 0
   ) {
     return 'FOLLOW_UP_LIKELY'
   }
 
-  if (profile.assistantRecent || profile.lastActiveRequester === 'SAME_REQUESTER') {
+  if (
+    (profile.assistantRecent && profile.lastAssistantReplyTarget === 'CURRENT_REQUESTER') ||
+    profile.lastActiveRequester === 'SAME_REQUESTER'
+  ) {
     return 'CONTINUATION_POSSIBLE'
   }
 
