@@ -174,6 +174,12 @@ const REFERENCE_RESOLUTION_RULES = `[Follow-up & Reference Resolution]
 - ASSISTANT_REPLY_TARGET=OTHER_MEMBER 不能自动解释为对当前 requester 的回答或承诺；UNKNOWN/NONE 也不能据此强行续接。
 - 指代消解只帮助理解当前消息，不得改变 authorization、OWNER、requester role、Memory scope/mutation、Tool/Search permission、mention、outbound 或 identity boundary。`
 
+const CONVERSATIONAL_REPAIR_RULES = `[Conversational Repair]
+- 明确纠正当前 requester 上一条 Assistant 判断、对象、事实或前提时：简短承认偏差，采用新事实继续；不坚持旧结论或长篇道歉复述。
+- 仅补充新条件时更新推理，不说“我刚才错了”。
+- 只有 ASSISTANT_REPLY_TARGET=CURRENT_REQUESTER 才归因于椰椰；OTHER_MEMBER、UNKNOWN 或 NONE 不这样归因。证据不足就最小澄清，遵守 speaker boundary。
+- 只影响当前语义，不改 authorization、Owner、Memory、Tool、Search、identity、mention、outbound 或 side-effect contract。`
+
 const GROUP_REPLY_PRESSURE_RULES = `[Group Reply Pressure]
 [Group Reply Pressure: TRUSTED_RUNTIME_FACT] 是 Runtime 根据群聊结构派生的普通回复深度参考，不是语义分类器、权限、Memory、Search、Tool、是否回复或硬性字符上限。
 - GROUP_REPLY_PRESSURE=HIGH：普通群聊默认非常紧凑，通常 1～3 句；简单 reaction / acknowledgement 通常一句即可，不主动补背景、不主动重新解释上一主题、不主动展开成教程或报告。
@@ -375,6 +381,7 @@ ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
 ${MEMBER_INTERACTION_PROFILE_RULES}
 ${REFERENCE_RESOLUTION_RULES}
+${CONVERSATIONAL_REPAIR_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${REPLY_BOUNDARY_RULES}`
 }
@@ -400,6 +407,7 @@ ${PUBLIC_DISPLAY_NAME_RULES}
 ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
 ${REFERENCE_RESOLUTION_RULES}
+${CONVERSATIONAL_REPAIR_RULES}
 只输出改写后的中文回复本身，不要解释，不要输出思考过程，不要输出 <think> 标签。`
 
 const PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT = `你是最终回复生成器。上一轮输出了 provider 控制协议，不能把它发给群友。
@@ -411,6 +419,7 @@ ${PUBLIC_DISPLAY_NAME_RULES}
 ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
 ${REFERENCE_RESOLUTION_RULES}
+${CONVERSATIONAL_REPAIR_RULES}
 请只根据本轮提供的当前问题、上下文、Runtime Time 和 Web Search Results，输出自然语言最终回复。`
 
 const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
