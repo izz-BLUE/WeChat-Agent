@@ -16,6 +16,16 @@ export interface WebSearchResponse {
   results: readonly WebSearchResult[]
 }
 
+export interface GroundedSourceUsage {
+  searchUsed: true
+  availableSourceCount: number
+  referencedSourceCount: number
+  appendedSourceCount: number
+  result: 'PASS' | 'NO_REFERENCED_SOURCE'
+}
+
+export type GroundedSourceUsageReporter = (usage: GroundedSourceUsage) => void
+
 export interface WebSearchProvider {
   search(request: WebSearchRequest): Promise<WebSearchResponse>
 }
@@ -132,15 +142,23 @@ export function appendGroundedSources(
   answer: string,
   results: readonly WebSearchResult[],
   forbiddenValues: readonly string[] = [],
+  reportUsage?: GroundedSourceUsageReporter,
 ): string {
   const safeResults = results.filter((item) => !containsForbiddenValue(`${item.title} ${item.url}`, forbiddenValues))
   const sourceById = new Map(safeResults.map((item) => [item.sourceId, item]))
   const referencedIds = [...answer.matchAll(/\[(S\d+)\]/gu)]
     .map((match) => match[1])
     .filter((sourceId): sourceId is string => sourceId !== undefined && sourceById.has(sourceId))
-  const selected = referencedIds.length > 0
-    ? [...new Set(referencedIds)].map((sourceId) => sourceById.get(sourceId)!).slice(0, 3)
-    : safeResults.slice(0, 2)
+  const groundedIds = [...new Set(referencedIds)]
+  const selected = groundedIds.map((sourceId) => sourceById.get(sourceId)!).slice(0, 3)
+
+  reportUsage?.({
+    searchUsed: true,
+    availableSourceCount: safeResults.length,
+    referencedSourceCount: groundedIds.length,
+    appendedSourceCount: selected.length,
+    result: selected.length > 0 ? 'PASS' : 'NO_REFERENCED_SOURCE',
+  })
 
   const groundedAnswer = answer.replace(/https?:\/\/[^\s)\]}>]+/gu, (url) => {
     return safeResults.some((item) => item.url === url) ? url : ''

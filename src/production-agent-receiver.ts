@@ -1,4 +1,4 @@
-import { ChatService, type ChatMentionFact } from './chat.js'
+import { ChatService, type ChatMentionFact, type MemoryPromptItem } from './chat.js'
 import { sanitizeFinalAnswer } from './final-answer.js'
 import {
   ABSENT_BOT_MENTION_SPANS,
@@ -446,6 +446,7 @@ export class ProductionChatAgent implements AgentExecutor {
       question.text,
       window.messages,
       ambient,
+      memory,
       request,
       runtimeTime,
     )
@@ -626,6 +627,7 @@ export class ProductionChatAgent implements AgentExecutor {
     question: string,
     recentContext: readonly GroupMessage[],
     ambient: readonly AmbientLine[],
+    authorizedMemory: readonly MemoryPromptItem[],
     request: AgentRequest,
     runtimeTime: RuntimeTimeFacts,
   ): Promise<{
@@ -643,6 +645,7 @@ export class ProductionChatAgent implements AgentExecutor {
         question,
         recentContext,
         ambient,
+        authorizedMemory,
         runtimeTime,
       },
       guardValues(request),

@@ -596,7 +596,17 @@ export class ChatService {
       return discloseWebSearchFailure(rendered)
     }
     if (request.webSearch?.status === 'PASS' && request.webSearch.results.length > 0) {
-      return appendGroundedSources(rendered, request.webSearch.results, internalValues)
+      return appendGroundedSources(
+        rendered,
+        request.webSearch.results,
+        internalValues,
+        (usage) => emitDiagnostic(
+          (line: string) => console.log(line),
+          persistentSink,
+          'WEB_SEARCH_SOURCE_USAGE',
+          { ...usage },
+        ),
+      )
     }
     return rendered
   }
