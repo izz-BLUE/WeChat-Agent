@@ -37,6 +37,46 @@ export interface GroundedSourceUsage {
 
 export type GroundedSourceUsageReporter = (usage: GroundedSourceUsage) => void
 
+function selectGroundedSources(
+  answer: string,
+  results: readonly WebSearchResult[],
+  forbiddenValues: readonly string[],
+): { safeResults: WebSearchResult[]; groundedIds: string[]; selected: WebSearchResult[] } {
+  const safeResults = results.filter((item) => !containsForbiddenValue(`${item.title} ${item.url}`, forbiddenValues))
+  const sourceById = new Map(safeResults.map((item) => [item.sourceId, item]))
+  const groundedIds = [...new Set(
+    [...answer.matchAll(/\[(S\d+)\]/gu)]
+      .map((match) => match[1])
+      .filter((sourceId): sourceId is string => sourceId !== undefined && sourceById.has(sourceId)),
+  )]
+  const selected = groundedIds.map((sourceId) => sourceById.get(sourceId)!)
+  return { safeResults, groundedIds, selected }
+}
+
+/** Inspect grounding without changing the answer or appending sources. */
+export function inspectGroundedSources(
+  answer: string,
+  results: readonly WebSearchResult[],
+  forbiddenValues: readonly string[] = [],
+): GroundedSourceUsage {
+  const selection = selectGroundedSources(answer, results, forbiddenValues)
+  const selectedIds = new Set(selection.selected.map((item) => item.sourceId))
+  const removedDanglingMarkerCount = [...answer.matchAll(/\[(S\d+)\]/gu)]
+    .filter((match) => !selectedIds.has(match[1] ?? ''))
+    .length
+  return {
+    searchUsed: true,
+    availableSourceCount: selection.safeResults.length,
+    referencedSourceCount: selection.groundedIds.length,
+    validReferencedSourceCount: selection.groundedIds.length,
+    selectedSourceCount: selection.selected.length,
+    removedDanglingMarkerCount,
+    visibleMarkerCount: 0,
+    appendedSourceCount: selection.selected.length,
+    result: selection.selected.length > 0 ? 'PASS' : 'NO_REFERENCED_SOURCE',
+  }
+}
+
 export interface WebSearchProvider {
   search(request: WebSearchRequest): Promise<WebSearchResponse>
 }
@@ -168,13 +208,8 @@ export function appendGroundedSources(
   forbiddenValues: readonly string[] = [],
   reportUsage?: GroundedSourceUsageReporter,
 ): string {
-  const safeResults = results.filter((item) => !containsForbiddenValue(`${item.title} ${item.url}`, forbiddenValues))
-  const sourceById = new Map(safeResults.map((item) => [item.sourceId, item]))
-  const referencedIds = [...answer.matchAll(/\[(S\d+)\]/gu)]
-    .map((match) => match[1])
-    .filter((sourceId): sourceId is string => sourceId !== undefined && sourceById.has(sourceId))
-  const groundedIds = [...new Set(referencedIds)]
-  const selected = groundedIds.map((sourceId) => sourceById.get(sourceId)!).slice(0, 3)
+  const selection = selectGroundedSources(answer, results, forbiddenValues)
+  const { safeResults, groundedIds, selected } = selection
   const selectedIds = new Set(selected.map((item) => item.sourceId))
   let removedDanglingMarkerCount = 0
 

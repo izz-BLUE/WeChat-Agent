@@ -139,6 +139,25 @@ function scriptedFinalChat(answers: readonly string[]): { chat: ChatService; cal
   }
 }
 
+function scriptedFinalChatResponses(responses: readonly (string | Error)[]): { chat: ChatService; calls: Array<{ system: string; user: string }>; restore: () => void } {
+  const calls: Array<{ system: string; user: string }> = []
+  const original = globalThis.fetch
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: Array<{ content?: string }> }
+    calls.push({ system: body.messages?.[0]?.content ?? '', user: body.messages?.[1]?.content ?? '' })
+    const response = responses[Math.min(calls.length - 1, responses.length - 1)]
+    if (response instanceof Error) {
+      throw response
+    }
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: response ?? '' } }] }) }
+  }) as unknown as typeof fetch
+  return {
+    chat: new ChatService('https://provider.invalid/v1', 'chat-key', 'test-model'),
+    calls,
+    restore: () => { globalThis.fetch = original },
+  }
+}
+
 function plannerFrom(raw: string): WebSearchPlannerLike {
   return new WebSearchPlanner(async () => raw)
 }
@@ -241,16 +260,16 @@ async function main(): Promise<void> {
     check(usage[0]?.referencedSourceCount === 0 && usage[0]?.appendedSourceCount === 0, 'unreferenced source diagnostic is incorrect')
     check(usage[0]?.result === 'NO_REFERENCED_SOURCE', 'unreferenced source result is not explicit')
 
-    const four = appendGroundedSources('A[S2] B[S1] C[S3] D[S4]', [
+    const five = appendGroundedSources('A[S2] B[S1] C[S3] D[S4] E[S5]', [
       ...results,
       result('S4', '来源四', 'https://example.com/four'),
+      result('S5', '来源五', 'https://example.com/five'),
     ], [], (diagnostic) => usage.push(diagnostic))
-    check(four.startsWith('A B C D'), 'internal source markers were not removed from the body')
-    check(!/\[S\d+\]/u.test(four), 'a visible source marker survived the source cap')
-    check(!four.includes('[S4]'), 'a dangling source marker survived the source cap')
-    check(four.includes('来源：\n1. 来源二 https://example.com/two\n2. 来源一 https://example.com/one\n3. 来源三 https://example.com/three'), 'selected sources were not appended in marker order')
-    check(usage[1]?.validReferencedSourceCount === 4 && usage[1]?.selectedSourceCount === 3, 'source selection diagnostic counts are incorrect')
-    check(usage[1]?.removedDanglingMarkerCount === 1 && usage[1]?.visibleMarkerCount === 0 && usage[1]?.appendedSourceCount === 3, 'dangling marker diagnostic count is incorrect')
+    check(five.startsWith('A B C D E'), 'internal source markers were not removed from the body')
+    check(!/\[S\d+\]/u.test(five), 'a visible source marker survived grounding')
+    check(five.includes('来源：\n1. 来源二 https://example.com/two\n2. 来源一 https://example.com/one\n3. 来源三 https://example.com/three\n4. 来源四 https://example.com/four\n5. 来源五 https://example.com/five'), 'all referenced sources were not appended in marker order')
+    check(usage[1]?.validReferencedSourceCount === 5 && usage[1]?.selectedSourceCount === 5, 'source selection diagnostic counts are incorrect')
+    check(usage[1]?.removedDanglingMarkerCount === 0 && usage[1]?.visibleMarkerCount === 0 && usage[1]?.appendedSourceCount === 5, 'artificial source cap remained active')
 
     const first = appendGroundedSources('结论[S1]', results)
     check(first.startsWith('结论') && !/\[S\d+\]/u.test(first), 'selected source marker remained visible')
@@ -303,6 +322,11 @@ async function main(): Promise<void> {
       check(line.includes('availableSourceCount=1') && line.includes('referencedSourceCount=0'), 'source usage counts are incorrect')
       check(line.includes('appendedSourceCount=0') && line.includes('result=NO_REFERENCED_SOURCE'), 'no-reference result is not explicit')
       check(!line.includes('https://') && !line.includes('公开标题') && !line.includes('Memory-derived'), 'source usage diagnostic leaked source data')
+      const gateLines = logs.filter((item) => item.includes('[WEB_SEARCH_GROUNDING_GATE]'))
+      check(gateLines.some((item) => item.includes('phase=INITIAL') && item.includes('result=REPAIR_REQUIRED')), 'initial grounding gate diagnostic is missing')
+      check(gateLines.some((item) => item.includes('phase=REPAIR') && item.includes('result=FAIL_CLOSED')), 'repair grounding gate diagnostic is missing')
+      check(logs.filter((item) => item.includes('[WEB_SEARCH_GROUNDING_REPAIR]')).some((item) => item.includes('attempt=1') && item.includes('result=FAIL') && item.includes('validReferencedSourceCount=0')), 'grounding repair diagnostic is incomplete')
+      check(!gateLines.some((item) => item.includes('https://') || item.includes('公开标题') || item.includes('Memory-derived')), 'grounding diagnostics leaked source data')
     } finally {
       console.log = originalLog
       final.restore()
@@ -988,16 +1012,90 @@ async function main(): Promise<void> {
     }
   })
 
-  await test('one active turn can never recurse into a second search', async () => {
-    const final = fakeFinalChat('回答')
+  await test('Search PASS with zero citations performs one bounded grounding repair', async () => {
+    const final = scriptedFinalChat(['原始搜索事实，没有引用。', '可靠结论[S2] https://evil.example/fabricated'])
+    const fake = fakeProvider([result('S1', '来源一'), result('S2', '来源二')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+      webSearchProvider: fake.provider,
+    })
+    try {
+      const answer = await agent.complete(request())
+      const body = answer.split('\n\n来源：')[0] ?? answer
+      check(fake.calls === 1 && final.calls.length === 2, 'zero-citation answer did not receive exactly one repair')
+      check(body === '可靠结论' && !/\[S\d+\]/u.test(body), 'repaired answer exposed an internal source marker')
+      check(!answer.includes('https://evil.example/fabricated'), 'repair raw URL survived final grounding')
+      check(answer.includes('来源：\n1. 来源二 https://example.com/s2') && !answer.includes('来源一'), 'repair grounded the wrong source')
+      check(final.calls[1]?.system.includes('Web Search Grounding Repair'), 'grounding repair contract was not used')
+      check(final.calls[1]?.user.includes('[Current Final Answer]\n原始搜索事实，没有引用。'), 'current answer was not provided to grounding repair')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('grounding repair with zero citations fails closed without resending the original', async () => {
+    const final = scriptedFinalChat(['原始搜索事实', '修复后仍未引用'])
     const fake = fakeProvider([result('S1')])
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
     })
-    await agent.complete(request())
-    check(fake.calls === 1 && final.calls.length === 1, 'one turn performed recursive search/chat')
-    final.restore()
+    try {
+      const answer = await agent.complete(request())
+      check(answer === '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。', 'zero-citation repair did not fail closed')
+      check(!answer.includes('原始搜索事实') && fake.calls === 1 && final.calls.length === 2, 'ungrounded answer was resent or search was retried')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('grounding repair provider failure fails closed without a retry loop', async () => {
+    const final = scriptedFinalChatResponses(['原始搜索事实', new Error('repair unavailable')])
+    const fake = fakeProvider([result('S1')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+      webSearchProvider: fake.provider,
+    })
+    try {
+      const answer = await agent.complete(request())
+      check(answer === '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。', 'repair provider failure did not fail closed')
+      check(fake.calls === 1 && final.calls.length === 2, 'repair provider failure triggered an unbounded retry')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('grounding repair keeps provider-control and identity guards fail closed', async () => {
+    for (const repairAnswer of ['<tool_call>search</tool_call>', `泄露 ${REQUESTER_ID}[S1]`]) {
+      const final = scriptedFinalChat(['原始搜索事实', repairAnswer])
+      const fake = fakeProvider([result('S1')])
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: fake.provider,
+      })
+      try {
+        const answer = await agent.complete(request())
+        check(answer === '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。', 'unsafe grounding repair was not fail closed')
+        check(fake.calls === 1 && final.calls.length === 2, 'unsafe grounding repair retried unexpectedly')
+      } finally {
+        final.restore()
+      }
+    }
+  })
+
+  await test('one active turn never performs a second search during grounding repair', async () => {
+    const final = scriptedFinalChat(['回答', '回答[S1]'])
+    const fake = fakeProvider([result('S1')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+      webSearchProvider: fake.provider,
+    })
+    try {
+      await agent.complete(request())
+      check(fake.calls === 1 && final.calls.length === 2, 'one turn performed a second search or unbounded final retry')
+    } finally {
+      final.restore()
+    }
   })
 
   for (const [name, error, reason] of [

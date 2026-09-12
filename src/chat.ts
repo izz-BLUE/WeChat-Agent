@@ -10,7 +10,7 @@ import type { RequesterRole } from './message-contract.js'
 import { isInternalSpeakerLabel, statelessSpeakerLabel, type SpeakerDisplayFacts } from './speaker-labels.js'
 import { emitDiagnostic, type PersistentRuntimeLogSink } from './persistent-runtime-log.js'
 import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
-import { appendGroundedSources, buildWebSearchContext, type WebSearchMode, type WebSearchResult, type WebSearchWindow } from './web-search.js'
+import { appendGroundedSources, buildWebSearchContext, inspectGroundedSources, type WebSearchMode, type WebSearchResult, type WebSearchWindow } from './web-search.js'
 import { formatRuntimeTimeFacts, type RuntimeTimeFacts } from './runtime-time.js'
 import { formatGroupStyleProfile, neutralGroupStyleProfile, type GroupStyleProfile } from './group-style.js'
 import { renderHumanChat } from './chat-renderer.js'
@@ -158,7 +158,7 @@ const WEB_SEARCH_RULES = `[Web Search Results]（如果本轮提供）来自互�
 - 默认先按用户真正的问题综合回答：内部去重、找共同主题、判断相关性并合并共同支持的事实；一个自然结论可以在同一句或同一段中引用多个 source，例如“模型能力和安全合作都在推进。[S1][S3]”。不要输出这个内部整理过程。
 - 搜索成功时，默认直接告诉群友最重要的自然结论；一个重要主题就直接回答，不要为了显得完整而凑多个 bullet，不要默认使用“首先/其次/最后”“一是/二是”或“以下是几个重点”等报告式组织。
 - 普通搜索回答默认使用少量自然段，除非用户明确要求详细整理、列出若干条、按时间线整理或做总结报告，或问题本身复杂确实需要结构化。此规则是表达意图，不是字符串黑名单，也不能通过 Renderer 强制删除列表。
-- NEWS_RECENT 如果只有一个真正相关的结果就只说这一件；没有足够近期结果就自然说明，绝不要为了凑满回答而拿旧消息填充成完整汇报。
+- NEWS_RECENT 如果只有一个真正相关的结果就只说这一件；普通新闻问题且用户没有要求汇总、多条或详细时，优先回答最相关的 1～2 个主题；没有足够近期结果就自然说明，绝不要为了凑满回答而拿旧消息填充成完整汇报。已经实际引用的 grounded source 仍须全部保留。
 - 新闻回答要像刚查完资料后直接和群友说明，避免“下面给你整理”“挑几个重点”以及机械的“一是/二是/三是”或按“模型/安全/监管”逐栏汇报；这不是字符串过滤规则。
 - 自然综合不能抹掉关键限定条件、把“可能”改成“确定”、把旧消息说成今天发生，或把互相冲突的来源合成一个确定结论；冲突时自然说明不同来源说法不完全一致。
 - 当 WEB_SEARCH_MODE=NEWS_RECENT 时，优先使用较新的 PublishedAt；如果当前近期窗口没有足够结果，直接说明没有查到足够近期信息，不要拿旧背景资料冒充今天新闻。
@@ -278,6 +278,17 @@ const PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT = `你是最终回复生成器。上
 ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
 请只根据本轮提供的当前问题、上下文、Runtime Time 和 Web Search Results，输出自然语言最终回复。`
+
+const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
+这不是重新搜索、第二次 Planner 或第二次 Tavily，只修复本轮已有回答的 grounding：
+- 只根据当前问题、已有 Web Search Results 和需修复的当前回答作答；保留原回答的自然含义，不新增任何事实。
+- 只有 Web Search Results 明确支持的事实才保留；无法由提供的结果支持的事实删除或降低确定性。
+- 对实际使用并由结果支持的事实保留正确的 [S1]、[S2] 等内部引用；不要停止引用，也不要创造 sourceId。
+- [Sx] 只供 Runtime 做 grounding，Runtime 会在发送前移除所有 marker；不要向用户解释引用协议。
+- 不得输出 URL、来源列表、修复说明、分析过程、思考过程或任何 provider 控制协议；只输出自然中文正文。
+- 不得输出任何身份标识、内部字段、Memory 原始元数据、conversation id、requester id、target id 或其它运行时内部值。`
+
+const WEB_SEARCH_GROUNDING_FAILURE_REPLY = '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。'
 
 function formatMessages(messages: GroupMessage[]): string {
   return messages.length === 0
@@ -451,6 +462,15 @@ function rewriteUserPrompt(
   return `${buildUserPrompt(context, question, request)}\n\n[需改写的草稿]\n${draft}\n\n只输出改写后的中文回复。`
 }
 
+function groundingRepairUserPrompt(
+  context: GroupMessage[],
+  question: GroupMessage,
+  request: ChatRequestContext,
+  draft: string,
+): string {
+  return `${buildUserPrompt(context, question, request)}\n\n[Current Final Answer]\n${draft}\n\n请只输出修复后的自然中文正文。`
+}
+
 export class ChatService {
   public constructor(
     private readonly apiBase: string,
@@ -616,6 +636,33 @@ export class ChatService {
       throw new Error('Chat renderer returned an empty answer')
     }
 
+    const reportSourceUsage = (usage: ReturnType<typeof inspectGroundedSources>): void => {
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        persistentSink,
+        'WEB_SEARCH_SOURCE_USAGE',
+        { ...usage },
+      )
+    }
+
+    const reportGroundingGate = (
+      phase: 'INITIAL' | 'REPAIR',
+      usage: ReturnType<typeof inspectGroundedSources>,
+      result: 'PASS' | 'REPAIR_REQUIRED' | 'FAIL_CLOSED',
+    ): void => {
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        persistentSink,
+        'WEB_SEARCH_GROUNDING_GATE',
+        {
+          phase,
+          validReferencedSourceCount: usage.validReferencedSourceCount,
+          availableSourceCount: usage.availableSourceCount,
+          result,
+        },
+      )
+    }
+
     if (request.webSearch?.status === 'FAILED') {
       if (request.webSearch.mode === 'NEWS_RECENT') {
         return '当前没有查到足够近期信息，无法可靠确认最新情况。'
@@ -623,16 +670,65 @@ export class ChatService {
       return discloseWebSearchFailure(rendered)
     }
     if (request.webSearch?.status === 'PASS' && request.webSearch.results.length > 0) {
+      const initialUsage = inspectGroundedSources(rendered, request.webSearch.results, internalValues)
+      reportGroundingGate(
+        'INITIAL',
+        initialUsage,
+        initialUsage.validReferencedSourceCount > 0 ? 'PASS' : 'REPAIR_REQUIRED',
+      )
+      if (initialUsage.validReferencedSourceCount === 0) {
+        reportSourceUsage(initialUsage)
+
+        let repairedRendered: string | undefined
+        let repairedUsage = initialUsage
+        try {
+          const repairedDraft = await this.requestFinalAnswer(
+            `${buildSystemPrompt(request.botDisplayName)}\n${WEB_SEARCH_GROUNDING_REPAIR_RULES}`,
+            groundingRepairUserPrompt(context, question, request, rendered),
+            persistentSink,
+            messageId,
+          )
+          const repairedGuard = guardFinalAnswer(repairedDraft, guardFacts)
+          if (repairedGuard.outcome !== 'BLOCKED') {
+            const candidate = renderHumanChat(repairedGuard.text)
+            if (candidate.length > 0) {
+              repairedRendered = candidate
+              repairedUsage = inspectGroundedSources(candidate, request.webSearch.results, internalValues)
+            }
+          }
+        } catch {
+          // A grounding repair failure must not resend the ungrounded original.
+        }
+
+        const repairPassed = repairedRendered !== undefined && repairedUsage.validReferencedSourceCount > 0
+        emitDiagnostic(
+          (line: string) => console.log(line),
+          persistentSink,
+          'WEB_SEARCH_GROUNDING_REPAIR',
+          {
+            attempt: 1,
+            result: repairPassed ? 'PASS' : 'FAIL',
+            validReferencedSourceCount: repairedUsage.validReferencedSourceCount,
+          },
+        )
+        reportGroundingGate('REPAIR', repairedUsage, repairPassed ? 'PASS' : 'FAIL_CLOSED')
+        if (!repairPassed || repairedRendered === undefined) {
+          return WEB_SEARCH_GROUNDING_FAILURE_REPLY
+        }
+
+        return appendGroundedSources(
+          repairedRendered,
+          request.webSearch.results,
+          internalValues,
+          reportSourceUsage,
+        )
+      }
+
       return appendGroundedSources(
         rendered,
         request.webSearch.results,
         internalValues,
-        (usage) => emitDiagnostic(
-          (line: string) => console.log(line),
-          persistentSink,
-          'WEB_SEARCH_SOURCE_USAGE',
-          { ...usage },
-        ),
+        reportSourceUsage,
       )
     }
     return rendered
