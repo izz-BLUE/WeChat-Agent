@@ -97,6 +97,9 @@ function deserializeRawMessage(value: unknown): RawHookMessage | { invalid: stri
   if (hasOwn(object, 'senderName') && object.senderName !== null && typeof object.senderName !== 'string') {
     return { invalid: 'SENDER_NAME_TYPE_INVALID' }
   }
+  if (hasOwn(object, 'publicDisplayName') && object.publicDisplayName !== null && typeof object.publicDisplayName !== 'string') {
+    return { invalid: 'PUBLIC_DISPLAY_NAME_TYPE_INVALID' }
+  }
   if (hasOwn(object, 'isMentioned') && object.isMentioned !== null && typeof object.isMentioned !== 'boolean') {
     return { invalid: 'IS_MENTIONED_TYPE_INVALID' }
   }
@@ -122,6 +125,7 @@ function deserializeRawMessage(value: unknown): RawHookMessage | { invalid: stri
     content: object.content,
     signature: object.signature,
     senderName: object.senderName as string | null | undefined,
+    publicDisplayName: object.publicDisplayName as string | null | undefined,
     isMentioned: object.isMentioned as boolean | null | undefined,
     // Runtime identity decision; GROUP payloads must carry it to be admitted.
     conversationType: object.conversationType as string | null | undefined,

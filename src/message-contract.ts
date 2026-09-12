@@ -8,6 +8,7 @@ import {
   type BotMentionSpanFacts,
   type UserContentSpanFacts,
 } from './canonical-user-text.js'
+import { sanitizePublicDisplayName } from './public-display-name.js'
 
 /**
  * Wire kind of the passive ambient event.
@@ -56,6 +57,8 @@ export interface RawHookMessage {
   ownerConfigured?: boolean | null
   /** Display metadata only; it carries no authority. */
   ownerDisplayName?: string | null
+  /** Local operator-bound public display metadata; never identity or authority. */
+  publicDisplayName?: string | null
   /**
    * Confirmed BOT mention token spans over `content`, in UTF-16 code units, as
    * produced by the runtime's single mention scan. Optional additive field: an
@@ -80,6 +83,8 @@ export interface InboundMessage {
   requesterRole: RequesterRole
   ownerConfigured: boolean
   ownerDisplayName: string | null
+  /** Provider-facing public display metadata; never requester/role/memory input. */
+  publicDisplayName: string | null
   /** Optional C# runtime target; only verified OWNER DIRECT may consume it. */
   privateDispatchTargetConversationId?: string | null
   senderName: string | null
@@ -132,6 +137,8 @@ export interface PassiveContextMessage {
   senderId: string
   requesterId: string
   requesterSource: string
+  /** Provider-facing public display metadata; carries no authority. */
+  publicDisplayName: string | null
   text: string
   timestamp: number
   rawMessageType: number
@@ -313,6 +320,9 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       requesterRole: identity.requesterRole,
       ownerConfigured: identity.ownerConfigured,
       ownerDisplayName: identity.ownerDisplayName,
+      publicDisplayName: conversationType === 'GROUP'
+        ? sanitizePublicDisplayName(raw.publicDisplayName)
+        : null,
       privateDispatchTargetConversationId: normalized(raw.privateDispatchTargetConversationId) || null,
       senderName: normalized(raw.senderName) || null,
       text,
@@ -433,6 +443,7 @@ export function normalizePassiveContextMessage(raw: RawHookMessage): PassiveNorm
       senderId,
       requesterId,
       requesterSource: normalized(raw.requesterSource) || 'UNKNOWN',
+      publicDisplayName: sanitizePublicDisplayName(raw.publicDisplayName),
       text,
       timestamp: raw.timestamp,
       rawMessageType,

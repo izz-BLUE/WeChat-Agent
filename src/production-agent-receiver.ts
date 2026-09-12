@@ -224,6 +224,7 @@ export class ProductionChatAgent implements AgentExecutor {
       messageId: passive.messageId,
       speakerId: passive.senderId,
       speakerType: 'MEMBER',
+      publicDisplayName: passive.publicDisplayName,
       text: passive.text,
       timestamp: passive.timestamp,
     })
@@ -335,6 +336,7 @@ export class ProductionChatAgent implements AgentExecutor {
       senderId: request.senderId,
       // Never the raw runtime identity: the label is role/pseudonym based.
       senderName: label,
+      publicDisplayName: request.publicDisplayName,
       // ONE canonical projection of the contract body, computed once and reused by
       // every consumer below: the memory admission gate, the extractor, the
       // retrieval query, the transcript and the final current request. It removes
@@ -419,6 +421,7 @@ export class ProductionChatAgent implements AgentExecutor {
         messageId: request.messageId,
         speakerId: request.senderId,
         speakerType: 'MEMBER',
+        publicDisplayName: request.publicDisplayName,
         text: question.text,
         timestamp: request.timestamp,
       })

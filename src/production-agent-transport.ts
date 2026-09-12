@@ -486,6 +486,9 @@ function parseInboundEnvelope(value: unknown): InboundEnvelope {
   if (raw.senderName !== undefined && raw.senderName !== null && typeof raw.senderName !== 'string') {
     throw new Error('Inbound senderName is invalid')
   }
+  if (raw.publicDisplayName !== undefined && raw.publicDisplayName !== null && typeof raw.publicDisplayName !== 'string') {
+    throw new Error('Inbound publicDisplayName is invalid')
+  }
   if (raw.isMentioned !== undefined && raw.isMentioned !== null && typeof raw.isMentioned !== 'boolean') {
     throw new Error('Inbound isMentioned is invalid')
   }

@@ -36,6 +36,7 @@
  * carry enums and counts only.
  */
 import { formatDiagnosticLine, type PersistentRuntimeLogSink } from './persistent-runtime-log.js'
+import { sanitizePublicDisplayName } from './public-display-name.js'
 
 /** Scope token used in every ambient diagnostic. */
 export const AMBIENT_SCOPE = 'GROUP_AMBIENT'
@@ -60,6 +61,8 @@ export interface AmbientEntryInput {
   messageId: string
   speakerId: string
   speakerType: AmbientSpeakerType
+  /** Local public display metadata; never used as a correlation key. */
+  publicDisplayName?: string | null
   text: string
   timestamp: number
 }
@@ -67,6 +70,8 @@ export interface AmbientEntryInput {
 /** One rendered transcript line. Never carries a raw identity. */
 export interface AmbientLine {
   label: string
+  /** Provider-facing display metadata; `label` remains the internal correlation label. */
+  publicDisplayName?: string | null
   text: string
   /** Short-term event identity, never rendered into a provider prompt. */
   messageId?: string
@@ -196,7 +201,11 @@ export class GroupAmbientContext {
       // member keeps the same label for the whole Agent lifetime.
       this.labelFor(groupKey, entry.speakerId)
     }
-    entries.push({ ...entry, text: entry.text.trim() })
+    entries.push({
+      ...entry,
+      publicDisplayName: sanitizePublicDisplayName(entry.publicDisplayName),
+      text: entry.text.trim(),
+    })
     if (entries.length > this.maxEntries) {
       entries.splice(0, entries.length - this.maxEntries)
     }
@@ -244,14 +253,15 @@ export class GroupAmbientContext {
     for (let index = eligible.length - 1; index >= 0 && lines.length < limit; index -= 1) {
       const entry = eligible[index]
       const label = this.renderLabel(groupKey, entry, request.currentRequesterId)
-      const lineChars = label.length + entry.text.length + 2
+      const displayLabel = entry.publicDisplayName ?? label
+      const lineChars = displayLabel.length + entry.text.length + 2
       // The budget always keeps the most recent line, even when that single line
       // is longer than the whole budget: an empty ambient section would be worse.
       if (lines.length > 0 && chars + lineChars > maxChars) {
         break
       }
 
-      lines.unshift({ label, text: entry.text, messageId: entry.messageId })
+      lines.unshift({ label, publicDisplayName: entry.publicDisplayName, text: entry.text, messageId: entry.messageId })
       chars += lineChars
     }
 

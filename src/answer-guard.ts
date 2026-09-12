@@ -52,6 +52,8 @@ export interface AnswerGuardFacts {
   /** Grounding facts for the narrow current-requester identity path. */
   selfIdentityQuery?: boolean
   retrievedPersonalMemoryCount?: number
+  /** Confirmed presentation names may contain role-like words such as 管理员. */
+  publicDisplayNames?: readonly string[]
 }
 
 export interface AnswerGuardResult {
@@ -146,6 +148,17 @@ function countOccurrences(text: string, needle: string): number {
     index = text.indexOf(needle, index + needle.length)
   }
   return count
+}
+
+function maskAllowedPublicDisplayNames(text: string, names: readonly string[] | undefined): string {
+  let masked = text
+  for (const name of [...new Set(names ?? [])]
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .sort((left, right) => right.length - left.length)) {
+    masked = masked.replace(new RegExp(escapeRegExp(name), 'gu'), (match) => ' '.repeat([...match].length))
+  }
+  return masked
 }
 
 function sameLabel(left: string, right: string): boolean {
@@ -320,7 +333,8 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
   }
 
   if (facts.selfIdentityQuery === true && facts.retrievedPersonalMemoryCount === 0) {
-    const claims = [...text.matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
+    const claims = [...maskAllowedPublicDisplayNames(text, facts.publicDisplayNames)
+      .matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
     if (claims > 0) {
       bump('UNGROUNDED_IDENTITY_CLAIM', claims)
       blocked = true

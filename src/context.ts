@@ -1,8 +1,11 @@
 import type { PersistentRuntimeLogSink } from './persistent-runtime-log.js'
+import { sanitizePublicDisplayName } from './public-display-name.js'
 
 export interface GroupMessage {
   senderId: string
   senderName: string
+  /** Local public display metadata; never used as a correlation key. */
+  publicDisplayName?: string | null
   text: string
   timestamp: number
   /** Short-term event identity, available only to structural de-duplication. */
@@ -44,7 +47,10 @@ export class GroupContext {
 
   public append(roomId: string, message: GroupMessage, messageId?: string): void {
     const entries = this.entriesByRoom.get(roomId) ?? []
-    entries.push({ message, messageId })
+    entries.push({
+      message: { ...message, publicDisplayName: sanitizePublicDisplayName(message.publicDisplayName) },
+      messageId,
+    })
 
     if (entries.length > this.maxMessages) {
       entries.splice(0, entries.length - this.maxMessages)
@@ -80,7 +86,7 @@ export class GroupContext {
 
     for (let index = entries.length - 1; index >= 0 && selected.length < messageLimit; index -= 1) {
       const entry = entries[index] as ContextEntry
-      const messageChars = entry.message.senderName.length + entry.message.text.length + 3
+      const messageChars = (entry.message.publicDisplayName ?? entry.message.senderName).length + entry.message.text.length + 3
 
       if (selected.length > 0 && chars + messageChars > maxChars) {
         break

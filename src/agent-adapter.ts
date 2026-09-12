@@ -32,6 +32,8 @@ export interface AgentRequest {
     ownerConfigured: boolean
     /** Display metadata only; never an authorization input. */
     ownerDisplayName: string | null
+    /** Local public display metadata; never identity, role or memory input. */
+    publicDisplayName?: string | null
     /** C#-only target; only verified OWNER DIRECT may consume it. */
     privateDispatchTargetConversationId?: string | null
   senderName: string | null
@@ -85,6 +87,8 @@ export interface AgentPassiveContext {
   conversationId: string
   senderId: string
   requesterId: string
+  /** Local public display metadata for presentation only. */
+  publicDisplayName?: string | null
   text: string
   timestamp: number
 }
@@ -148,6 +152,7 @@ export function toPassiveContext(message: PassiveContextMessage): AgentPassiveCo
     conversationId: message.conversationId,
     senderId: message.senderId,
     requesterId: message.requesterId,
+    publicDisplayName: message.publicDisplayName,
     text: message.text,
     timestamp: message.timestamp,
   }
@@ -195,6 +200,7 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     requesterRole: message.requesterRole,
     ownerConfigured: message.ownerConfigured,
     ownerDisplayName: message.ownerDisplayName,
+    publicDisplayName: message.publicDisplayName,
     privateDispatchTargetConversationId: message.conversationType === 'DIRECT'
       ? message.privateDispatchTargetConversationId
       : null,

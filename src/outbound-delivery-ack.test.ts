@@ -51,6 +51,7 @@ function rawMessage(messageId = REQUEST_ID, content = '@椰椰\u2005你好'): Ra
     requesterRole: 'OWNER',
     ownerConfigured: true,
     ownerDisplayName: null,
+    publicDisplayName: null,
     botMentionSpans: [{ start: 0, length: 4 }],
     userContentSpan: { start: 4, length: 2 },
   }
@@ -82,6 +83,7 @@ function inboundMessage(messageId: string, text: string): InboundMessage {
     requesterRole: 'OWNER',
     ownerConfigured: true,
     ownerDisplayName: null,
+    publicDisplayName: null,
     senderName: 'Synthetic Member',
     text,
     rawText: text,
