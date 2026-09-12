@@ -61,6 +61,7 @@ import {
 import { MemoryExtractor, type StructuredCompletion } from './memory-extractor.js'
 import type { MemoryStore } from './memory-store.js'
 import type { ConversationType, RequesterRole } from './message-contract.js'
+import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
 import {
   emitDiagnostic,
   type DiagnosticFields,
@@ -243,7 +244,10 @@ export interface MemoryReadRequest {
   userContentSpanTrust?: UserContentSpanTrust
 }
 
-export interface ExplicitMemoryRequest extends MemoryReadRequest {}
+export interface ExplicitMemoryRequest extends MemoryReadRequest {
+  requestDeadline?: RequestDeadline
+  msgIdToken?: string
+}
 
 export interface ExplicitMemoryResult {
   handled: boolean
@@ -494,7 +498,11 @@ export class MemoryService {
   }
 
   /** Admission + buffering. Never writes memory by itself. */
-  public observeHumanMessage(observation: MemoryObservation): void {
+  public observeHumanMessage(
+    observation: MemoryObservation,
+    requestDeadline?: RequestDeadline,
+    msgIdToken?: string,
+  ): void {
     if (!this.store.isEnabled) {
       this.emit('MEMORY_TRIGGER', { trigger: 'NONE', role: observation.requesterRole, result: 'SKIPPED', reason: 'STORE_UNAVAILABLE' })
       return
@@ -551,7 +559,7 @@ export class MemoryService {
 
     const trigger: MemoryFlushTrigger =
       count >= MEMORY_AUTO_FLUSH_BATCH_SIZE ? 'AUTO_BATCH' : 'AUTO_CHAT_THRESHOLD'
-    this.scheduleFlush(slot, batch, trigger)
+    this.scheduleFlush(slot, batch, trigger, requestDeadline, msgIdToken)
   }
 
   /** Diagnostic-only fail-closed path for an untrusted GROUP body claim. */
@@ -674,8 +682,19 @@ export class MemoryService {
     const candidates = this.store.retrieve(this.explicitCandidateRules(request), MEMORY_FINAL_LIMIT)
     let parsedMutation: MemoryMutationParseDiagnostics
     try {
-      parsedMutation = parseMemoryMutationDetailed(await this.mutate(mutationSystemPrompt(), mutationUserPrompt(request.question, candidates)))
-    } catch {
+      request.requestDeadline?.throwIfExpired()
+      const rawMutation = await this.mutate(
+        mutationSystemPrompt(),
+        mutationUserPrompt(request.question, candidates),
+        request.requestDeadline,
+        request.msgIdToken,
+      )
+      request.requestDeadline?.throwIfExpired()
+      parsedMutation = parseMemoryMutationDetailed(rawMutation)
+    } catch (error) {
+      if (isRequestDeadlineExceeded(error)) {
+        throw error
+      }
       this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: 'FAIL', reason: 'MUTATION_UNAVAILABLE' })
       return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
     }
@@ -793,8 +812,14 @@ export class MemoryService {
     }
   }
 
-  private scheduleFlush(slot: PendingSlot, batch: readonly BufferedEntry[], trigger: MemoryFlushTrigger): void {
-    const task: Promise<void> = this.flushAsync(slot, batch, trigger)
+  private scheduleFlush(
+    slot: PendingSlot,
+    batch: readonly BufferedEntry[],
+    trigger: MemoryFlushTrigger,
+    requestDeadline?: RequestDeadline,
+    msgIdToken?: string,
+  ): void {
+    const task: Promise<void> = this.flushAsync(slot, batch, trigger, requestDeadline, msgIdToken)
     this.pendingFlushes.add(task)
     void task.finally(() => {
       this.pendingFlushes.delete(task)
@@ -805,9 +830,18 @@ export class MemoryService {
     slot: PendingSlot,
     batch: readonly BufferedEntry[],
     trigger: MemoryFlushTrigger,
+    requestDeadline?: RequestDeadline,
+    msgIdToken?: string,
   ): Promise<void> {
     try {
-      const candidates = await this.extractor.extract('GROUP', batch.map((entry) => entry.message))
+      requestDeadline?.throwIfExpired()
+      const candidates = await this.extractor.extract(
+        'GROUP',
+        batch.map((entry) => entry.message),
+        requestDeadline,
+        msgIdToken,
+      )
+      requestDeadline?.throwIfExpired()
       let written = 0
       let skipped = 0
       for (const candidate of candidates) {

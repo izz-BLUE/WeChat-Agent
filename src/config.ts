@@ -11,6 +11,15 @@ function positiveInteger(name: string, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback
 }
 
+function strictPositiveInteger(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim() ?? ''
+  if (!/^\d+$/u.test(raw)) {
+    return fallback
+  }
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback
+}
+
 const botMode = process.env.BOT_MODE ?? 'smoke'
 
 if (botMode !== 'smoke' && botMode !== 'chat') {
@@ -71,6 +80,7 @@ export const config = {
   webSearchMaxResults: positiveInteger('WEB_SEARCH_MAX_RESULTS', 5),
   webSearchTimeoutMs: positiveInteger('WEB_SEARCH_TIMEOUT_MS', 8_000),
   webSearchMaxContextChars: positiveInteger('WEB_SEARCH_MAX_CONTEXT_CHARS', 6_000),
+  agentRequestDeadlineMs: strictPositiveInteger('AGENT_REQUEST_DEADLINE_MS', 50_000),
   agentTimeZone: process.env.AGENT_TIME_ZONE?.trim() || undefined,
 }
 

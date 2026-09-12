@@ -3,6 +3,7 @@ import {
   ProviderControlMarkupError,
   sanitizeFinalAnswer,
 } from './final-answer.js'
+import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
 
 export type OwnerPrivateDispatchAction = 'NOOP' | 'DISPATCH'
 
@@ -27,11 +28,11 @@ export interface OwnerPrivateDispatchPlannerResult {
 }
 
 export interface OwnerPrivateDispatchPlannerLike {
-  plan(question: string, forbiddenValues?: readonly string[]): Promise<OwnerPrivateDispatchPlannerResult>
+  plan(question: string, forbiddenValues?: readonly string[], deadline?: RequestDeadline, msgIdToken?: string): Promise<OwnerPrivateDispatchPlannerResult>
 }
 
 export interface StructuredOwnerPrivateDispatchCompletion {
-  (systemPrompt: string, userContent: string): Promise<string>
+  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string): Promise<string>
 }
 
 const PLANNER_SYSTEM_PROMPT = `你是 Owner Private Dispatch Planner，只负责判断已验证 OWNER 的 DIRECT 私聊请求是否应向已经绑定的 GROUP 另行发送一条消息。
@@ -173,17 +174,26 @@ export class OwnerPrivateDispatchPlanner implements OwnerPrivateDispatchPlannerL
   public async plan(
     question: string,
     forbiddenValues: readonly string[] = [],
+    deadline?: RequestDeadline,
+    msgIdToken?: string,
   ): Promise<OwnerPrivateDispatchPlannerResult> {
     const userPrompt = buildOwnerPrivateDispatchPlannerUserPrompt(question)
     let failureReason: OwnerPrivateDispatchPlannerFailure = 'COMPLETION_ERROR'
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       let raw: string
       try {
+        deadline?.throwIfExpired()
         raw = await this.completeStructured(
           attempt === 1 ? PLANNER_SYSTEM_PROMPT : PLANNER_REPAIR_SYSTEM_PROMPT,
           userPrompt,
+          deadline,
+          msgIdToken,
         )
+        deadline?.throwIfExpired()
       } catch (error) {
+        if (isRequestDeadlineExceeded(error)) {
+          throw error
+        }
         failureReason = error instanceof ProviderControlMarkupError
           ? 'PROVIDER_CONTROL_MARKUP'
           : 'COMPLETION_ERROR'

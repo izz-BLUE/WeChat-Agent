@@ -252,7 +252,7 @@ export class ProductionAgentTransportServer {
       envelope = parseInboundEnvelope(JSON.parse(line) as unknown)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Invalid inbound envelope'
-      await writeResponse(socket, { kind: 'ERROR', code: 'INVALID_INBOUND', message })
+      await this.writeResponse(socket, { kind: 'ERROR', code: 'INVALID_INBOUND', message }, 'NONE')
       this.persistentSink?.writeStructured(
         'INBOUND_INVALID',
         { result: 'INVALID_INBOUND', phase: 'parse', errorCode: 'INVALID_INBOUND' },
@@ -322,13 +322,13 @@ export class ProductionAgentTransportServer {
         result: response.kind,
         phase: 'pipeline',
         conversationType: identity.conversationType,
-        msgIdToken: this.persistentLog?.shortIdFor(envelope.message.msgId) ?? 'NONE',
+        msgIdToken: this.messageIdToken(envelope.message.msgId),
         conversationToken: identityToken(identity.conversationId),
         requesterToken: identityToken(identity.requesterId),
       },
       `status=${result.status}`,
     )
-    await writeResponse(socket, response)
+    await this.writeResponse(socket, response, this.messageIdToken(envelope.message.msgId))
     if (this.options.maxMessages !== undefined && this.messageCount >= this.options.maxMessages) {
       socket.end()
       await this.stop()
@@ -359,7 +359,7 @@ export class ProductionAgentTransportServer {
       },
       `outboundToken=${this.persistentLog?.shortIdFor(ack.outboundId) ?? 'NONE'}`,
     )
-    await writeResponse(socket, response)
+    await this.writeResponse(socket, response, this.messageIdToken(ack.requestMessageId))
   }
 
   private async processProactivePoll(socket: Socket): Promise<void> {
@@ -370,7 +370,7 @@ export class ProductionAgentTransportServer {
       command = null
     }
     if (command === null) {
-      await writeResponse(socket, { kind: 'NO_PROACTIVE_OUTBOUND' })
+      await this.writeResponse(socket, { kind: 'NO_PROACTIVE_OUTBOUND' }, 'NONE')
       return
     }
     this.persistentSink?.writeStructured(
@@ -378,7 +378,7 @@ export class ProductionAgentTransportServer {
       { result: 'COMMAND' },
       `outboundToken=${this.persistentLog?.shortIdFor(command.outboundId) ?? 'NONE'}`,
     )
-    await writeResponse(socket, { kind: 'PROACTIVE_OUTBOUND_COMMAND', ...command })
+    await this.writeResponse(socket, { kind: 'PROACTIVE_OUTBOUND_COMMAND', ...command }, this.messageIdToken(command.requestMessageId))
   }
 
   /**
@@ -415,13 +415,13 @@ export class ProductionAgentTransportServer {
         result: response.kind,
         phase: 'passive-context',
         conversationType: identity.conversationType,
-        msgIdToken: this.persistentLog?.shortIdFor(raw.msgId) ?? 'NONE',
+        msgIdToken: this.messageIdToken(raw.msgId),
         conversationToken: identityToken(identity.conversationId),
         requesterToken: identityToken(identity.requesterId),
       },
       `status=${result.status} agentInvoked=false outbound=false`,
     )
-    await writeResponse(socket, response)
+    await this.writeResponse(socket, response, this.messageIdToken(raw.msgId))
   }
 
   private async writeSummary(): Promise<void> {
@@ -432,6 +432,54 @@ export class ProductionAgentTransportServer {
     const path = this.options.summaryPath
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, `${JSON.stringify({ endpoint: this.pipePath, entries: this.summary }, null, 2)}\n`, 'utf8')
+  }
+
+  private messageIdToken(messageId: string | number): string {
+    return this.persistentLog?.shortIdFor(messageId) ?? identityToken(String(messageId)).slice(0, 6)
+  }
+
+  private async writeResponse(socket: Socket, response: AgentResponse, msgIdToken: string): Promise<void> {
+    const startedAt = Date.now()
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.write(`${JSON.stringify(response)}\n`, 'utf8', (error?: Error | null) => {
+          if (error) reject(error)
+          else resolve()
+        })
+      })
+      const fields = {
+        result: 'PASS',
+        reason: 'NONE',
+        responseKind: response.kind,
+        latencyMs: Date.now() - startedAt,
+        msgIdToken,
+      }
+      this.persistentSink?.writeStructured('TRANSPORT_RESPONSE_WRITE', fields)
+      console.log(
+        `[TRANSPORT_RESPONSE_WRITE] result=${fields.result} reason=${fields.reason} ` +
+        `responseKind=${fields.responseKind} latencyMs=${fields.latencyMs} msgIdToken=${fields.msgIdToken}`,
+      )
+    } catch (error) {
+      const reason = socket.destroyed || socket.writableEnded
+        ? 'SOCKET_ENDED'
+        : error instanceof Error
+          ? 'SOCKET_ERROR'
+          : 'UNKNOWN'
+      const fields = {
+        result: 'FAIL',
+        reason,
+        responseKind: response.kind,
+        latencyMs: Date.now() - startedAt,
+        msgIdToken,
+      }
+      this.persistentSink?.writeStructured('TRANSPORT_RESPONSE_WRITE', fields)
+      console.log(
+        `[TRANSPORT_RESPONSE_WRITE] result=${fields.result} reason=${fields.reason} ` +
+        `responseKind=${fields.responseKind} latencyMs=${fields.latencyMs} msgIdToken=${fields.msgIdToken}`,
+      )
+      const detail = error instanceof Error ? error.message : String(error)
+      console.error(`[PRODUCTION_AGENT_TRANSPORT_ERROR] response write failed: ${detail}`)
+    }
   }
 }
 
@@ -582,15 +630,6 @@ function toSummaryEntry(raw: RawHookMessage, result: AgentPipelineResult): Produ
     entry.text = agentResult.outboundCommand.text
   }
   return entry
-}
-
-function writeResponse(socket: Socket, response: AgentResponse): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    socket.write(`${JSON.stringify(response)}\n`, 'utf8', (error?: Error | null) => {
-      if (error) reject(error)
-      else resolve()
-    })
-  })
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

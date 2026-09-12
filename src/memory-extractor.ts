@@ -15,8 +15,14 @@
 import { sanitizeFinalAnswer } from './final-answer.js'
 import { MemoryText, type MemoryCandidate, type MemoryInputMessage, type MemoryScopeType } from './memory-models.js'
 import type { ConversationType } from './message-contract.js'
+import type { RequestDeadline } from './request-deadline.js'
 
-export type StructuredCompletion = (systemPrompt: string, userContent: string) => Promise<string>
+export type StructuredCompletion = (
+  systemPrompt: string,
+  userContent: string,
+  deadline?: RequestDeadline,
+  msgIdToken?: string,
+) => Promise<string>
 
 const EXTRACTOR_PROMPT = `你是微信群 AI 的长期记忆候选提取器。
 只根据用户消息提取以后可能有用的稳定事实、偏好或约定。
@@ -34,6 +40,8 @@ export class MemoryExtractor {
   public async extract(
     conversationType: ConversationType,
     messages: readonly MemoryInputMessage[],
+    deadline?: RequestDeadline,
+    msgIdToken?: string,
   ): Promise<MemoryCandidate[]> {
     if (messages.length === 0) {
       return []
@@ -44,7 +52,7 @@ export class MemoryExtractor {
       `messages:\n` +
       messages.map((message) => `[${message.speakerLabel} | ${message.role}]\n${MemoryText.forModel(message.content)}`).join('\n')
 
-    const response = await this.complete(EXTRACTOR_PROMPT, input)
+    const response = await this.complete(EXTRACTOR_PROMPT, input, deadline, msgIdToken)
     const boundary = sanitizeFinalAnswer(response)
     if (boundary.unterminatedTag || !boundary.text) {
       // Fail closed: an answer that is nothing but reasoning is not memory.

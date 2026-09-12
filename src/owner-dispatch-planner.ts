@@ -3,6 +3,7 @@ import {
   ProviderControlMarkupError,
   sanitizeFinalAnswer,
 } from './final-answer.js'
+import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
 
 export type OwnerDispatchAction = 'CHAT' | 'DISPATCH_NOW'
 
@@ -27,11 +28,11 @@ export interface OwnerDispatchPlannerResult {
 }
 
 export interface OwnerDispatchPlannerLike {
-  plan(question: string, forbiddenValues?: readonly string[]): Promise<OwnerDispatchPlannerResult>
+  plan(question: string, forbiddenValues?: readonly string[], deadline?: RequestDeadline, msgIdToken?: string): Promise<OwnerDispatchPlannerResult>
 }
 
 export interface StructuredOwnerDispatchCompletion {
-  (systemPrompt: string, userContent: string): Promise<string>
+  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string): Promise<string>
 }
 
 const PLANNER_SYSTEM_PROMPT = `你是 Owner Dispatch Planner，只负责判断已验证 OWNER 的当前 GROUP @ 请求是否应立即向当前群发送一条消息。
@@ -162,6 +163,8 @@ export class OwnerDispatchPlanner implements OwnerDispatchPlannerLike {
   public async plan(
     question: string,
     forbiddenValues: readonly string[] = [],
+    deadline?: RequestDeadline,
+    msgIdToken?: string,
   ): Promise<OwnerDispatchPlannerResult> {
     const userPrompt = buildOwnerDispatchPlannerUserPrompt(question)
     let failureReason: OwnerDispatchPlannerFailure = 'COMPLETION_ERROR'
@@ -169,11 +172,18 @@ export class OwnerDispatchPlanner implements OwnerDispatchPlannerLike {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       let raw: string
       try {
+        deadline?.throwIfExpired()
         raw = await this.completeStructured(
           attempt === 1 ? PLANNER_SYSTEM_PROMPT : PLANNER_REPAIR_SYSTEM_PROMPT,
           userPrompt,
+          deadline,
+          msgIdToken,
         )
+        deadline?.throwIfExpired()
       } catch (error) {
+        if (isRequestDeadlineExceeded(error)) {
+          throw error
+        }
         failureReason = error instanceof ProviderControlMarkupError
           ? 'PROVIDER_CONTROL_MARKUP'
           : 'COMPLETION_ERROR'

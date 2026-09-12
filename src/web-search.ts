@@ -6,6 +6,7 @@ export interface WebSearchRequest {
   days?: 1 | 3
   startDate?: string
   endDate?: string
+  signal?: AbortSignal
 }
 
 export type WebSearchMode = 'GENERAL' | 'NEWS_RECENT'
@@ -261,7 +262,9 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
       ? this.apiBase
       : `${this.apiBase.replace(/\/$/u, '')}/search`
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), request.timeoutMs)
+    const timeout = setTimeout(() => controller.abort(), Math.max(1, request.timeoutMs))
+    const abortExternal = (): void => controller.abort()
+    request.signal?.addEventListener('abort', abortExternal, { once: true })
     try {
       let response: Response
       try {
@@ -313,6 +316,7 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
       return { results: normalizeWebSearchResults(record.results).slice(0, request.maxResults) }
     } finally {
       clearTimeout(timeout)
+      request.signal?.removeEventListener('abort', abortExternal)
     }
   }
 }

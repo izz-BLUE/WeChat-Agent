@@ -4,6 +4,7 @@ import type { MemoryPromptItem } from './chat.js'
 import { detectProviderControlMarkup, ProviderControlMarkupError } from './final-answer.js'
 import { formatRuntimeTimeFacts, type RuntimeTimeFacts } from './runtime-time.js'
 import type { WebSearchMode } from './web-search.js'
+import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
 
 export type WebSearchAction = 'DIRECT' | 'SEARCH'
 export type WebSearchRecencyWindow = 'NONE' | 'DAY_1' | 'DAY_3'
@@ -45,11 +46,11 @@ export interface WebSearchPlannerResult {
 }
 
 export interface StructuredCompletion {
-  (systemPrompt: string, userContent: string): Promise<string>
+  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string): Promise<string>
 }
 
 export interface WebSearchPlannerLike {
-  plan(input: WebSearchPlanInput, forbiddenValues?: readonly string[]): Promise<WebSearchPlannerResult>
+  plan(input: WebSearchPlanInput, forbiddenValues?: readonly string[], deadline?: RequestDeadline, msgIdToken?: string): Promise<WebSearchPlannerResult>
 }
 
 const SEARCH_REASON_CODES = new Set<WebSearchReasonCode>([
@@ -263,18 +264,30 @@ export function formatWebSearchDecisionProtocol(decision: WebSearchDecision): st
 export class WebSearchPlanner implements WebSearchPlannerLike {
   public constructor(private readonly completeStructured: StructuredCompletion) {}
 
-  public async plan(input: WebSearchPlanInput, forbiddenValues: readonly string[] = []): Promise<WebSearchPlannerResult> {
+  public async plan(
+    input: WebSearchPlanInput,
+    forbiddenValues: readonly string[] = [],
+    deadline?: RequestDeadline,
+    msgIdToken?: string,
+  ): Promise<WebSearchPlannerResult> {
     const userPrompt = buildWebSearchPlannerUserPrompt(input)
     let failureReason: WebSearchPlannerFailure = 'COMPLETION_ERROR'
 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       let raw: string
       try {
+        deadline?.throwIfExpired()
         raw = await this.completeStructured(
           attempt === 1 ? PLANNER_SYSTEM_PROMPT : PLANNER_REPAIR_SYSTEM_PROMPT,
           userPrompt,
+          deadline,
+          msgIdToken,
         )
+        deadline?.throwIfExpired()
       } catch (error) {
+        if (isRequestDeadlineExceeded(error)) {
+          throw error
+        }
         failureReason = error instanceof ProviderControlMarkupError
           ? 'PROVIDER_CONTROL_MARKUP'
           : 'COMPLETION_ERROR'

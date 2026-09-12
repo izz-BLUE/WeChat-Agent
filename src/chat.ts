@@ -8,7 +8,7 @@ import {
 } from './group-ambient-context.js'
 import type { RequesterRole } from './message-contract.js'
 import { isInternalSpeakerLabel, statelessSpeakerLabel, type SpeakerDisplayFacts } from './speaker-labels.js'
-import { emitDiagnostic, type PersistentRuntimeLogSink } from './persistent-runtime-log.js'
+import { emitDiagnostic, formatDiagnosticLine, type PersistentRuntimeLogSink } from './persistent-runtime-log.js'
 import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import { appendGroundedSources, buildWebSearchContext, inspectGroundedSources, type WebSearchMode, type WebSearchResult, type WebSearchWindow } from './web-search.js'
 import { formatRuntimeTimeFacts, type RuntimeTimeFacts } from './runtime-time.js'
@@ -16,6 +16,8 @@ import { formatGroupStyleProfile, neutralGroupStyleProfile, type GroupStyleProfi
 import { formatConversationDynamicsProfile, type ConversationDynamicsProfile } from './conversation-dynamics.js'
 import { renderHumanChat } from './chat-renderer.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
+import { identityToken } from './identity-observer.js'
+import { isRequestDeadlineExceeded, type RequestDeadline, withRequestDeadline } from './request-deadline.js'
 
 /** The runtime's admission fact, handed to the model instead of being re-derived by it. */
 export type ChatMentionFact = 'MENTIONED' | 'NOT_MENTIONED' | 'UNKNOWN' | 'NOT_APPLICABLE'
@@ -332,7 +334,15 @@ const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 - 不得输出 URL、来源列表、修复说明、分析过程、思考过程或任何 provider 控制协议；只输出自然中文正文。
 - 不得输出任何身份标识、内部字段、Memory 原始元数据、conversation id、requester id、target id 或其它运行时内部值。`
 
-const WEB_SEARCH_GROUNDING_FAILURE_REPLY = '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。'
+export const WEB_SEARCH_GROUNDING_FAILURE_REPLY = '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。'
+export const REQUEST_DEADLINE_FALLBACK_REPLY = '这次处理有点超时了，稍后再问我一次。'
+export const MIN_GROUNDING_REPAIR_BUDGET_MS = 8_000
+
+function remainingBudgetBucket(remainingMs: number): string {
+  if (remainingMs <= 0) return 'EXHAUSTED'
+  if (remainingMs < 1_000) return '<1S'
+  return `${Math.floor(remainingMs / 1_000)}S`
+}
 
 interface PublicSpeakerPresentation {
   labelFor(publicDisplayName: string | null | undefined, internalLabel: string): string
@@ -645,6 +655,7 @@ export class ChatService {
     private readonly apiBase: string,
     private readonly apiKey: string,
     private readonly model: string,
+    private readonly structuredSink?: PersistentRuntimeLogSink,
   ) {}
 
   /**
@@ -661,8 +672,11 @@ export class ChatService {
     internalValues: readonly string[] = [],
     persistentSink?: PersistentRuntimeLogSink,
     messageId?: string,
+    deadline?: RequestDeadline,
   ): Promise<string> {
     const startedAt = Date.now()
+    const msgIdToken = identityToken(messageId).slice(0, 6)
+    deadline?.mark('FINAL_ANSWER')
     const groupStyle = request.groupStyle ?? neutralGroupStyleProfile()
     emitDiagnostic(
       (line: string) => console.log(line),
@@ -682,8 +696,8 @@ export class ChatService {
       'PROVIDER_CALL',
       {
         result: 'STARTED',
-        phase: 'provider-call',
-        msgIdToken: messageId ? messageId.slice(-6) : null,
+        phase: 'FINAL_ANSWER',
+        msgIdToken,
       },
       `contextCount=${context.length}`,
     )
@@ -703,8 +717,13 @@ export class ChatService {
         buildUserPrompt(context, question, request, presentation),
         persistentSink,
         messageId,
+        deadline,
+        'FINAL_ANSWER',
       )
     } catch (error) {
+      if (isRequestDeadlineExceeded(error)) {
+        throw error
+      }
       if (!(error instanceof ProviderControlMarkupError)) {
         throw error
       }
@@ -724,6 +743,8 @@ export class ChatService {
           buildUserPrompt(context, question, request, presentation),
           persistentSink,
           messageId,
+          deadline,
+          'PROVIDER_CONTROL_REPAIR',
         )
         emitDiagnostic(
           (line: string) => console.log(line),
@@ -732,6 +753,9 @@ export class ChatService {
           { stage: 'FINAL', result: 'REGENERATED', kinds: firstKinds },
         )
       } catch (repairError) {
+        if (isRequestDeadlineExceeded(repairError)) {
+          throw repairError
+        }
         const secondKinds = repairError instanceof ProviderControlMarkupError
           ? repairError.kinds.join('|')
           : firstKinds
@@ -769,30 +793,48 @@ export class ChatService {
           rewriteUserPrompt(context, question, request, draft, presentation),
           persistentSink,
           messageId,
+          deadline,
+          'ANSWER_GUARD_REGENERATION',
         )
         guard = guardFinalAnswer(rewritten, guardFacts)
-      } catch {
+      } catch (error) {
+        if (isRequestDeadlineExceeded(error)) {
+          throw error
+        }
         // A re-generation that fails or returns nothing keeps the draft blocked.
-        console.log('[AGENT_ANSWER_GUARD] outcome=BLOCKED reason=REGENERATION_FAILED')
+        console.log(formatDiagnosticLine('AGENT_ANSWER_GUARD', {
+          outcome: 'BLOCKED',
+          result: 'REGENERATION_FAILED',
+          msgIdToken,
+        }))
+        persistentSink?.writeStructured('ANSWER_GUARD', {
+          result: 'BLOCKED',
+          phase: 'regeneration',
+          errorCode: 'REGENERATION_FAILED',
+          msgIdToken,
+        })
       }
     }
 
-    console.log(
-      `[AGENT_ANSWER_GUARD] outcome=${guard.outcome} detections=${formatGuardDetections(guard.detections)} ` +
-        `regenerable=${guard.regenerable} finalAnswerChars=${guard.text.length}`,
-    )
-
-    const elapsedMs = Date.now() - startedAt
-    persistentSink?.writeStructured(
-      'ANSWER_GUARD',
-      {
-        result: guard.outcome,
-        phase: 'guard',
-        latencyMs: elapsedMs,
-        answerLength: guard.text.length,
-      },
-      `detections=${formatGuardDetections(guard.detections)} regenerable=${guard.regenerable}`,
-    )
+    const guardLatencyMs = Date.now() - startedAt
+    const guardDiagnostic = {
+      outcome: guard.outcome,
+      detections: formatGuardDetections(guard.detections),
+      regenerable: guard.regenerable,
+      finalAnswerChars: guard.text.length,
+      latencyMs: guardLatencyMs,
+      msgIdToken,
+    }
+    // Preserve the historical stdout event name while converging the durable
+    // structured event on ANSWER_GUARD.
+    console.log(formatDiagnosticLine('AGENT_ANSWER_GUARD', guardDiagnostic))
+    persistentSink?.writeStructured('ANSWER_GUARD', {
+      result: guard.outcome,
+      phase: 'guard',
+      latencyMs: guardLatencyMs,
+      answerLength: guard.text.length,
+      msgIdToken,
+    }, `detections=${formatGuardDetections(guard.detections)} regenerable=${guard.regenerable}`)
 
     if (guard.outcome === 'BLOCKED') {
       // Fail closed: an internal runtime label or a raw identity value is never
@@ -809,6 +851,7 @@ export class ChatService {
         changed: rendered !== guard.text,
         beforeChars: guard.text.length,
         afterChars: rendered.length,
+        msgIdToken,
       },
     )
     if (rendered.length === 0) {
@@ -820,7 +863,7 @@ export class ChatService {
         (line: string) => console.log(line),
         persistentSink,
         'WEB_SEARCH_SOURCE_USAGE',
-        { ...usage },
+        { ...usage, msgIdToken },
       )
     }
 
@@ -838,6 +881,7 @@ export class ChatService {
           validReferencedSourceCount: usage.validReferencedSourceCount,
           availableSourceCount: usage.availableSourceCount,
           result,
+          msgIdToken,
         },
       )
     }
@@ -858,8 +902,28 @@ export class ChatService {
       if (initialUsage.validReferencedSourceCount === 0) {
         reportSourceUsage(initialUsage)
 
+        const remainingMs = deadline?.remainingMs() ?? Number.POSITIVE_INFINITY
+        if (deadline !== undefined && remainingMs < MIN_GROUNDING_REPAIR_BUDGET_MS) {
+          emitDiagnostic(
+            (line: string) => console.log(line),
+            persistentSink,
+            'WEB_SEARCH_GROUNDING_REPAIR',
+            {
+              attempt: 0,
+              result: 'SKIPPED',
+              reason: 'REQUEST_DEADLINE_BUDGET',
+              remainingBucket: remainingBudgetBucket(remainingMs),
+              validReferencedSourceCount: initialUsage.validReferencedSourceCount,
+              msgIdToken,
+            },
+          )
+          reportGroundingGate('REPAIR', initialUsage, 'FAIL_CLOSED')
+          return WEB_SEARCH_GROUNDING_FAILURE_REPLY
+        }
+
         let repairedRendered: string | undefined
         let repairedUsage = initialUsage
+        deadline?.mark('GROUNDING_REPAIR')
         try {
           const repairedDraft = await this.requestFinalAnswer(
             `${buildSystemPrompt(request.botDisplayName)}\n${WEB_SEARCH_GROUNDING_REPAIR_RULES}`,
@@ -872,6 +936,8 @@ export class ChatService {
             ),
             persistentSink,
             messageId,
+            deadline,
+            'GROUNDING_REPAIR',
           )
           const repairedGuard = guardFinalAnswer(repairedDraft, guardFacts)
           if (repairedGuard.outcome !== 'BLOCKED') {
@@ -881,7 +947,10 @@ export class ChatService {
               repairedUsage = inspectGroundedSources(candidate, request.webSearch.results, internalValues)
             }
           }
-        } catch {
+        } catch (error) {
+          if (isRequestDeadlineExceeded(error)) {
+            throw error
+          }
           // A grounding repair failure must not resend the ungrounded original.
         }
 
@@ -894,6 +963,7 @@ export class ChatService {
             attempt: 1,
             result: repairPassed ? 'PASS' : 'FAIL',
             validReferencedSourceCount: repairedUsage.validReferencedSourceCount,
+            msgIdToken,
           },
         )
         reportGroundingGate('REPAIR', repairedUsage, repairPassed ? 'PASS' : 'FAIL_CLOSED')
@@ -925,62 +995,16 @@ export class ChatService {
    * `choices[0].message.content` is returned, so provider reasoning can never be
    * interpreted as a memory candidate.
    */
-  public async completeStructured(systemPrompt: string, userContent: string): Promise<string> {
-    const response = await fetch(`${this.apiBase}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userContent },
-        ],
-      }),
-    })
-
-    if (!response.ok) {
-      const detail = await response.text()
-      throw new Error(`Chat API returned ${response.status}: ${detail.slice(0, 300)}`)
-    }
-
-    const data = (await response.json()) as ChatCompletionResponse
-    const finalAnswer = extractFinalAnswer(data.choices?.[0]?.message)
-    if (finalAnswer.providerControlMarkup) {
-      throw new ProviderControlMarkupError(finalAnswer.providerControlKinds)
-    }
-    console.log(
-      `[AGENT_STRUCTURED_ANSWER] contentPresent=${finalAnswer.contentPresent} ` +
-        `reasoningFields=${finalAnswer.reasoningFields.join('|') || 'NONE'} ` +
-        `removedThinkingBlocks=${finalAnswer.removedBlocks} ` +
-        `unterminatedThinkingTag=${finalAnswer.unterminatedTag} ` +
-        `chars=${finalAnswer.text.length}`,
-    )
-
-    if (!finalAnswer.text) {
-      throw new Error('Chat API returned no final answer (reasoning is not structured output)')
-    }
-
-    return finalAnswer.text
-  }
-
-  /**
-   * Shared provider step for the reply path: one completion, the FINAL_ANSWER
-   * boundary, and a field-level trace of which carrier produced the text. An empty
-   * final answer fails closed instead of falling back to reasoning.
-   */
-  private async requestFinalAnswer(
+  public async completeStructured(
     systemPrompt: string,
     userContent: string,
-    persistentSink?: PersistentRuntimeLogSink,
-    messageId?: string,
+    deadline?: RequestDeadline,
+    msgIdToken = 'NONE',
   ): Promise<string> {
     const startedAt = Date.now()
-    let response: Response
-    try {
-      response = await fetch(`${this.apiBase}/chat/completions`, {
+    deadline?.mark('STRUCTURED_PROVIDER')
+    const execute = async (signal?: AbortSignal): Promise<ChatCompletionResponse> => {
+      const response = await fetch(`${this.apiBase}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -993,82 +1017,147 @@ export class ChatService {
             { role: 'user', content: userContent },
           ],
         }),
+        ...(signal === undefined ? {} : { signal }),
       })
-    } catch (cause) {
+
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(`Chat API returned ${response.status}: ${detail.slice(0, 300)}`)
+      }
+      return (await response.json()) as ChatCompletionResponse
+    }
+
+    try {
+      const data = deadline === undefined
+        ? await execute()
+        : await withRequestDeadline(deadline, (signal) => execute(signal))
+      const finalAnswer = extractFinalAnswer(data.choices?.[0]?.message)
+      if (finalAnswer.providerControlMarkup) {
+        throw new ProviderControlMarkupError(finalAnswer.providerControlKinds)
+      }
       const elapsedMs = Date.now() - startedAt
-      const detail = cause instanceof Error ? cause.message : String(cause)
-      persistentSink?.writeStructured(
-        'PROVIDER_CALL',
-        {
-          result: 'EXCEPTION',
-          phase: 'provider-call',
-          latencyMs: elapsedMs,
-          errorCode: 'CHAT_EXCEPTION',
-        },
-        `msgIdTail=${messageId ? messageId.slice(-6) : 'NONE'} detail=${detail.slice(0, 200)}`,
-      )
-      throw cause
-    }
-
-    if (!response.ok) {
-      const detail = await response.text()
-      const elapsedMs = Date.now() - startedAt
-      persistentSink?.writeStructured(
-        'PROVIDER_CALL',
-        {
-          result: 'HTTP_ERROR',
-          phase: 'provider-call',
-          latencyMs: elapsedMs,
-          errorCode: 'CHAT_HTTP_ERROR',
-        },
-        `msgIdTail=${messageId ? messageId.slice(-6) : 'NONE'} status=${response.status}`,
-      )
-      throw new Error(`Chat API returned ${response.status}: ${detail.slice(0, 300)}`)
-    }
-
-    const data = (await response.json()) as ChatCompletionResponse
-    const message = data.choices?.[0]?.message
-    const finalAnswer = extractFinalAnswer(message)
-    if (finalAnswer.providerControlMarkup) {
-      throw new ProviderControlMarkupError(finalAnswer.providerControlKinds)
-    }
-    const elapsedMs = Date.now() - startedAt
-
-    console.log(
-      `[AGENT_FINAL_ANSWER] source=content contentPresent=${finalAnswer.contentPresent} ` +
-        `reasoningFieldPresent=${finalAnswer.reasoningFields.length > 0} ` +
-        `reasoningFields=${finalAnswer.reasoningFields.join('|') || 'NONE'} ` +
-        `removedThinkingBlocks=${finalAnswer.removedBlocks} ` +
-        `unterminatedThinkingTag=${finalAnswer.unterminatedTag} ` +
-        `finalAnswerChars=${finalAnswer.text.length}`,
-    )
-
-    if (!finalAnswer.text) {
-      persistentSink?.writeStructured(
-        'PROVIDER_CALL',
-        {
-          result: 'EMPTY',
-          phase: 'provider-call',
-          latencyMs: elapsedMs,
-          errorCode: 'CHAT_EMPTY',
-        },
-        `msgIdTail=${messageId ? messageId.slice(-6) : 'NONE'}`,
-      )
-      // Fail closed: reasoning is never a reply fallback.
-      throw new Error('Chat API returned no final answer (reasoning is not a reply)')
-    }
-
-    persistentSink?.writeStructured(
-      'PROVIDER_CALL',
-      {
+      console.log(formatDiagnosticLine('AGENT_STRUCTURED_ANSWER', {
+        contentPresent: finalAnswer.contentPresent,
+        reasoningFields: finalAnswer.reasoningFields.join('|') || 'NONE',
+        removedThinkingBlocks: finalAnswer.removedBlocks,
+        unterminatedThinkingTag: finalAnswer.unterminatedTag,
+        chars: finalAnswer.text.length,
+        latencyMs: elapsedMs,
+        msgIdToken,
+      }))
+      if (!finalAnswer.text) {
+        throw new Error('Chat API returned no final answer (reasoning is not structured output)')
+      }
+      emitDiagnostic((line: string) => console.log(line), this.structuredSink, 'PROVIDER_CALL', {
         result: 'CLEAN',
-        phase: 'provider-call',
+        phase: 'STRUCTURED_PROVIDER',
+        latencyMs: elapsedMs,
+        msgIdToken,
+      })
+      return finalAnswer.text
+    } catch (error) {
+      const elapsedMs = Date.now() - startedAt
+      emitDiagnostic((line: string) => console.log(line), this.structuredSink, 'PROVIDER_CALL', {
+        result: isRequestDeadlineExceeded(error) ? 'DEADLINE' : 'EXCEPTION',
+        phase: 'STRUCTURED_PROVIDER',
+        latencyMs: elapsedMs,
+        errorCode: isRequestDeadlineExceeded(error) ? 'REQUEST_DEADLINE' : 'CHAT_EXCEPTION',
+        msgIdToken,
+      })
+      throw error
+    }
+  }
+
+  /**
+   * Shared provider step for the reply path: one completion, the FINAL_ANSWER
+   * boundary, and a field-level trace of which carrier produced the text. An empty
+   * final answer fails closed instead of falling back to reasoning.
+   */
+  private async requestFinalAnswer(
+    systemPrompt: string,
+    userContent: string,
+    persistentSink?: PersistentRuntimeLogSink,
+    messageId?: string,
+    deadline?: RequestDeadline,
+    phase = 'FINAL_ANSWER',
+  ): Promise<string> {
+    const startedAt = Date.now()
+    const msgIdToken = identityToken(messageId).slice(0, 6)
+    deadline?.mark(phase)
+    const execute = async (signal?: AbortSignal): Promise<ChatCompletionResponse> => {
+      const response = await fetch(`${this.apiBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
+          ],
+        }),
+        ...(signal === undefined ? {} : { signal }),
+      })
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(`Chat API returned ${response.status}: ${detail.slice(0, 300)}`)
+      }
+      return (await response.json()) as ChatCompletionResponse
+    }
+
+    try {
+      const data = deadline === undefined
+        ? await execute()
+        : await withRequestDeadline(deadline, (signal) => execute(signal))
+      const message = data.choices?.[0]?.message
+      const finalAnswer = extractFinalAnswer(message)
+      if (finalAnswer.providerControlMarkup) {
+        throw new ProviderControlMarkupError(finalAnswer.providerControlKinds)
+      }
+      const elapsedMs = Date.now() - startedAt
+      console.log(formatDiagnosticLine('AGENT_FINAL_ANSWER', {
+        source: 'content',
+        contentPresent: finalAnswer.contentPresent,
+        reasoningFieldPresent: finalAnswer.reasoningFields.length > 0,
+        reasoningFields: finalAnswer.reasoningFields.join('|') || 'NONE',
+        removedThinkingBlocks: finalAnswer.removedBlocks,
+        unterminatedThinkingTag: finalAnswer.unterminatedTag,
+        finalAnswerChars: finalAnswer.text.length,
+        latencyMs: elapsedMs,
+        phase,
+        msgIdToken,
+      }))
+      if (!finalAnswer.text) {
+        emitDiagnostic((line: string) => console.log(line), persistentSink, 'PROVIDER_CALL', {
+          result: 'EMPTY',
+          phase,
+          latencyMs: elapsedMs,
+          answerLength: 0,
+          errorCode: 'CHAT_EMPTY',
+          msgIdToken,
+        })
+        throw new Error('Chat API returned no final answer (reasoning is not a reply)')
+      }
+      emitDiagnostic((line: string) => console.log(line), persistentSink, 'PROVIDER_CALL', {
+        result: 'CLEAN',
+        phase,
         latencyMs: elapsedMs,
         answerLength: finalAnswer.text.length,
-      },
-      `msgIdTail=${messageId ? messageId.slice(-6) : 'NONE'}`,
-    )
-
-    return finalAnswer.text
+        msgIdToken,
+      })
+      return finalAnswer.text
+    } catch (cause) {
+      const elapsedMs = Date.now() - startedAt
+      emitDiagnostic((line: string) => console.log(line), persistentSink, 'PROVIDER_CALL', {
+        result: isRequestDeadlineExceeded(cause) ? 'DEADLINE' : 'EXCEPTION',
+        phase,
+        latencyMs: elapsedMs,
+        errorCode: isRequestDeadlineExceeded(cause) ? 'REQUEST_DEADLINE' : 'CHAT_EXCEPTION',
+        msgIdToken,
+      })
+      throw cause
+    }
   }
 }

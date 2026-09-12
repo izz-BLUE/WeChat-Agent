@@ -1,4 +1,10 @@
-import { ChatService, type ChatMentionFact, type ChatPromptMessage, type MemoryPromptItem } from './chat.js'
+import {
+  ChatService,
+  REQUEST_DEADLINE_FALLBACK_REPLY,
+  type ChatMentionFact,
+  type ChatPromptMessage,
+  type MemoryPromptItem,
+} from './chat.js'
 import { sanitizeFinalAnswer } from './final-answer.js'
 import {
   ABSENT_BOT_MENTION_SPANS,
@@ -56,6 +62,8 @@ import {
   type OwnerPrivateDispatchPlannerLike,
 } from './owner-private-dispatch-planner.js'
 import { isGroupConversationId, isVerifiedOwnerDirect } from './message-contract.js'
+import { isRequestDeadlineExceeded, RequestDeadline, withRequestDeadline } from './request-deadline.js'
+import { identityToken } from './identity-observer.js'
 import {
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
@@ -171,6 +179,7 @@ export interface ProductionChatAgentOptions {
   webSearchMaxResults?: number
   webSearchTimeoutMs?: number
   webSearchMaxContextChars?: number
+  requestDeadlineMs?: number
   runtimeClock?: RuntimeClock
   runtimeTimeZone?: string
   pendingOutboundMaxEntries?: number
@@ -193,6 +202,7 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly webSearchMaxResults: number
   private readonly webSearchTimeoutMs: number
   private readonly webSearchMaxContextChars: number
+  private readonly requestDeadlineMs: number
   private readonly runtimeClock: RuntimeClock
   private readonly runtimeTimeZone: string | undefined
   private readonly pendingOutbound: PendingOutboundReplyStore
@@ -212,6 +222,7 @@ export class ProductionChatAgent implements AgentExecutor {
     this.webSearchMaxResults = options.webSearchMaxResults ?? config.webSearchMaxResults
     this.webSearchTimeoutMs = options.webSearchTimeoutMs ?? config.webSearchTimeoutMs
     this.webSearchMaxContextChars = options.webSearchMaxContextChars ?? config.webSearchMaxContextChars
+    this.requestDeadlineMs = options.requestDeadlineMs ?? config.agentRequestDeadlineMs
     this.runtimeClock = options.runtimeClock ?? { now: () => new Date() }
     this.runtimeTimeZone = options.runtimeTimeZone ?? config.agentTimeZone
     this.pendingOutbound = new PendingOutboundReplyStore({
@@ -344,8 +355,50 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   public async complete(request: AgentRequest): Promise<string> {
+    const deadline = new RequestDeadline(this.requestDeadlineMs)
+    const msgIdToken = this.persistentLog?.shortIdFor(request.messageId) ?? identityToken(request.messageId).slice(0, 6)
+    let result: 'COMPLETED' | 'DEADLINE_FALLBACK' = 'COMPLETED'
+    try {
+      const answer = await this.completeWithinDeadline(request, deadline, msgIdToken)
+      deadline.throwIfExpired()
+      return answer
+    } catch (error) {
+      if (!isRequestDeadlineExceeded(error)) {
+        throw error
+      }
+      result = 'DEADLINE_FALLBACK'
+      this.stageOutbound(request, REQUEST_DEADLINE_FALLBACK_REPLY, msgIdToken)
+      return REQUEST_DEADLINE_FALLBACK_REPLY
+    } finally {
+      const elapsedMs = Date.now() - deadline.startedAt
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+        'AGENT_REQUEST_DEADLINE',
+        {
+          budgetMs: this.requestDeadlineMs,
+          elapsedMs,
+          plannerLatencyMs: deadline.phaseLatencyMs('WEB_SEARCH_PLANNER'),
+          searchLatencyMs: deadline.phaseLatencyMs('WEB_SEARCH'),
+          finalAnswerLatencyMs: deadline.phaseLatencyMs('FINAL_ANSWER'),
+          groundingRepairLatencyMs: deadline.phaseLatencyMs('GROUNDING_REPAIR'),
+          totalRequestLatencyMs: elapsedMs,
+          remainingMs: deadline.remainingMs(),
+          result,
+          phase: deadline.phase,
+          msgIdToken,
+        },
+      )
+    }
+  }
+
+  private async completeWithinDeadline(
+    request: AgentRequest,
+    deadline: RequestDeadline,
+    msgIdToken: string,
+  ): Promise<string> {
     if (isVerifiedOwnerDirect(request)) {
-      return this.tryOwnerPrivateDispatch(request)
+      return this.tryOwnerPrivateDispatch(request, deadline, msgIdToken)
     }
 
     // One immutable snapshot is shared by the Planner and final-answer prompt.
@@ -472,6 +525,7 @@ export class ProductionChatAgent implements AgentExecutor {
     this.context.append(request.conversationId, question, request.messageId)
 
     if (this.memory) {
+      deadline.mark('MEMORY_EXPLICIT')
       // Historical order: explicit memory intent short-circuits the chat turn,
       // then the message feeds the automatic extractor, then retrieval. All three
       // see the SAME canonical text the chat turn will see.
@@ -489,13 +543,15 @@ export class ProductionChatAgent implements AgentExecutor {
         botMentionSpanTrust: spanFacts.trust,
         botMentionSpanCount: spanFacts.spans.length,
         userContentSpanTrust: userContentSpan.trust,
+        requestDeadline: deadline,
+        msgIdToken,
       })
       if (explicit.handled) {
         return explicit.reply
       }
     }
 
-    if (await this.tryOwnerDispatch(request, question.text)) {
+    if (await this.tryOwnerDispatch(request, question.text, deadline, msgIdToken)) {
       return ''
     }
 
@@ -513,7 +569,7 @@ export class ProductionChatAgent implements AgentExecutor {
           text: question.text,
           timestamp: request.timestamp,
           chatTriggered: true,
-        })
+        }, deadline, msgIdToken)
       }
     }
 
@@ -534,6 +590,8 @@ export class ProductionChatAgent implements AgentExecutor {
       memory,
       request,
       runtimeTime,
+      deadline,
+      msgIdToken,
     )
 
     const answer = await this.chatService.reply(
@@ -564,12 +622,17 @@ export class ProductionChatAgent implements AgentExecutor {
       guardValues(request),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-chat') : undefined,
       request.messageId,
+      deadline,
     )
 
+    deadline.throwIfExpired()
+    this.stageOutbound(request, answer, msgIdToken)
+    return answer
+  }
+
+  private stageOutbound(request: AgentRequest, answer: string, msgIdToken: string): void {
     const outboundText = sanitizeFinalAnswer(answer).text
-    if (!outboundText) {
-      return answer
-    }
+    if (!outboundText) return
     const identity = this.pendingOutbound.stage({
       requestMessageId: request.messageId,
       conversationType: request.conversationType,
@@ -581,15 +644,19 @@ export class ProductionChatAgent implements AgentExecutor {
     if (this.persistentLog) {
       new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver').writeStructured(
         'PENDING_OUTBOUND',
-        { result: 'STAGED', chars: outboundText.length },
+        { result: 'STAGED', chars: outboundText.length, msgIdToken },
         `outboundIdToken=${this.persistentLog.shortIdFor(identity.outboundId)}`,
       )
     }
 
-    return answer
   }
 
-  private async tryOwnerDispatch(request: AgentRequest, question: string): Promise<boolean> {
+  private async tryOwnerDispatch(
+    request: AgentRequest,
+    question: string,
+    deadline: RequestDeadline,
+    msgIdToken: string,
+  ): Promise<boolean> {
     const authorized = request.conversationType === 'GROUP' &&
       request.requesterRole === 'OWNER' &&
       request.mentionState === 'MENTIONED' &&
@@ -603,8 +670,11 @@ export class ProductionChatAgent implements AgentExecutor {
 
     let plan
     try {
-      plan = await this.ownerDispatchPlanner.plan(question, guardValues(request))
-    } catch {
+      deadline.mark('OWNER_DISPATCH_PLANNER')
+      plan = await this.ownerDispatchPlanner.plan(question, guardValues(request), deadline, msgIdToken)
+      deadline.throwIfExpired()
+    } catch (error) {
+      if (isRequestDeadlineExceeded(error)) throw error
       this.logOwnerDispatch('CHAT', 'FAIL', 'PLANNER_EXCEPTION')
       return false
     }
@@ -630,7 +700,11 @@ export class ProductionChatAgent implements AgentExecutor {
     return true
   }
 
-  private async tryOwnerPrivateDispatch(request: AgentRequest): Promise<string> {
+  private async tryOwnerPrivateDispatch(
+    request: AgentRequest,
+    deadline: RequestDeadline,
+    msgIdToken: string,
+  ): Promise<string> {
     const target = request.privateDispatchTargetConversationId?.trim() ?? ''
     if (!target) {
       this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'TARGET_UNBOUND')
@@ -647,8 +721,11 @@ export class ProductionChatAgent implements AgentExecutor {
 
     let plan
     try {
-      plan = await this.ownerPrivateDispatchPlanner.plan(request.text, guardValues(request))
-    } catch {
+      deadline.mark('OWNER_PRIVATE_DISPATCH_PLANNER')
+      plan = await this.ownerPrivateDispatchPlanner.plan(request.text, guardValues(request), deadline, msgIdToken)
+      deadline.throwIfExpired()
+    } catch (error) {
+      if (isRequestDeadlineExceeded(error)) throw error
       this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', 'PLANNER_EXCEPTION')
       return ''
     }
@@ -723,6 +800,8 @@ export class ProductionChatAgent implements AgentExecutor {
     authorizedMemory: readonly MemoryPromptItem[],
     request: AgentRequest,
     runtimeTime: RuntimeTimeFacts,
+    deadline: RequestDeadline,
+    msgIdToken: string,
   ): Promise<{
     used: boolean
     status: 'PASS' | 'FAILED'
@@ -735,6 +814,7 @@ export class ProductionChatAgent implements AgentExecutor {
       return undefined
     }
 
+    deadline.mark('WEB_SEARCH_PLANNER')
     const planner = await this.webSearchPlanner.plan(
       {
         question,
@@ -744,7 +824,10 @@ export class ProductionChatAgent implements AgentExecutor {
         runtimeTime,
       },
       guardValues(request),
+      deadline,
+      msgIdToken,
     )
+    deadline.throwIfExpired()
     const revalidated = parseWebSearchDecisionProtocol(
       formatWebSearchDecisionProtocol(planner.decision),
       guardValues(request),
@@ -767,6 +850,7 @@ export class ProductionChatAgent implements AgentExecutor {
         queryChars: decision.query?.length ?? 0,
         plannerAttempts: planner.attempts ?? 1,
         failureReason,
+        msgIdToken,
       },
     )
 
@@ -792,9 +876,9 @@ export class ProductionChatAgent implements AgentExecutor {
     })
 
     if (this.webSearchProvider === null) {
-      this.logWebSearchExecution(mode, primaryWindow, 1, 'FAILED', 0)
-      this.logWebSearch('FAIL', 0, 'DISABLED')
-      this.logWebSearchContext(0, 0, false)
+      this.logWebSearchExecution(mode, primaryWindow, 1, 'FAILED', 0, msgIdToken)
+      this.logWebSearch('FAIL', 0, 'DISABLED', msgIdToken)
+      this.logWebSearchContext(0, 0, false, msgIdToken)
       return failed(primaryWindow)
     }
 
@@ -802,32 +886,35 @@ export class ProductionChatAgent implements AgentExecutor {
       const attempt = index + 1
       try {
         const days = window === 'DAY_1' ? 1 : window === 'DAY_3' ? 3 : undefined
-        const response = await this.webSearchProvider.search({
-          query: decision.query,
+        deadline.mark('WEB_SEARCH')
+        deadline.throwIfExpired()
+        const response = await withRequestDeadline(deadline, (signal) => this.webSearchProvider!.search({
+          query: decision.query!,
           maxResults: this.webSearchMaxResults,
-          timeoutMs: this.webSearchTimeoutMs,
+          timeoutMs: Math.min(this.webSearchTimeoutMs, Math.max(1, deadline.remainingMs())),
           mode,
+          signal,
           ...(days === undefined ? {} : {
             days: days as 1 | 3,
             startDate: dateDaysBefore(runtimeTime.localDate, days - 1),
             endDate: runtimeTime.localDate,
           }),
-        })
+        }))
         const normalized = normalizeWebSearchResults(response.results)
         if (normalized.length === 0) {
-          this.logWebSearchExecution(mode, window, attempt, 'NO_RESULTS', 0)
-          this.logWebSearch('FAIL', 0, 'NO_RESULTS')
-          this.logWebSearchContext(0, 0, false)
+          this.logWebSearchExecution(mode, window, attempt, 'NO_RESULTS', 0, msgIdToken)
+          this.logWebSearch('FAIL', 0, 'NO_RESULTS', msgIdToken)
+          this.logWebSearchContext(0, 0, false, msgIdToken)
           if (attempt < windows.length) {
             continue
           }
           return failed(window)
         }
 
-        this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length)
+        this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length, msgIdToken)
         const bounded = buildWebSearchContext(normalized, this.webSearchMaxContextChars)
-        this.logWebSearch('PASS', bounded.results.length, 'NONE')
-        this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated)
+        this.logWebSearch('PASS', bounded.results.length, 'NONE', msgIdToken)
+        this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
         if (bounded.results.length === 0) {
           return failed(window)
         }
@@ -840,12 +927,13 @@ export class ProductionChatAgent implements AgentExecutor {
           window,
         }
       } catch (error) {
+        if (isRequestDeadlineExceeded(error)) throw error
         const reason: WebSearchFailureReason = error instanceof WebSearchError
           ? error.reason
           : 'HTTP_ERROR'
-        this.logWebSearchExecution(mode, window, attempt, 'FAILED', 0)
-        this.logWebSearch('FAIL', 0, reason)
-        this.logWebSearchContext(0, 0, false)
+        this.logWebSearchExecution(mode, window, attempt, 'FAILED', 0, msgIdToken)
+        this.logWebSearch('FAIL', 0, reason, msgIdToken)
+        this.logWebSearchContext(0, 0, false, msgIdToken)
         return failed(window)
       }
     }
@@ -859,30 +947,36 @@ export class ProductionChatAgent implements AgentExecutor {
     attempt: number,
     result: 'PASS' | 'NO_RESULTS' | 'FAILED',
     resultCount: number,
+    msgIdToken: string,
   ): void {
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
       'WEB_SEARCH_EXECUTION',
-      { mode, window, attempt, result, resultCount },
+      { mode, window, attempt, result, resultCount, msgIdToken },
     )
   }
 
-  private logWebSearch(result: 'PASS' | 'FAIL', resultCount: number, reason: WebSearchFailureReason | 'NONE'): void {
+  private logWebSearch(
+    result: 'PASS' | 'FAIL',
+    resultCount: number,
+    reason: WebSearchFailureReason | 'NONE',
+    msgIdToken: string,
+  ): void {
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
       'WEB_SEARCH',
-      { result, resultCount, reason },
+      { result, resultCount, reason, msgIdToken },
     )
   }
 
-  private logWebSearchContext(resultCount: number, chars: number, truncated: boolean): void {
+  private logWebSearchContext(resultCount: number, chars: number, truncated: boolean, msgIdToken: string): void {
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
       'WEB_SEARCH_CONTEXT',
-      { resultCount, chars, truncated },
+      { resultCount, chars, truncated, msgIdToken },
     )
   }
 }
@@ -924,9 +1018,12 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
   }
 
   validateChatConfig()
-  const chatService = new ChatService(config.openAiApiBase, config.openAiApiKey, config.openAiModel)
+  const chatSink = options.persistentLog
+    ? new PersistentRuntimeLogSink(options.persistentLog, 'agent-chat')
+    : undefined
+  const chatService = new ChatService(config.openAiApiBase, config.openAiApiKey, config.openAiModel, chatSink)
   const webSearchPlanner = config.webSearchEnabled
-    ? new WebSearchPlanner((system, user) => chatService.completeStructured(system, user))
+    ? new WebSearchPlanner((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken))
     : null
   const webSearchProvider = config.webSearchEnabled
     ? new TavilyWebSearchProvider(config.tavilyApiBase, config.tavilyApiKey)
@@ -939,10 +1036,11 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     webSearchMaxResults: config.webSearchMaxResults,
     webSearchTimeoutMs: config.webSearchTimeoutMs,
     webSearchMaxContextChars: config.webSearchMaxContextChars,
+    requestDeadlineMs: config.agentRequestDeadlineMs,
     runtimeTimeZone: config.agentTimeZone,
-    ownerDispatchPlanner: new OwnerDispatchPlanner((system, user) => chatService.completeStructured(system, user)),
+    ownerDispatchPlanner: new OwnerDispatchPlanner((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken)),
     ownerPrivateDispatchPlanner: new OwnerPrivateDispatchPlanner(
-      (system, user) => chatService.completeStructured(system, user),
+      (system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken),
     ),
   })
 }
@@ -989,8 +1087,8 @@ export function createMemoryService(
   })
   return new MemoryService({
     store,
-    extractor: new MemoryExtractor((system, user) => chatService.completeStructured(system, user)),
-    mutate: (system, user) => chatService.completeStructured(system, user),
+    extractor: new MemoryExtractor((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken)),
+    mutate: (system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken),
     enableTimer: true,
     sink,
   })
