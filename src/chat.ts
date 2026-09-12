@@ -18,7 +18,12 @@ import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import { appendGroundedSources, buildWebSearchContext, inspectGroundedSources, type WebSearchMode, type WebSearchResult, type WebSearchWindow } from './web-search.js'
 import { formatRuntimeTimeFacts, type RuntimeTimeFacts } from './runtime-time.js'
 import { formatGroupStyleProfile, neutralGroupStyleProfile, type GroupStyleProfile } from './group-style.js'
-import { formatConversationDynamicsProfile, type ConversationDynamicsProfile } from './conversation-dynamics.js'
+import {
+  deriveGroupReplyPressure,
+  formatConversationDynamicsProfile,
+  type ConversationDynamicsProfile,
+  type GroupReplyPressure,
+} from './conversation-dynamics.js'
 import { renderHumanChat } from './chat-renderer.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
 import { identityToken } from './identity-observer.js'
@@ -88,6 +93,8 @@ export interface ChatRequestContext {
   groupStyle?: GroupStyleProfile
   /** Deterministic, transient structure facts observed from historical group chatter. */
   conversationDynamics?: ConversationDynamicsProfile
+  /** Deterministic, transient pressure fact derived from conversation dynamics. */
+  groupReplyPressure?: GroupReplyPressure
   /** One bounded external-search result set, or a failed search status. */
   webSearch?: {
     used: boolean
@@ -145,8 +152,18 @@ const CONVERSATION_DYNAMICS_RULES = `[Conversation Dynamics]
 - CONTINUITY=FOLLOW_UP_LIKELY 时，倾向把当前消息当作正在进行的对话继续理解，结合 Recent Group Context / Ambient Context 承接前文；不要无必要重新介绍刚讲过的背景或重新定义已经解释过的概念。简单追问优先直接回答，不要写成新报告。
 - 这只是结构提示，不是语义事实：上下文证据不足时不要强行续接，也不要把别人的话归给当前请求者。
 - CONTINUITY=INTERRUPTED 或 PARTICIPATION=MULTI_PARTY 时，更谨慎确认当前消息对应哪段讨论；不要默认当前用户一定在回复椰椰上一句话，必要时自然补一个短背景。
-- PARTICIPATION=FOCUSED 可以稍微更像一对一聊天；PACE=HIGH 时默认表达更紧凑，除非问题本身明确要求详细技术解释。
+- PARTICIPATION=FOCUSED 可以稍微更像一对一聊天；回复深度以 [Group Reply Pressure] 提供的可信事实为准，不要从 PARTICIPATION/PACE 自行计算压力。
 - 无论这些结构字段是什么，都不能改变 authorization、Memory、Tool、Search、mention、Owner capability 或任何 side-effect contract。`
+
+const GROUP_REPLY_PRESSURE_RULES = `[Group Reply Pressure]
+[Group Reply Pressure: TRUSTED_RUNTIME_FACT] 是 Runtime 根据群聊结构派生的普通回复深度参考，不是语义分类器、权限、Memory、Search、Tool、是否回复或硬性字符上限。
+- GROUP_REPLY_PRESSURE=HIGH：普通群聊默认非常紧凑，通常 1～3 句；简单 reaction / acknowledgement 通常一句即可，不主动补背景、不主动重新解释上一主题、不主动展开成教程或报告。
+- GROUP_REPLY_PRESSURE=MEDIUM：普通回答保持紧凑，只讲解决当前问题必要的信息。
+- GROUP_REPLY_PRESSURE=LOW：不额外施加群聊长度压力，但仍遵守正常的自然表达规则。
+- 如果当前消息主要是 reaction、acknowledgement 或情绪回应，且没有提出新的明确问题、任务或信息请求，只做自然短回应，可以轻微承接前文，不要凭历史上下文脑补一个新的复杂问题，也不要主动展开部署、架构、合规或性能等话题。
+- reaction 中如果同时有明确问题、任务或信息请求，仍按当前任务回答，不要把它当作纯 reaction。
+- 当前消息明确要求详细解释、教程、步骤或代码，或要求分析、比较、总结、故事、长文本创作，或任务客观上需要充分信息时，可以自然突破 Reply Pressure；Reply Pressure 是 soft response-depth constraint，不是 hard limit。
+- 不要在生成后按字符数或句数截断答案；代码、引用、步骤和安全说明必须保持完整。`
 
 const TURN_OWNERSHIP_RULES = `[Turn Ownership Rules]
 - 每条历史 ASSISTANT 消息都必须按运行时提供的 Assistant reply ownership 理解；它不等于“最近一个人说完后机器人就默认在回复当前提问者”。
@@ -337,6 +354,7 @@ ${RUNTIME_TIME_RULES}
 ${TOOL_RUNTIME_RULES}
 ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
+${GROUP_REPLY_PRESSURE_RULES}
 ${REPLY_BOUNDARY_RULES}`
 }
 
@@ -355,6 +373,7 @@ ${ASSISTANT_IDENTITY_BOUNDARY_RULES}
 ${MEMORY_SIDE_EFFECT_GROUNDING_RULES}
 ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
+${GROUP_REPLY_PRESSURE_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
 只输出改写后的中文回复本身，不要解释，不要输出思考过程，不要输出 <think> 标签。`
 
@@ -520,6 +539,14 @@ function conversationDynamicsSection(profile: ConversationDynamicsProfile | unde
   return `\n\n[Conversation Dynamics: RUNTIME_STRUCTURAL_REFERENCE]\n${formatConversationDynamicsProfile(profile)}`
 }
 
+function groupReplyPressureSection(
+  pressure: GroupReplyPressure | undefined,
+): string {
+  return pressure === undefined
+    ? ''
+    : `\n\n[Group Reply Pressure: TRUSTED_RUNTIME_FACT]\nGROUP_REPLY_PRESSURE=${pressure}`
+}
+
 function discloseWebSearchFailure(answer: string): string {
   if (/(?:刚刚|刚才)?(?:查到|搜索到)|(?:联网|搜索)结果(?:显示|表明)/u.test(answer)) {
     return '当前没有成功取得联网结果，无法可靠确认最新情况。'
@@ -613,6 +640,11 @@ export function buildUserPrompt(
   const currentRequesterActiveContext = request.currentRequesterActiveContext ?? []
   const otherMemberActiveContext = request.otherMemberActiveContext ?? []
   const assistantRuntime = request.assistantRuntime ?? createTrustedAssistantRuntimeFacts(request.botDisplayName)
+  const groupReplyPressure = request.groupReplyPressure ?? (
+    request.conversationDynamics === undefined
+      ? undefined
+      : deriveGroupReplyPressure(request.conversationDynamics)
+  )
   const memoryTruthfulnessSection = request.memoryMutationThisTurn === undefined
     ? ''
     : `\n\n[Memory Truthfulness Runtime Fact]\nMEMORY_MUTATION_THIS_TURN=${request.memoryMutationThisTurn}`
@@ -634,6 +666,7 @@ export function buildUserPrompt(
       : `[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(request.runtimeTime)}\n\n`) +
     groupStyleSection(request.groupStyle) +
     conversationDynamicsSection(request.conversationDynamics) +
+    groupReplyPressureSection(groupReplyPressure) +
     '\n\n' +
     `[Trusted Assistant Runtime Facts]\n${formatAssistantRuntimeFacts(assistantRuntime)}\n\n` +
     `[Runtime Facts]\n${runtimeFacts(context, request, selfIdentityQuery)}` +

@@ -53,7 +53,7 @@ import {
 } from './persistent-runtime-log.js'
 import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from './runtime-time.js'
 import { observeGroupStyle } from './group-style.js'
-import { observeConversationDynamics } from './conversation-dynamics.js'
+import { deriveGroupReplyPressure, observeConversationDynamics } from './conversation-dynamics.js'
 import { type OwnerDispatchPlannerLike, OwnerDispatchPlanner } from './owner-dispatch-planner.js'
 import {
   OwnerPrivateDispatchPlanner,
@@ -489,6 +489,9 @@ export class ProductionChatAgent implements AgentExecutor {
           currentRequesterId: request.requesterId,
         })
       : undefined
+    const groupReplyPressure = conversationDynamics === undefined
+      ? undefined
+      : deriveGroupReplyPressure(conversationDynamics)
 
     if (conversationDynamics !== undefined) {
       emitDiagnostic(
@@ -505,6 +508,17 @@ export class ProductionChatAgent implements AgentExecutor {
           participation: conversationDynamics.participation,
           pace: conversationDynamics.pace,
           continuity: conversationDynamics.continuity,
+          result: 'PASS',
+        },
+      )
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+        'GROUP_REPLY_PRESSURE',
+        {
+          pressure: groupReplyPressure,
+          participation: conversationDynamics.participation,
+          pace: conversationDynamics.pace,
           result: 'PASS',
         },
       )
@@ -617,6 +631,7 @@ export class ProductionChatAgent implements AgentExecutor {
         runtimeTime,
         groupStyle,
         conversationDynamics,
+        groupReplyPressure,
         currentRequesterActiveContext: request.conversationType === 'GROUP'
           ? activeContext.currentRequester
           : undefined,

@@ -24,6 +24,9 @@ export type ConversationParticipation = 'QUIET' | 'FOCUSED' | 'MULTI_PARTY'
 
 export type ConversationPace = 'LOW' | 'MEDIUM' | 'HIGH'
 
+/** Coarse transient pressure for ordinary group reply depth. */
+export type GroupReplyPressure = 'LOW' | 'MEDIUM' | 'HIGH'
+
 export interface ConversationDynamicsProfile {
   activeTurnCount: number
   ambientLineCount: number
@@ -45,6 +48,20 @@ export interface ConversationDynamicsObservationInput {
   currentSpeakerLabel: string
   /** Trusted requester identity, used only to classify historical active turns. */
   currentRequesterId?: string
+}
+
+/**
+ * Derive response-depth pressure from structure only. This is not a semantic
+ * classifier and does not decide whether the current message needs detail.
+ */
+export function deriveGroupReplyPressure(profile: ConversationDynamicsProfile): GroupReplyPressure {
+  if (profile.participation === 'MULTI_PARTY' && profile.pace === 'HIGH') {
+    return 'HIGH'
+  }
+  if (profile.participation === 'MULTI_PARTY' || profile.pace === 'HIGH') {
+    return 'MEDIUM'
+  }
+  return 'LOW'
 }
 
 /** Explicit bounds keep the profile small, explainable and deterministic. */

@@ -10,6 +10,7 @@ import {
 } from './chat.js'
 import type { GroupMessage } from './context.js'
 import {
+  deriveGroupReplyPressure,
   formatConversationDynamicsProfile,
   observeConversationDynamics,
   type ConversationDynamicsProfile,
@@ -108,6 +109,13 @@ await test('empty-history-is-neutral', () => {
   assert.equal(profile.activeTurnCount, 0)
   assert.equal(profile.ambientLineCount, 0)
   assert.equal(profile.pace, 'LOW')
+})
+
+await test('reply-pressure-derivation-is-structural', () => {
+  assert.equal(deriveGroupReplyPressure(observe([active('MEMBER_1', 'event-1'), active('MEMBER_2', 'event-2'), active('MEMBER_3', 'event-3'), active('MEMBER_4', 'event-4'), active('MEMBER_5', 'event-5'), active('MEMBER_6', 'event-6'), active('MEMBER_7', 'event-7')])), 'HIGH')
+  assert.equal(deriveGroupReplyPressure(observe([active('MEMBER_1', 'event-1'), active('MEMBER_2', 'event-2'), active('MEMBER_3', 'event-3'), active('MEMBER_4', 'event-4'), active('MEMBER_5', 'event-5')])), 'MEDIUM')
+  assert.equal(deriveGroupReplyPressure(observe([active('MEMBER_1', 'event-1'), active('MEMBER_1', 'event-2'), active('MEMBER_1', 'event-3'), active('MEMBER_1', 'event-4'), active('MEMBER_1', 'event-5'), active('MEMBER_1', 'event-6'), active('MEMBER_1', 'event-7')], [], 'MEMBER_1')), 'MEDIUM')
+  assert.equal(deriveGroupReplyPressure(observe([active('MEMBER_1', 'event-1')])), 'LOW')
 })
 
 await test('same-requester-after-assistant-is-follow-up-likely', () => {
@@ -242,6 +250,7 @@ await test('production-computes-before-current-request-is-appended', async () =>
   assert.equal(profile.activeTurnCount, 0)
   assert.equal(profile.ambientLineCount, 1)
   assert.equal(profile.continuity, 'NONE')
+  assert.equal(captured[0]?.groupReplyPressure, 'LOW')
 })
 
 await test('direct-request-does-not-generate-dynamics', async () => {
@@ -289,6 +298,7 @@ await test('dynamics-diagnostic-is-safe-and-persistent', async () => {
       .map((name) => readFileSync(join(directory, name), 'utf8'))
       .join('\n')
     assert(durable.includes('CONVERSATION_DYNAMICS'))
+    assert(durable.includes('GROUP_REPLY_PRESSURE'))
     assert(durable.includes('result=PASS'))
     for (const forbidden of ['diagnostic-request', 'requester-1', 'room@chatroom', '当前请求正文']) {
       assert(!durable.includes(forbidden), `diagnostic log leaked ${forbidden}`)
