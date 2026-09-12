@@ -239,6 +239,11 @@ export function toOutboundCommand(
   result: AgentResult,
   identity?: OutboundIdentity | null,
 ): OutboundCommand | null {
+  if (isVerifiedOwnerDirect(message)) {
+    // Verified DIRECT is an Agent command channel only. Its destination is never
+    // an outbound recipient; private dispatch is staged as GROUP proactive work.
+    return null
+  }
   if (result.kind !== 'SUCCESS_TEXT') {
     return null
   }

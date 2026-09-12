@@ -3,6 +3,7 @@ import { createConnection } from 'node:net'
 import {
   applyMentionPolicy,
   runRawAgentPipeline,
+  toOutboundCommand,
   type AgentRequest,
 } from './agent-adapter.js'
 import { ChatService } from './chat.js'
@@ -151,6 +152,7 @@ async function main(): Promise<void> {
   assert.equal(normalized.policy.status, 'PROCESS_PRIVATE_OWNER')
   assert.equal(normalized.request.requesterSource, DIRECT_OWNER_FIELD_VERIFIED)
   assert.equal(normalized.request.requesterRole, 'OWNER')
+  assert.equal(toOutboundCommand(normalized.normalization.message, { kind: 'SUCCESS_TEXT', text: 'must not send direct' }), null)
 
   const generic = await runRawAgentPipeline(rawDirect({ requesterId: OWNER, requesterSource: 'DIRECT_IDENTITY_UNVERIFIED', requesterRole: 'OWNER' }), { complete: async () => { throw new Error('must not invoke') } })
   assert.deepEqual(generic.status === 'IGNORED' ? generic.policy : null, {
