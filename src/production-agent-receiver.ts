@@ -36,6 +36,7 @@ import {
   formatWebSearchDecisionProtocol,
   WebSearchPlanner,
   parseWebSearchDecisionProtocol,
+  type WebSearchRecencyWindow,
   type WebSearchPlannerLike,
 } from './web-search-planner.js'
 import {
@@ -102,12 +103,6 @@ function redactUntrustedGroupIds(text: string, request: AgentRequest): string {
     redacted = redacted.split(value).join(UNTRUSTED_GROUP_ID_PLACEHOLDER)
   }
   return redacted
-}
-
-/** This only selects a bounded NEWS_RECENT window after Planner admission. */
-function isTodayScopedNewsQuestion(question: string): boolean {
-  const normalized = question.trim().toLocaleLowerCase()
-  return ['今天', '今日', 'today'].some((token) => normalized.includes(token))
 }
 
 function dateDaysBefore(localDate: string, days: number): string {
@@ -675,7 +670,7 @@ export class ProductionChatAgent implements AgentExecutor {
     )
     const decision = planner.result === 'PASS' && revalidated.valid
       ? revalidated.decision
-      : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const, mode: 'GENERAL' as const }
+      : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const, mode: 'GENERAL' as const, recencyWindow: 'NONE' as const }
     const decisionResult = planner.result === 'PASS' && revalidated.valid ? 'PASS' : 'FAIL'
     const failureReason = planner.result === 'PASS' && !revalidated.valid
       ? revalidated.failureReason
@@ -699,9 +694,12 @@ export class ProductionChatAgent implements AgentExecutor {
     }
 
     const mode = decision.mode
-    const primaryWindow: WebSearchWindow = mode === 'NEWS_RECENT'
-      ? isTodayScopedNewsQuestion(question) ? 'DAY_1' : 'DAY_3'
-      : 'GENERAL'
+    const recencyWindow: WebSearchRecencyWindow = decision.recencyWindow
+    const primaryWindow: WebSearchWindow = recencyWindow === 'DAY_1'
+      ? 'DAY_1'
+      : recencyWindow === 'DAY_3'
+        ? 'DAY_3'
+        : 'GENERAL'
     const windows = primaryWindow === 'DAY_1' ? ['DAY_1', 'DAY_3'] as const : [primaryWindow] as const
     const failed = (window: WebSearchWindow) => ({
       used: true as const,
