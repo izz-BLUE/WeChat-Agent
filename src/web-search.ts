@@ -20,6 +20,9 @@ export interface GroundedSourceUsage {
   searchUsed: true
   availableSourceCount: number
   referencedSourceCount: number
+  validReferencedSourceCount: number
+  selectedSourceCount: number
+  removedDanglingMarkerCount: number
   appendedSourceCount: number
   result: 'PASS' | 'NO_REFERENCED_SOURCE'
 }
@@ -151,18 +154,34 @@ export function appendGroundedSources(
     .filter((sourceId): sourceId is string => sourceId !== undefined && sourceById.has(sourceId))
   const groundedIds = [...new Set(referencedIds)]
   const selected = groundedIds.map((sourceId) => sourceById.get(sourceId)!).slice(0, 3)
+  const selectedIds = new Set(selected.map((item) => item.sourceId))
+  let removedDanglingMarkerCount = 0
 
-  reportUsage?.({
-    searchUsed: true,
-    availableSourceCount: safeResults.length,
-    referencedSourceCount: groundedIds.length,
-    appendedSourceCount: selected.length,
-    result: selected.length > 0 ? 'PASS' : 'NO_REFERENCED_SOURCE',
-  })
+  const groundedAnswer = answer
+    .replace(/https?:\/\/[^\s)\]}>]+/gu, (url) => {
+      return safeResults.some((item) => item.url === url) ? url : ''
+    })
+    .replace(/\[(S\d+)\]/gu, (marker, sourceId: string) => {
+      if (selectedIds.has(sourceId)) {
+        return marker
+      }
+      removedDanglingMarkerCount += 1
+      return ''
+    })
 
-  const groundedAnswer = answer.replace(/https?:\/\/[^\s)\]}>]+/gu, (url) => {
-    return safeResults.some((item) => item.url === url) ? url : ''
-  })
+  if (reportUsage !== undefined) {
+    reportUsage({
+      searchUsed: true,
+      availableSourceCount: safeResults.length,
+      referencedSourceCount: groundedIds.length,
+      validReferencedSourceCount: groundedIds.length,
+      selectedSourceCount: selected.length,
+      removedDanglingMarkerCount,
+      appendedSourceCount: selected.length,
+      result: selected.length > 0 ? 'PASS' : 'NO_REFERENCED_SOURCE',
+    })
+  }
+
   if (selected.length === 0) {
     return groundedAnswer
   }

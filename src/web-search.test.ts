@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { appendGroundedSources, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type WebSearchProvider, type WebSearchResult } from './web-search.js'
+import { appendGroundedSources, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebSearchProvider, type WebSearchResult } from './web-search.js'
 import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { ChatService } from './chat.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
@@ -184,12 +184,22 @@ async function main(): Promise<void> {
       result('S2', '来源二', 'https://example.com/two'),
       result('S3', '来源三', 'https://example.com/three'),
     ]
-    const usage: Array<{ searchUsed: boolean; availableSourceCount: number; referencedSourceCount: number; appendedSourceCount: number; result: string }> = []
+    const usage: GroundedSourceUsage[] = []
     const unreferenced = appendGroundedSources('Memory-derived answer.', results, [], (diagnostic) => usage.push(diagnostic))
     check(unreferenced === 'Memory-derived answer.', 'unreferenced search results were appended')
     check(usage[0]?.searchUsed === true && usage[0]?.availableSourceCount === 3, 'source availability diagnostic is incomplete')
     check(usage[0]?.referencedSourceCount === 0 && usage[0]?.appendedSourceCount === 0, 'unreferenced source diagnostic is incorrect')
     check(usage[0]?.result === 'NO_REFERENCED_SOURCE', 'unreferenced source result is not explicit')
+
+    const four = appendGroundedSources('A[S2] B[S1] C[S3] D[S4]', [
+      ...results,
+      result('S4', '来源四', 'https://example.com/four'),
+    ], [], (diagnostic) => usage.push(diagnostic))
+    check(four.includes('A[S2] B[S1] C[S3] D'), 'the first three source markers were not preserved')
+    check(!four.includes('[S4]'), 'a dangling source marker survived the source cap')
+    check(four.includes('来源：\n1. 来源二 https://example.com/two\n2. 来源一 https://example.com/one\n3. 来源三 https://example.com/three'), 'selected sources were not appended in marker order')
+    check(usage[1]?.validReferencedSourceCount === 4 && usage[1]?.selectedSourceCount === 3, 'source selection diagnostic counts are incorrect')
+    check(usage[1]?.removedDanglingMarkerCount === 1 && usage[1]?.appendedSourceCount === 3, 'dangling marker diagnostic count is incorrect')
 
     const first = appendGroundedSources('结论[S1]', results)
     check(first.includes('来源一 https://example.com/one'), 'referenced S1 was not appended')
@@ -206,14 +216,18 @@ async function main(): Promise<void> {
     check(duplicate.split('来源一').length === 2, 'duplicate source was appended more than once')
 
     const invalid = appendGroundedSources('结论[S99]', results)
-    check(invalid === '结论[S99]', 'unknown source id fabricated a source')
+    check(invalid === '结论', 'unknown source marker survived cleanup')
+
+    const mixed = appendGroundedSources('结论[S1][S99]', results)
+    check(mixed.includes('结论[S1]') && !mixed.includes('[S99]'), 'valid and unknown source markers were not separated')
+    check(mixed.includes('来源一 https://example.com/one') && !mixed.includes('来源二'), 'mixed marker sources were not grounded exactly once')
 
     const rawUrl = appendGroundedSources('结论[S1] https://evil.example/fabricated', results)
     check(!rawUrl.includes('https://evil.example/fabricated'), 'model-created URL survived grounding')
     check(rawUrl.includes('[S1]'), 'valid source marker was removed from answer body')
 
     const forbidden = appendGroundedSources('结论[S1]', [result('S1', REQUESTER_ID, 'https://example.com/private')], [REQUESTER_ID])
-    check(forbidden === '结论[S1]', 'forbidden identity-bearing source was appended')
+    check(forbidden === '结论', 'forbidden identity-bearing source marker survived cleanup')
   })
 
   await test('source attribution diagnostics are count-only and never carry source data', async () => {
