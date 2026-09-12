@@ -168,6 +168,76 @@ async function main(): Promise<void> {
   assert.equal(parseOwnerPrivateDispatchProtocol(`ACTION=DISPATCH\nMESSAGE=${OWNER}`, [OWNER, PEER]).valid, false)
   assert.equal(parseOwnerPrivateDispatchProtocol(`ACTION=DISPATCH\nMESSAGE=${'x'.repeat(501)}`).valid, false)
 
+  const rewriteFixtures = [
+    {
+      input: '帮我跟大家说一下今晚十点开会，别迟到',
+      message: '大家今晚十点开会，别迟到。',
+    },
+    {
+      input: '你帮我问一下大家今晚谁有空，晚点一起看看那个问题',
+      message: '大家今晚谁有空？晚点一起看看那个问题。',
+    },
+    {
+      input: '跟大家说部署好了，辛苦大家',
+      message: '部署已经好了，大家辛苦了。',
+    },
+    {
+      input: '帮我跟大家说一下，今晚部署应该差不多了，让他们有问题直接群里说',
+      message: '今晚部署应该差不多了，大家有问题直接在群里说就行。',
+    },
+  ] as const
+  const commandShells = ['帮我跟大家说', '你跟群里说一下', '替我通知一下', '帮我问问大家', '跟大家说']
+  let rewritePlannerCalls = 0
+  let rewritePlannerSystem = ''
+  for (const fixture of rewriteFixtures) {
+    const planner = new OwnerPrivateDispatchPlanner(async (system, user) => {
+      rewritePlannerCalls += 1
+      rewritePlannerSystem = system
+      assert.equal(user, `[Canonical Private Owner Request]\n${fixture.input}`)
+      return `ACTION=DISPATCH\nMESSAGE=${fixture.message}`
+    })
+    const planned = await planner.plan(fixture.input)
+    assert.equal(planned.result, 'PASS')
+    assert.deepEqual(planned.decision, { action: 'DISPATCH', message: fixture.message })
+    assert.equal(planned.attempts, 1)
+    for (const shell of commandShells) {
+      assert.equal(fixture.message.includes(shell), false, `final group message kept command shell: ${shell}`)
+    }
+  }
+  assert.equal(rewritePlannerCalls, rewriteFixtures.length)
+  for (const rule of [
+    'DISPATCH 的 MESSAGE 不是对 OWNER 原话的机械转述，而是一条可以直接发到群里的自然成品消息',
+    '去掉私聊指令壳',
+    '群体询问要自然化为直接问群成员的问题',
+    '不得新增原文没有的时间、地点、人名、数字、原因、事实、结论、承诺或情绪评价',
+    '不确定性和请求语气必须保留',
+    '原文“今晚开会”不得变成“今晚十点开会”',
+    '原文“部署好了”不得变成“生产环境已经全部部署完成”',
+    '原文“让大家注意一下”不得自行猜测注意服务器、代码、上线、数据库',
+    '当前 private path 不提供安全的群聊历史或 deterministic style profile',
+  ]) {
+    assert.equal(rewritePlannerSystem.includes(rule), true, `planner prompt lost rewrite rule: ${rule}`)
+  }
+
+  const noNewFactFixtures = [
+    { input: '今晚开会', message: '大家今晚开会。', added: '十点' },
+    { input: '办公室开会', message: '大家在办公室开会。', added: '会议室' },
+    { input: '两个人参加', message: '两个人参加。', added: '三个人' },
+    { input: '小王负责', message: '小王负责。', added: '小李' },
+    { input: '因为下雨取消', message: '因为下雨取消。', added: '临时安排' },
+  ] as const
+  for (const fixture of noNewFactFixtures) {
+    assert.equal(fixture.message.includes(fixture.added), false)
+    assert.equal(parseOwnerPrivateDispatchProtocol(`ACTION=DISPATCH\nMESSAGE=${fixture.message}`).valid, true)
+  }
+
+  for (const input of ['你觉得虚拟线程怎么样', '帮我分析这个问题', '帮我写一段通知', '帮我查新闻']) {
+    const planner = new OwnerPrivateDispatchPlanner(async () => 'ACTION=NOOP\nMESSAGE=')
+    const planned = await planner.plan(input)
+    assert.equal(planned.result, 'PASS')
+    assert.deepEqual(planned.decision, { action: 'NOOP', message: null })
+  }
+
   let plannerCalls = 0
   const repairPlanner = new OwnerPrivateDispatchPlanner(async () => {
     plannerCalls += 1
