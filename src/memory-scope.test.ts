@@ -28,7 +28,7 @@ import {
   MemoryService,
 } from './memory-service.js'
 import { MemoryStore, isReleaseArtifactPath, memoryFileIn } from './memory-store.js'
-import { MemoryText, type MemoryInputMessage, type MemoryScopeType, type MemoryVisibility } from './memory-models.js'
+import { MemoryText, type MemoryInputMessage, type MemoryOrigin, type MemoryScopeType, type MemoryVisibility } from './memory-models.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { SpeakerLabelRegistry, isPseudonymousMemberLabel } from './speaker-labels.js'
 
@@ -321,6 +321,7 @@ function seed(
     scopeId: string
     content: string
     visibility?: MemoryVisibility
+    origin?: MemoryOrigin
     updatedAt?: number
   },
 ): void {
@@ -331,7 +332,7 @@ function seed(
     content: options.content,
     contentHash: '',
     visibility: options.visibility ?? 'SHARED',
-    origin: 'AUTOMATIC',
+    origin: options.origin ?? (options.scopeType === 'GROUP' ? 'EXPLICIT_OWNER' : 'AUTOMATIC'),
     sourceConversationType: 'GROUP',
     sourceConversationId: 'room-a@chatroom',
     sourceSenderId: options.scopeId,
@@ -431,8 +432,8 @@ async function testCrossGroupPersonalContinuity(): Promise<void> {
 
 /** 5. Group shared memory is visible to every member of that room. */
 async function testGroupSharedSameRoomVisibility(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"GROUP","content":"本群活动时间是周五"}]'] })
-  await feed(harness.service, 3, { signature: 'sig-a', conversationId: 'room-a@chatroom' })
+  const harness = createHarness()
+  seed(harness.store, { scopeType: 'GROUP', scopeId: 'room-a@chatroom', content: '本群活动时间是周五' })
 
   const a = await retrieve(harness.service, { signature: 'sig-a', question: '本群活动时间' })
   const b = await retrieve(harness.service, { signature: 'sig-b', question: '本群活动时间' })
@@ -442,8 +443,8 @@ async function testGroupSharedSameRoomVisibility(): Promise<void> {
 
 /** 6. Group memory is keyed by conversation, never by requester. */
 async function testGroupCrossRoomIsolation(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"GROUP","content":"本群活动时间是周五"}]'] })
-  await feed(harness.service, 3, { signature: 'sig-a', conversationId: 'room-a@chatroom' })
+  const harness = createHarness()
+  seed(harness.store, { scopeType: 'GROUP', scopeId: 'room-a@chatroom', content: '本群活动时间是周五' })
 
   const otherRoom = await retrieve(harness.service, {
     signature: 'sig-a',

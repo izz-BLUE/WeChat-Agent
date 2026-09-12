@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GroupContext } from './context.js'
 import { MemoryExtractor } from './memory-extractor.js'
-import type { MemoryScopeType } from './memory-models.js'
+import type { MemoryOrigin, MemoryScopeType } from './memory-models.js'
 import { MemoryService } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { PersistentRuntimeLog, PersistentRuntimeLogSink } from './persistent-runtime-log.js'
@@ -204,7 +204,7 @@ function observe(
 
 function seed(
   store: MemoryStore,
-  options: { memoryId: string; scopeType: MemoryScopeType; scopeId: string; content: string },
+  options: { memoryId: string; scopeType: MemoryScopeType; scopeId: string; content: string; origin?: MemoryOrigin },
 ): void {
   const status = store.add({
     memoryId: options.memoryId,
@@ -213,7 +213,7 @@ function seed(
     content: options.content,
     contentHash: '',
     visibility: 'SHARED',
-    origin: 'AUTOMATIC',
+    origin: options.origin ?? (options.scopeType === 'GROUP' ? 'EXPLICIT_OWNER' : 'AUTOMATIC'),
     sourceConversationType: 'GROUP',
     sourceConversationId: ROOM,
     sourceSenderId: options.scopeId,

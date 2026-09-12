@@ -30,7 +30,7 @@ import { ChatService, buildSystemPrompt, type ChatRequestContext } from './chat.
 import { MENTION_SEPARATOR } from './canonical-user-text.js'
 import { GroupAmbientContext } from './group-ambient-context.js'
 import { MemoryExtractor } from './memory-extractor.js'
-import type { MemoryContextItem, MemoryScopeType, MemoryVisibility } from './memory-models.js'
+import type { MemoryContextItem, MemoryOrigin, MemoryScopeType, MemoryVisibility } from './memory-models.js'
 import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import { MemoryService } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
@@ -219,6 +219,7 @@ interface SeedOptions {
   scopeId: string
   content: string
   visibility?: MemoryVisibility
+  origin?: MemoryOrigin
   updatedAt?: number
 }
 
@@ -231,7 +232,7 @@ function seed(store: MemoryStore, options: SeedOptions): void {
     content: options.content,
     contentHash: '',
     visibility: options.visibility ?? 'SHARED',
-    origin: 'AUTOMATIC',
+    origin: options.origin ?? (options.scopeType === 'GROUP' ? 'EXPLICIT_OWNER' : 'AUTOMATIC'),
     sourceConversationType: 'GROUP',
     sourceConversationId: ROOM_A,
     sourceSenderId: options.scopeId,

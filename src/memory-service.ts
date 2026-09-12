@@ -938,6 +938,9 @@ export class MemoryService {
     }
 
     let scopeType: MemoryScopeType
+    if (candidate.scopeType === MEMORY_SCOPE_GROUP && !isRequesterLocalPreference(subject, kind)) {
+      return { rejection: 'AUTOMATIC_GROUP_SCOPE_NOT_WRITABLE' }
+    }
     if (isRequesterLocalPreference(subject, kind)) {
       // The semantic subject is authoritative for requester-local preferences:
       // a malformed extractor scope must not turn one person's preference into
@@ -1000,6 +1003,7 @@ export class MemoryService {
 
   private readableRecords(records: readonly MemoryRecord[]): MemoryRecord[] {
     return records.filter((record) =>
+      !isHistoricalAutomaticGroupRecord(record) &&
       isReadableMemoryKind(record.kind, record.content, record.subject) &&
       !isDirtyRequesterLocalPreference(record),
     )
@@ -1081,6 +1085,10 @@ function isDirtyRequesterLocalPreference(record: MemoryRecord): boolean {
   }
   const kind = classifyMemoryKind(record.content, record.kind)
   return isRequesterLocalPreference(record.subject, kind)
+}
+
+function isHistoricalAutomaticGroupRecord(record: MemoryRecord): boolean {
+  return record.origin === 'AUTOMATIC' && record.scopeType === MEMORY_SCOPE_GROUP
 }
 
 function explicitAddReply(status: MemoryWriteStatus): string {

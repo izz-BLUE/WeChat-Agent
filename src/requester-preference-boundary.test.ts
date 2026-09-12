@@ -13,7 +13,7 @@ import { MemoryExtractor } from './memory-extractor.js'
 import { MemoryService } from './memory-service.js'
 import { MemoryStore } from './memory-store.js'
 import type { MemoryKind, MemorySubject } from './assistant-identity.js'
-import type { MemoryRecord, MemoryScopeType } from './memory-models.js'
+import type { MemoryOrigin, MemoryRecord, MemoryScopeType } from './memory-models.js'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -114,6 +114,7 @@ function record(
   content: string,
   kind: MemoryKind,
   subject: MemorySubject,
+  origin: MemoryOrigin = scopeType === 'GROUP' ? 'EXPLICIT_OWNER' : 'AUTOMATIC',
 ): MemoryRecord {
   return {
     memoryId,
@@ -122,7 +123,7 @@ function record(
     content,
     contentHash: '',
     visibility: 'SHARED',
-    origin: 'AUTOMATIC',
+    origin,
     sourceConversationType: 'GROUP',
     sourceConversationId: roomId,
     sourceSenderId: 'sig-a',

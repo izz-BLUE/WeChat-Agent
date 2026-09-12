@@ -32,7 +32,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryExtractor } from './memory-extractor.js'
-import type { MemoryAccessRule, MemoryRecord, MemoryScopeType, MemoryVisibility } from './memory-models.js'
+import type { MemoryAccessRule, MemoryOrigin, MemoryRecord, MemoryScopeType, MemoryVisibility } from './memory-models.js'
 import {
   evaluateMemoryRelevance,
   evaluateRelevance,
@@ -119,6 +119,7 @@ function seed(
     scopeId: string
     content: string
     visibility?: MemoryVisibility
+    origin?: MemoryOrigin
   },
 ): void {
   const status = store.add({
@@ -128,7 +129,7 @@ function seed(
     content: options.content,
     contentHash: '',
     visibility: options.visibility ?? 'SHARED',
-    origin: 'AUTOMATIC',
+    origin: options.origin ?? (options.scopeType === 'GROUP' ? 'EXPLICIT_OWNER' : 'AUTOMATIC'),
     sourceConversationType: 'GROUP',
     sourceConversationId: ROOM_A,
     sourceSenderId: options.scopeId,

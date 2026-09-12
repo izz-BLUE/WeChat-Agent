@@ -21,7 +21,7 @@ import { runRawAgentPipeline, toAgentRequest, type AgentRequest } from './agent-
 import type { ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
 import { MemoryExtractor } from './memory-extractor.js'
-import type { MemoryScopeType } from './memory-models.js'
+import type { MemoryOrigin, MemoryScopeType } from './memory-models.js'
 import { MemoryService, MEMORY_TIMER_INTERVAL_MS } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { normalizeRawHookMessage, type InboundMessage, type RawHookMessage } from './message-contract.js'
@@ -199,6 +199,7 @@ function seed(
     scopeType: MemoryScopeType
     scopeId: string
     content: string
+    origin?: MemoryOrigin
     updatedAt?: number
   },
 ): void {
@@ -209,7 +210,7 @@ function seed(
     content: options.content,
     contentHash: '',
     visibility: 'SHARED',
-    origin: 'AUTOMATIC',
+    origin: options.origin ?? (options.scopeType === 'GROUP' ? 'EXPLICIT_OWNER' : 'AUTOMATIC'),
     sourceConversationType: 'GROUP',
     sourceConversationId: ROOM_A,
     sourceSenderId: options.scopeId,
@@ -290,9 +291,11 @@ async function testDuplicateKeyNeverDuplicatesARecord(): Promise<void> {
   await feed(spaced.service, 3, { text: FACT })
   assert(memoryRecordCount(spaced.service) === 1, `a normalized duplicate wrote ${memoryRecordCount(spaced.service)} records`)
 
-  // 3. The key is per scope: the same content in a different scope is a new record.
-  const scoped = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"},{"scope":"GROUP","content":"${FACT}"}]`] })
+  // 3. The key is per scope: a legal explicit GROUP record with the same
+  // content is a new record, while automatic GROUP extraction is rejected.
+  const scoped = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"}]`] })
   await feed(scoped.service, 3, { text: FACT })
+  seed(scoped.store, { memoryId: 'scoped-group', scopeType: 'GROUP', scopeId: ROOM_A, content: FACT })
   assert(memoryRecordCount(scoped.service) === 2, `distinct scopes collapsed into ${memoryRecordCount(scoped.service)} records`)
 
   // 4. Across a restart: a fresh store loads the persisted hash and still skips.
