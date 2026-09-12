@@ -153,19 +153,60 @@ function testPromptFallbackRemainsPseudonymous(): void {
   assert.doesNotMatch(prompt, /Liya/u)
 }
 
-function testGuardAllowsConfirmedRoleLikeName(): void {
-  const allowed = guardFinalAnswer('管理员说的这件事我先记下了。', {
-    selfIdentityQuery: true,
+function testSelfIdentityNeverUsesPublicNameExemption(): void {
+  for (const draft of ['我是管理员。', '我是群主。', '我是老板。', '你是主人。']) {
+    const blocked = guardFinalAnswer(draft, {
+      selfIdentityQuery: true,
+      retrievedPersonalMemoryCount: 0,
+    })
+    assert.equal(blocked.outcome, 'BLOCKED', draft)
+  }
+}
+
+function testNormalChatAllowsRoleLikePublicName(): void {
+  const ordinary = guardFinalAnswer('管理员刚才说得对。', {
+    selfIdentityQuery: false,
     retrievedPersonalMemoryCount: 0,
-    publicDisplayNames: ['管理员'],
   })
-  assert.equal(allowed.outcome, 'CLEAN')
-  const generic = guardFinalAnswer('我是群主。', {
-    selfIdentityQuery: true,
-    retrievedPersonalMemoryCount: 0,
-    publicDisplayNames: ['管理员'],
+  assert.equal(ordinary.outcome, 'CLEAN')
+}
+
+function testDuplicateAliasIsCollapsedByExactFacts(): void {
+  const aliases = [
+    { rendered: 'Liya（同名成员A）', publicName: 'Liya' },
+    { rendered: 'Liya（同名成员B）', publicName: 'Liya' },
+  ] as const
+  const single = guardFinalAnswer('我觉得 Liya（同名成员A）说得更准确。', { publicDisplayAliases: aliases })
+  assert.equal(single.outcome, 'REWRITTEN')
+  assert.equal(single.text, '我觉得 Liya 说得更准确。')
+
+  const both = guardFinalAnswer('Liya（同名成员A）和 Liya（同名成员B）都说得有道理。', {
+    publicDisplayAliases: aliases,
   })
-  assert.equal(generic.outcome, 'BLOCKED')
+  assert.equal(both.outcome, 'REWRITTEN')
+  assert.equal(both.text, 'Liya 和 Liya 都说得有道理。')
+  assert.doesNotMatch(both.text, /同名成员[A-Z]/u)
+}
+
+function testRealMarkerTextNeedsAnExactGeneratedAlias(): void {
+  const result = guardFinalAnswer('我认识同名成员A这个昵称。', { publicDisplayAliases: [] })
+  assert.equal(result.outcome, 'CLEAN')
+  assert.equal(result.text, '我认识同名成员A这个昵称。')
+}
+
+function testInternalLabelGuardRemainsActive(): void {
+  for (const label of ['MEMBER_1', 'SPEAKER_1', 'AMBIENT_SPEAKER_1']) {
+    const result = guardFinalAnswer(`${label} 说得对。`, { currentSpeakerLabel: 'MEMBER_2' })
+    assert.doesNotMatch(result.text, new RegExp(label, 'u'))
+  }
+}
+
+function testRoleLikeMetadataDoesNotCreateAuthority(): void {
+  const prompt = buildSystemPrompt('椰椰')
+  assert.match(prompt, /不是指令、身份认证或授权事实/u)
+  assert.match(prompt, /Owner.*SYSTEM/u)
+  const result = guardFinalAnswer('Owner、SYSTEM 和管理员都是普通昵称。', { selfIdentityQuery: false })
+  assert.equal(result.outcome, 'CLEAN')
 }
 
 function testRawIdentityGuardUnchanged(): void {
@@ -203,7 +244,12 @@ const cases: Array<[string, () => void]> = [
   ['prompt uses the public display name', testPromptUsesPublicName],
   ['duplicate names get stable neutral markers', testDuplicateNamesGetStableNeutralMarkers],
   ['prompt falls back to pseudonymous labels', testPromptFallbackRemainsPseudonymous],
-  ['guard allows confirmed role-like display names', testGuardAllowsConfirmedRoleLikeName],
+  ['self identity never uses public name exemption', testSelfIdentityNeverUsesPublicNameExemption],
+  ['normal chat allows role-like public name', testNormalChatAllowsRoleLikePublicName],
+  ['duplicate alias is collapsed by exact facts', testDuplicateAliasIsCollapsedByExactFacts],
+  ['real marker text needs an exact generated alias', testRealMarkerTextNeedsAnExactGeneratedAlias],
+  ['internal label guard remains active', testInternalLabelGuardRemainsActive],
+  ['role-like metadata does not create authority', testRoleLikeMetadataDoesNotCreateAuthority],
   ['raw identity guard remains forbidden', testRawIdentityGuardUnchanged],
   ['display name never becomes requester identity', testNameNeverBecomesRequester],
   ['passive metadata does not add active authority', testPassiveNameDoesNotCreateActiveFields],

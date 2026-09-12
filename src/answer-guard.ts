@@ -31,6 +31,7 @@ export type InternalLeakKind =
   | 'SPEAKER_LABEL_CURRENT'
   | 'SPEAKER_LABEL_OTHER'
   | 'SPEAKER_LABEL_CONFLATION'
+  | 'PUBLIC_DISPLAY_ALIAS'
   | 'INTERNAL_FIELD_NAME'
   | 'UNGROUNDED_IDENTITY_CLAIM'
   | 'INTERNAL_VALUE'
@@ -52,8 +53,14 @@ export interface AnswerGuardFacts {
   /** Grounding facts for the narrow current-requester identity path. */
   selfIdentityQuery?: boolean
   retrievedPersonalMemoryCount?: number
-  /** Confirmed presentation names may contain role-like words such as 管理员. */
-  publicDisplayNames?: readonly string[]
+  /** Exact provider-only duplicate-name labels generated for this prompt. */
+  publicDisplayAliases?: readonly PublicDisplayAlias[]
+}
+
+/** A generated duplicate-name label and the safe public name it may collapse to. */
+export interface PublicDisplayAlias {
+  rendered: string
+  publicName: string
 }
 
 export interface AnswerGuardResult {
@@ -128,6 +135,7 @@ const DETECTION_ORDER: readonly InternalLeakKind[] = [
   'SPEAKER_LABEL_CURRENT',
   'SPEAKER_LABEL_OTHER',
   'SPEAKER_LABEL_CONFLATION',
+  'PUBLIC_DISPLAY_ALIAS',
   'INTERNAL_FIELD_NAME',
   'UNGROUNDED_IDENTITY_CLAIM',
   'INTERNAL_VALUE',
@@ -150,15 +158,36 @@ function countOccurrences(text: string, needle: string): number {
   return count
 }
 
-function maskAllowedPublicDisplayNames(text: string, names: readonly string[] | undefined): string {
-  let masked = text
-  for (const name of [...new Set(names ?? [])]
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0)
-    .sort((left, right) => right.length - left.length)) {
-    masked = masked.replace(new RegExp(escapeRegExp(name), 'gu'), (match) => ' '.repeat([...match].length))
+function replaceGeneratedPublicDisplayAliases(
+  text: string,
+  aliases: readonly PublicDisplayAlias[] | undefined,
+): { text: string; replaced: number } {
+  const isWordScalar = (value: string | undefined): boolean => value !== undefined && /[\p{L}\p{N}]/u.test(value)
+  const candidates = [...(aliases ?? [])]
+    .filter((alias) => alias.rendered.length > 0 && alias.publicName.length > 0)
+    .sort((left, right) => right.rendered.length - left.rendered.length)
+
+  // Scan the original draft once. Replacements are never rescanned, so a real
+  // public name containing another alias cannot be modified by a later pass.
+  let cursor = 0
+  let replaced = 0
+  let normalized = ''
+  while (cursor < text.length) {
+    const alias = candidates.find((candidate) => text.startsWith(candidate.rendered, cursor))
+    if (alias === undefined) {
+      normalized += text[cursor]
+      cursor++
+      continue
+    }
+
+    normalized += alias.publicName
+    const following = [...text.slice(cursor + alias.rendered.length)][0]
+    const lastPublicScalar = [...alias.publicName].at(-1)
+    if (isWordScalar(lastPublicScalar) && isWordScalar(following)) normalized += ' '
+    cursor += alias.rendered.length
+    replaced++
   }
-  return masked
+  return { text: normalized, replaced }
 }
 
 function sameLabel(left: string, right: string): boolean {
@@ -264,6 +293,14 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
   let blocked = false
   let regenerable = true
 
+  // Only exact aliases emitted by this turn's presentation are collapsed. This
+  // is a deterministic provider-only cleanup, not a regex guess about names.
+  const aliases = replaceGeneratedPublicDisplayAliases(text, facts.publicDisplayAliases)
+  if (aliases.replaced > 0) {
+    bump('PUBLIC_DISPLAY_ALIAS', aliases.replaced)
+    text = aliases.text
+  }
+
   // Ambient-section labels first, and by meaning: they are runtime vocabulary with
   // a known referent, so they resolve to a natural phrase instead of being folded
   // into the pseudonym loop, where `CURRENT_REQUESTER` would have been rewritten
@@ -333,8 +370,10 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
   }
 
   if (facts.selfIdentityQuery === true && facts.retrievedPersonalMemoryCount === 0) {
-    const claims = [...maskAllowedPublicDisplayNames(text, facts.publicDisplayNames)
-      .matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
+    // Public names are presentation metadata, never an exemption for the
+    // fail-closed self-identity boundary. A name such as 管理员 must not make
+    // "我是管理员" or "你是主人" acceptable here.
+    const claims = [...text.matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
     if (claims > 0) {
       bump('UNGROUNDED_IDENTITY_CLAIM', claims)
       blocked = true
