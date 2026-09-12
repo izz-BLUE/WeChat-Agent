@@ -47,6 +47,7 @@ import {
 } from './persistent-runtime-log.js'
 import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from './runtime-time.js'
 import { observeGroupStyle } from './group-style.js'
+import { observeConversationDynamics } from './conversation-dynamics.js'
 import { type OwnerDispatchPlannerLike, OwnerDispatchPlanner } from './owner-dispatch-planner.js'
 import {
   OwnerPrivateDispatchPlanner,
@@ -384,6 +385,33 @@ export class ProductionChatAgent implements AgentExecutor {
         })
       : undefined
 
+    const conversationDynamics = request.conversationType === 'GROUP'
+      ? observeConversationDynamics({
+          recentGroupContext: window.messages,
+          groupAmbientContext: ambient,
+          currentSpeakerLabel: label,
+        })
+      : undefined
+
+    if (conversationDynamics !== undefined) {
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+        'CONVERSATION_DYNAMICS',
+        {
+          activeTurnCount: conversationDynamics.activeTurnCount,
+          ambientLineCount: conversationDynamics.ambientLineCount,
+          assistantRecent: conversationDynamics.assistantRecent,
+          membersAfterAssistant: conversationDynamics.membersAfterAssistant,
+          lastActiveRequester: conversationDynamics.lastActiveRequester,
+          participation: conversationDynamics.participation,
+          pace: conversationDynamics.pace,
+          continuity: conversationDynamics.continuity,
+          result: 'PASS',
+        },
+      )
+    }
+
     // A real mention is group history too: the next member to ask needs to see
     // that the question was already asked and what was answered.
     if (request.conversationType === 'GROUP') {
@@ -479,6 +507,7 @@ export class ProductionChatAgent implements AgentExecutor {
         persistentMemoryAvailable: this.memory !== null && this.memory.isEnabled,
         runtimeTime,
         groupStyle,
+        conversationDynamics,
         webSearch,
       },
       guardValues(request),

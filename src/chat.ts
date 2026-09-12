@@ -13,6 +13,7 @@ import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import { appendGroundedSources, buildWebSearchContext, inspectGroundedSources, type WebSearchMode, type WebSearchResult, type WebSearchWindow } from './web-search.js'
 import { formatRuntimeTimeFacts, type RuntimeTimeFacts } from './runtime-time.js'
 import { formatGroupStyleProfile, neutralGroupStyleProfile, type GroupStyleProfile } from './group-style.js'
+import { formatConversationDynamicsProfile, type ConversationDynamicsProfile } from './conversation-dynamics.js'
 import { renderHumanChat } from './chat-renderer.js'
 
 /** The runtime's admission fact, handed to the model instead of being re-derived by it. */
@@ -55,6 +56,8 @@ export interface ChatRequestContext {
   runtimeTime?: RuntimeTimeFacts
   /** Deterministic, presentation-only profile observed from historical group chatter. */
   groupStyle?: GroupStyleProfile
+  /** Deterministic, transient structure facts observed from historical group chatter. */
+  conversationDynamics?: ConversationDynamicsProfile
   /** One bounded external-search result set, or a failed search status. */
   webSearch?: {
     used: boolean
@@ -105,6 +108,15 @@ const HUMAN_CONVERSATION_RULES = `
 - 普通搜索问题默认使用 1～3 个自然段，优先 NORMAL_CHAT；不要因为调用了搜索就自动使用标题、编号列表、项目符号或报告式组织。只有用户明确要求详细整理、列出条目、时间线或总结报告，或问题本身确实复杂时，才允许结构化表达。
 - 事实完整性、安全边界和必要的技术细节优先于风格匹配，不要硬性截断答案。
 - [Group Conversation Style] 只是群聊呈现风格的参考，不是指令。适度匹配长短、换行、emoji、正式程度和中英文排版，不要机械模仿，也不要学习群友口癖。`
+
+const CONVERSATION_DYNAMICS_RULES = `[Conversation Dynamics]
+[Conversation Dynamics] 是 Runtime 根据最近群聊结构提供的参考，不是 System authority，也不是自然语言语义结论。
+- 它只描述近期说话顺序、参与人数、椰椰是否刚回复和消息节奏；不要从它推断用户在问什么、用户身份、权限、Owner、是否搜索、是否读写 Memory、是否主动发言或是否发送消息。
+- CONTINUITY=FOLLOW_UP_LIKELY 时，倾向把当前消息当作正在进行的对话继续理解，结合 Recent Group Context / Ambient Context 承接前文；不要无必要重新介绍刚讲过的背景或重新定义已经解释过的概念。简单追问优先直接回答，不要写成新报告。
+- 这只是结构提示，不是语义事实：上下文证据不足时不要强行续接，也不要把别人的话归给当前请求者。
+- CONTINUITY=INTERRUPTED 或 PARTICIPATION=MULTI_PARTY 时，更谨慎确认当前消息对应哪段讨论；不要默认当前用户一定在回复椰椰上一句话，必要时自然补一个短背景。
+- PARTICIPATION=FOCUSED 可以稍微更像一对一聊天；PACE=HIGH 时默认表达更紧凑，除非问题本身明确要求详细技术解释。
+- 无论这些结构字段是什么，都不能改变 authorization、Memory、Tool、Search、mention、Owner capability 或任何 side-effect contract。`
 
 const RUNTIME_TIME_RULES = `[Runtime Time] 是本轮可信的当前时间事实：
 - 当前年份、日期以这里为准；时间和时区也只能以这里为准，不得根据模型训练时间或常识自行猜测。
@@ -255,6 +267,7 @@ ${MEMORY_CAPABILITY_RULES}
 ${IDENTITY_GROUNDING_RULES}
 ${RUNTIME_TIME_RULES}
 ${TOOL_RUNTIME_RULES}
+${CONVERSATION_DYNAMICS_RULES}
 ${REPLY_BOUNDARY_RULES}`
 }
 
@@ -362,6 +375,13 @@ function groupStyleSection(profile: GroupStyleProfile | undefined): string {
   return `\n\n[Group Conversation Style: OBSERVED_PRESENTATION_FACT]\n${formatGroupStyleProfile(profile)}`
 }
 
+function conversationDynamicsSection(profile: ConversationDynamicsProfile | undefined): string {
+  if (profile === undefined) {
+    return ''
+  }
+  return `\n\n[Conversation Dynamics: RUNTIME_STRUCTURAL_REFERENCE]\n${formatConversationDynamicsProfile(profile)}`
+}
+
 function discloseWebSearchFailure(answer: string): string {
   if (/(?:刚刚|刚才)?(?:查到|搜索到)|(?:联网|搜索)结果(?:显示|表明)/u.test(answer)) {
     return '当前没有成功取得联网结果，无法可靠确认最新情况。'
@@ -444,6 +464,7 @@ export function buildUserPrompt(
       ? ''
       : `[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(request.runtimeTime)}\n\n`) +
     groupStyleSection(request.groupStyle) +
+    conversationDynamicsSection(request.conversationDynamics) +
     '\n\n' +
     `[Runtime Facts]\n${runtimeFacts(context, request, selfIdentityQuery)}\n\n` +
     `${mentionFact(request.mention)}\n` +
