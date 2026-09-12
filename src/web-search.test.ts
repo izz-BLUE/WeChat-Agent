@@ -916,6 +916,35 @@ async function main(): Promise<void> {
     final.restore()
   })
 
+  await test('Final Web Search prompt preserves news action, scope, time, certainty, and attribution', async () => {
+    const final = fakeFinalChat('据报道，部分用户受到影响。[S1]')
+    const fake = fakeProvider([result('S1', '新闻来源')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI recent news\nSEARCH_MODE=NEWS_RECENT\nRECENCY_WINDOW=DAY_3'),
+      webSearchProvider: fake.provider,
+    })
+    try {
+      await agent.complete(request({
+        text: '@椰椰 OpenAI 最近有什么新闻？',
+        rawText: '@椰椰 OpenAI 最近有什么新闻？',
+        userContentSpan: { trust: 'VALID', span: { start: 0, length: '@椰椰 OpenAI 最近有什么新闻？'.length } },
+      }))
+      const system = final.calls[0]?.system ?? ''
+      check(system.includes('launch、announce、pause、investigate、report、consider、plan、test、roll out'), 'action preservation examples are missing')
+      check(system.includes('启动调查') && system.includes('认定违规') && system.includes('测试') && system.includes('正式上线'), 'action strength boundary is missing')
+      check(system.includes('暂停 ChatGPT Pro 的新注册') && system.includes('关闭 ChatGPT') && system.includes('停止订阅服务'), 'object preservation boundary is missing')
+      check(system.includes('new users') && system.includes('selected users') && system.includes('pilot') && system.includes('limited rollout') && system.includes('enterprise customers') && system.includes('全球'), 'scope preservation boundary is missing')
+      check(system.includes('PublishedAt') && system.includes('Runtime Time') && system.includes('来源是昨天或更早时不得自动说成今天'), 'time preservation boundary is missing')
+      check(system.includes('may/could/reportedly/according to/sources say/expected/plans to/considering'), 'certainty and attribution vocabulary is missing')
+      check(system.includes('据该报道') && system.includes('不能包装成已确认事实'), 'single-source attribution boundary is missing')
+      check(system.includes('目前几家来源说法不完全一致') && system.includes('不要强行裁决'), 'conflict-source boundary is missing')
+      check(system.includes('不要自动追问') && system.includes('你比较关心哪一块？') && system.includes('要不要我继续查？'), 'automatic follow-up prohibition is missing')
+      check(final.calls[0]?.user.includes('[S1]'), 'final prompt lost the internal grounding marker')
+    } finally {
+      final.restore()
+    }
+  })
+
   await test('Final Web Search keeps natural one-result answers and allows explicit structure', async () => {
     const final = scriptedFinalChat([
       '核心变化是模型能力继续增强。[S1]',

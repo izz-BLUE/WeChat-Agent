@@ -163,6 +163,15 @@ const WEB_SEARCH_RULES = `[Web Search Results]（如果本轮提供）来自互�
 - 自然综合不能抹掉关键限定条件、把“可能”改成“确定”、把旧消息说成今天发生，或把互相冲突的来源合成一个确定结论；冲突时自然说明不同来源说法不完全一致。
 - 当 WEB_SEARCH_MODE=NEWS_RECENT 时，优先使用较新的 PublishedAt；如果当前近期窗口没有足够结果，直接说明没有查到足够近期信息，不要拿旧背景资料冒充今天新闻。
 - NEWS_RECENT 的结果即使出现在搜索资料中，也不能把旧内容说成今天发生；没有可靠发布日期或来源之间时间冲突时，保留限定并自然说明不确定性。
+- 新闻事实保真优先于语言压缩：可以去重、合并共同主题和简化表达，但 compression 不得造成 semantic expansion；如果自然简短和事实完整冲突，优先事实完整。
+- ACTION 必须保持来源动作和强度：launch、announce、pause、investigate、report、consider、plan、test、roll out 等不能升级或替换成更强动作；“启动调查”不等于“认定违规”，“测试”不等于“正式上线”，“计划”不等于“已经实施”。
+- OBJECT 必须保持动作对象及其限定关系；“暂停 ChatGPT Pro 的新注册”不得改成“暂停 ChatGPT Pro”“关闭 ChatGPT”或“停止订阅服务”。
+- SCOPE 必须保持来源中的范围限制，包括 new users、selected users、some users、pilot、limited rollout、地区、enterprise customers、beta 等；部分用户、试点或单一地区不得扩大成全体、全面或全球。
+- TIME 必须保留来源真实时间边界；“今天/昨天/最近/本周”等只能依据 PublishedAt 与 Runtime Time 判断，来源是昨天或更早时不得自动说成今天。
+- CERTAINTY 和 ATTRIBUTION 必须保持原等级：may/could/reportedly/according to/sources say/expected/plans to/considering 要保留“可能、据报道/报道称、有消息称、预计、计划、正在考虑”等限定；单一来源的夸张说法要说“据该报道”或“目前这条消息主要来自报道中的说法”，不能包装成已确认事实。
+- 多个来源冲突时不要强行裁决或合并成确定结论；自然说明“目前几家来源说法不完全一致”，或分别保留相反说法，除非搜索材料本身提供了足够依据。
+- 搜索结果很多不代表要制造多个主题；真正重要的只有一件时直接说这一件。来源不足以支持强结论时，直接降低确定性，例如“目前搜到的公开信息还比较有限”。
+- 普通新闻问题回答完就结束，不要自动追问“你比较关心哪一块？”“要不要我继续查？”“需要我展开吗？”或“如果你想我可以……”；只有用户请求本身需要澄清时才提问。明确要求详细整理或列出条目时，仍可按要求结构化。
 - [Sx] 是只供 Runtime 做 grounding 的内部引用协议，用来标记真正支撑回答的来源；Runtime 会在发送前移除 marker，最终不需要向群友解释 [Sx]。
 - 仍然要在相关事实后保留运行时提供的 [S1]、[S2] 等 sourceId，不要停止引用；不要自行创造或输出 URL，实际来源由 Runtime 追加。`
 
