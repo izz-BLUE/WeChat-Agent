@@ -7,7 +7,7 @@ import {
   type MemoryPromptItem,
 } from './chat.js'
 import { sanitizeFinalAnswer } from './final-answer.js'
-import { decorateYeyeReplySignature } from './chat-renderer.js'
+import { decorateYeyeReplySignatureWithDiagnostics } from './chat-renderer.js'
 import {
   ABSENT_BOT_MENTION_SPANS,
   ABSENT_USER_CONTENT_SPAN,
@@ -81,8 +81,26 @@ import {
   ProactiveGroupQueue,
 } from './proactive-group-queue.js'
 
-function finalizeYeyeReply(answer: string): string {
-  return sanitizeFinalAnswer(decorateYeyeReplySignature(answer)).text
+function finalizeYeyeReply(
+  answer: string,
+  reportSignature = false,
+  persistentSink?: PersistentRuntimeLogSink,
+): string {
+  const decorated = decorateYeyeReplySignatureWithDiagnostics(answer)
+  if (reportSignature) {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      persistentSink,
+      'YEYE_REPLY_SIGNATURE',
+      {
+        beforeCount: decorated.beforeCount,
+        afterCount: decorated.afterCount,
+        placement: decorated.placement,
+        result: decorated.afterCount <= 1 ? 'PASS' : 'FAIL',
+      },
+    )
+  }
+  return sanitizeFinalAnswer(decorated.text).text
 }
 
 export const MIN_SEARCH_FALLBACK_BUDGET_MS = 3_000
@@ -478,13 +496,21 @@ export class ProductionChatAgent implements AgentExecutor {
     try {
       const answer = await this.completeWithinDeadline(request, deadline, msgIdToken)
       deadline.throwIfExpired()
-      return finalizeYeyeReply(answer)
+      return finalizeYeyeReply(
+        answer,
+        true,
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      )
     } catch (error) {
       if (!isRequestDeadlineExceeded(error)) {
         throw error
       }
       result = 'DEADLINE_FALLBACK'
-      const fallback = finalizeYeyeReply(REQUEST_DEADLINE_FALLBACK_REPLY)
+      const fallback = finalizeYeyeReply(
+        REQUEST_DEADLINE_FALLBACK_REPLY,
+        true,
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      )
       this.stageOutbound(request, fallback, msgIdToken)
       return fallback
     } finally {
@@ -763,6 +789,7 @@ export class ProductionChatAgent implements AgentExecutor {
       {
         botDisplayName: config.botDisplayName,
         assistantRuntime,
+        conversationType: request.conversationType,
         mention: mentionFact(request),
         requesterRole: request.requesterRole,
         ownerConfigured: request.ownerConfigured,

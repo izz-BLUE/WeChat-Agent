@@ -25,7 +25,7 @@ import {
   type ConversationDynamicsProfile,
   type GroupReplyPressure,
 } from './conversation-dynamics.js'
-import { renderHumanChat } from './chat-renderer.js'
+import { boundGroupReply, renderHumanChat } from './chat-renderer.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
 import { identityToken } from './identity-observer.js'
 import { isRequestDeadlineExceeded, type RequestDeadline, withRequestDeadline } from './request-deadline.js'
@@ -51,6 +51,8 @@ export type ChatPromptMessage = Pick<GroupMessage, 'senderName' | 'publicDisplay
 
 export interface ChatRequestContext {
   botDisplayName: string
+  /** Conversation kind used only to scope the presentation fallback to GROUP. */
+  conversationType?: 'GROUP' | 'DIRECT'
   /** Trusted runtime facts about the Assistant; absent only for legacy callers. */
   assistantRuntime?: AssistantRuntimeFacts
   mention: ChatMentionFact
@@ -1113,7 +1115,40 @@ export class ChatService {
       throw new Error('Chat API returned an answer that carries internal runtime labels')
     }
 
-    const rendered = renderHumanChat(guard.text)
+    const groupReplyPressure = resolveGroupReplyPressure(request)
+    const responseDepth = request.memberInteractionProfile?.responseDepth ?? 'NORMAL'
+    const applyGroupReplyBoundary = (answer: string) => {
+      const bound = request.conversationType === 'GROUP'
+        ? boundGroupReply(answer, {
+            responseDepth,
+            groupReplyPressure: groupReplyPressure ?? 'MEDIUM',
+          })
+        : {
+            text: answer,
+            beforeChars: answer.length,
+            afterChars: answer.length,
+            bounded: false,
+            boundaryType: 'NONE' as const,
+          }
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        persistentSink,
+        'GROUP_REPLY_LENGTH',
+        {
+          responseDepth,
+          groupReplyPressure: request.conversationType === 'GROUP' ? groupReplyPressure ?? 'MEDIUM' : 'NONE',
+          beforeChars: bound.beforeChars,
+          afterChars: bound.afterChars,
+          bounded: bound.bounded,
+          boundaryType: bound.boundaryType,
+          result: 'PASS',
+          msgIdToken,
+        },
+      )
+      return bound
+    }
+    const bound = applyGroupReplyBoundary(guard.text)
+    const rendered = renderHumanChat(bound.text)
     emitDiagnostic(
       (line: string) => console.log(line),
       persistentSink,
@@ -1157,7 +1192,6 @@ export class ChatService {
       )
     }
 
-    const groupReplyPressure = resolveGroupReplyPressure(request)
     if (request.webSearch?.status === 'FAILED') {
       if (request.webSearch.mode === 'NEWS_RECENT') {
         return '当前没有查到足够近期信息，无法可靠确认最新情况。'
@@ -1215,7 +1249,8 @@ export class ChatService {
           )
           const repairedGuard = guardFinalAnswer(repairedDraft, guardFacts)
           if (repairedGuard.outcome !== 'BLOCKED') {
-            const candidate = renderHumanChat(repairedGuard.text)
+            const repairedBound = applyGroupReplyBoundary(repairedGuard.text)
+            const candidate = renderHumanChat(repairedBound.text)
             if (candidate.length > 0) {
               repairedRendered = candidate
               repairedUsage = inspectGroundedSources(candidate, request.webSearch.results, internalValues)

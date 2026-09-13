@@ -47,6 +47,93 @@ export const YEYE_REPLY_SIGNATURE = '🌴˙ᵕ˙'
 
 const SENTENCE_ENDINGS = new Set(['。', '！', '？', '!', '?', '.'])
 
+export type GroupReplyResponseDepth = 'SHORT' | 'NORMAL' | 'DETAILED'
+export type GroupReplyPressure = 'LOW' | 'MEDIUM' | 'HIGH'
+export type GroupReplyBoundaryType = 'NONE' | 'PARAGRAPH' | 'SENTENCE' | 'BYPASS_CODE' | 'BYPASS_DETAILED'
+
+export interface GroupReplyPresentationPolicy {
+  responseDepth: GroupReplyResponseDepth
+  groupReplyPressure: GroupReplyPressure
+}
+
+export interface GroupReplyBoundaryResult {
+  text: string
+  beforeChars: number
+  afterChars: number
+  bounded: boolean
+  boundaryType: GroupReplyBoundaryType
+}
+
+/**
+ * Presentation-only budgets for ordinary group replies. They are deliberately
+ * generous enough for a useful answer, while making a runaway story stop at a
+ * complete natural boundary. DETAILED is handled as an explicit detail bypass.
+ */
+export const GROUP_REPLY_LENGTH_BUDGETS = Object.freeze({
+  SHORT: Object.freeze({ HIGH: 120, MEDIUM: 160, LOW: 200 }),
+  NORMAL: Object.freeze({ HIGH: 240, MEDIUM: 360, LOW: 480 }),
+  DETAILED: Object.freeze({ HIGH: 720, MEDIUM: 960, LOW: 1_200 }),
+})
+
+/**
+ * Apply the deterministic group presentation fallback before rendering or
+ * grounding. It never cuts a fenced-code answer, an explicitly detailed
+ * profile, or a reply without a safe paragraph/sentence boundary.
+ */
+export function boundGroupReply(
+  text: string,
+  policy: GroupReplyPresentationPolicy,
+): GroupReplyBoundaryResult {
+  const beforeChars = text.length
+  const normalized = text.trim()
+  if (normalized.length === 0) {
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+  }
+
+  if (hasFence(normalized)) {
+    return {
+      text: normalized,
+      beforeChars,
+      afterChars: normalized.length,
+      bounded: false,
+      boundaryType: 'BYPASS_CODE',
+    }
+  }
+
+  if (policy.responseDepth === 'DETAILED') {
+    return {
+      text: normalized,
+      beforeChars,
+      afterChars: normalized.length,
+      bounded: false,
+      boundaryType: 'BYPASS_DETAILED',
+    }
+  }
+
+  const pressure = policy.groupReplyPressure
+  const budget = GROUP_REPLY_LENGTH_BUDGETS[policy.responseDepth][pressure]
+  if (normalized.length <= budget) {
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+  }
+
+  const boundary = findSafeBoundary(normalized, budget)
+  if (boundary === null) {
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+  }
+
+  const boundedText = normalized.slice(0, boundary.end).trimEnd()
+  if (!preservesSourceMarkers(normalized, boundedText)) {
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+  }
+  return {
+    text: boundedText,
+    beforeChars,
+    afterChars: boundedText.length,
+    bounded: true,
+    boundaryType: boundary.type,
+  }
+}
+
 /**
  * Add the fixed Yeye display signature without changing the answer's meaning.
  * This is deliberately separate from `renderHumanChat`: the renderer cleans up
@@ -54,28 +141,74 @@ const SENTENCE_ENDINGS = new Set(['。', '！', '？', '!', '?', '.'])
  * outbound display concern.
  */
 export function decorateYeyeReplySignature(text: string): string {
+  return decorateYeyeReplySignatureWithDiagnostics(text).text
+}
+
+export interface YeyeReplySignatureResult {
+  text: string
+  beforeCount: number
+  afterCount: number
+  placement: 'FINAL_NATURAL_LANGUAGE' | 'EXISTING' | 'NONE'
+}
+
+/** Decorate one whole reply, preserving protected and source regions. */
+export function decorateYeyeReplySignatureWithDiagnostics(text: string): YeyeReplySignatureResult {
   if (text.trim().length === 0) {
-    return ''
+    return { text: '', beforeCount: 0, afterCount: 0, placement: 'NONE' }
   }
 
   const lines = splitLines(text)
-  const output: string[] = []
+  const sourceStart = findSourceAreaStart(lines)
+  const bodyLines = sourceStart < 0 ? lines : lines.slice(0, sourceStart)
+  const sourceLines = sourceStart < 0 ? [] : lines.slice(sourceStart)
   let inCodeBlock = false
+  let beforeCount = 0
+  let lastNaturalLine = -1
+  const cleanedBody: SourceLine[] = []
 
-  for (const line of lines) {
+  for (const line of bodyLines) {
     if (isFence(line.content)) {
       inCodeBlock = !inCodeBlock
-      output.push(line.content + line.eol)
+      cleanedBody.push(line)
       continue
     }
     if (inCodeBlock) {
-      output.push(line.content + line.eol)
+      cleanedBody.push(line)
       continue
     }
-    output.push(decorateNaturalLanguageLine(line.content) + line.eol)
+
+    const protectedRanges = collectProtectedRanges(line.content)
+    if (isProtectedOrStructuralLine(line.content, protectedRanges)) {
+      cleanedBody.push(line)
+      continue
+    }
+
+    beforeCount += countNaturalSignatures(line.content, protectedRanges)
+    const cleaned = removeNaturalSignatures(line.content, protectedRanges)
+    const cleanedRanges = collectProtectedRanges(cleaned)
+    if (hasNaturalLanguage(cleaned, cleanedRanges)) {
+      lastNaturalLine = cleanedBody.length
+    }
+    cleanedBody.push({ ...line, content: cleaned })
   }
 
-  return output.join('')
+  let placement: YeyeReplySignatureResult['placement'] = 'NONE'
+  if (lastNaturalLine >= 0) {
+    const line = cleanedBody[lastNaturalLine]
+    if (line !== undefined) {
+      cleanedBody[lastNaturalLine] = {
+        ...line,
+        content: appendReplyLevelSignature(line.content),
+      }
+      placement = 'FINAL_NATURAL_LANGUAGE'
+    }
+  } else if (beforeCount > 0) {
+    placement = 'EXISTING'
+  }
+
+  const rendered = [...cleanedBody, ...sourceLines].map((line) => line.content + line.eol).join('')
+  const afterCount = countNaturalSignatures(rendered)
+  return { text: rendered, beforeCount, afterCount, placement }
 }
 
 interface SourceLine {
@@ -105,6 +238,10 @@ function isFence(line: string): boolean {
   return /^\s*```/u.test(line)
 }
 
+function hasFence(text: string): boolean {
+  return splitLines(text).some((line) => isFence(line.content))
+}
+
 function normalizePresentationLine(line: string): string {
   const heading = /^\s{0,3}#{1,6}(?:\s+|$)(.*?)\s*#*\s*$/u.exec(line)
   const withoutHeading = heading === null ? line : (heading[1] ?? '')
@@ -116,48 +253,6 @@ function normalizePresentationLine(line: string): string {
 interface ProtectedRange {
   start: number
   end: number
-}
-
-function decorateNaturalLanguageLine(line: string): string {
-  const { prefix, body } = splitLinePrefix(line)
-  if (body.trim().length === 0) {
-    return line
-  }
-
-  const protectedRanges = collectProtectedRanges(body)
-  if (isProtectedOrStructuralLine(body, protectedRanges)) {
-    return line
-  }
-
-  let rendered = ''
-  let rangeIndex = 0
-  for (let index = 0; index < body.length;) {
-    const protectedRange = protectedRanges[rangeIndex]
-    if (protectedRange !== undefined && protectedRange.start === index) {
-      rendered += body.slice(protectedRange.start, protectedRange.end)
-      index = protectedRange.end
-      rangeIndex += 1
-      continue
-    }
-
-    const character = body[index] ?? ''
-    rendered += character
-    if (isSentenceEnding(body, index, character, protectedRanges) && !hasSignatureAfter(body, index + 1)) {
-      rendered += YEYE_REPLY_SIGNATURE
-      if (body[index + 1] === '[' && /^\[S\d+\]/u.test(body.slice(index + 1))) {
-        rendered += ' '
-      }
-    }
-    index += 1
-  }
-
-  return prefix + appendLineEndingSignature(rendered, body)
-}
-
-function splitLinePrefix(line: string): { prefix: string; body: string } {
-  const match = /^(\s*(?:(?:[-+*]|\d+[.)]|>|#{1,6})\s+)?)/u.exec(line)
-  const prefix = match?.[1] ?? ''
-  return { prefix, body: line.slice(prefix.length) }
 }
 
 function collectProtectedRanges(text: string): ProtectedRange[] {
@@ -215,7 +310,11 @@ function mergeRanges(ranges: ProtectedRange[]): ProtectedRange[] {
 function isProtectedOrStructuralLine(line: string, ranges: readonly ProtectedRange[]): boolean {
   const trimmed = line.trim()
   if (/^来源\s*[:：]?\s*$/u.test(trimmed)) return true
-  if (isSourceUrlLine(trimmed)) return true
+  if (isSourceUrlLine(trimmed)) {
+    const unprotected = removeProtectedRanges(line, ranges).trim()
+    if (unprotected.length === 0 || !/[\p{Script=Han}\p{Letter}]/u.test(unprotected)) return true
+    if (/^\s*\d+[.)]\s+/u.test(trimmed)) return true
+  }
 
   const unprotected = removeProtectedRanges(line, ranges).trim()
   if (unprotected.length === 0 || !/[\p{Script=Han}\p{Letter}]/u.test(unprotected)) return true
@@ -284,25 +383,128 @@ function isProtectedIndex(index: number, ranges: readonly ProtectedRange[]): boo
   return ranges.some((range) => index >= range.start && index < range.end)
 }
 
-function hasSignatureAfter(text: string, start: number): boolean {
-  return /^[ \t]*🌴˙ᵕ˙/u.test(text.slice(start))
+function findSafeBoundary(text: string, maxChars: number): { end: number; type: 'PARAGRAPH' | 'SENTENCE' } | null {
+  const ranges = collectProtectedRanges(text)
+  const candidates: Array<{ end: number; type: 'PARAGRAPH' | 'SENTENCE' }> = []
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === '\n' && text[index + 1] === '\n') {
+      const end = index + 2
+      if (end <= maxChars) candidates.push({ end, type: 'PARAGRAPH' })
+    }
+
+    const character = text[index] ?? ''
+    if (!isSentenceEnding(text, index, character, ranges)) continue
+    const end = includeCitationTail(text, index + 1)
+    if (end <= maxChars) candidates.push({ end, type: 'SENTENCE' })
+  }
+
+  return candidates.length === 0 ? null : candidates[candidates.length - 1] ?? null
 }
 
-function appendLineEndingSignature(rendered: string, original: string): string {
-  const trailingWhitespace = rendered.match(/[ \t]+$/u)?.[0] ?? ''
-  const core = trailingWhitespace.length === 0 ? rendered : rendered.slice(0, -trailingWhitespace.length)
-  if (core.length === 0 || core.endsWith(YEYE_REPLY_SIGNATURE)) return rendered
+function includeCitationTail(text: string, start: number): number {
+  let cursor = start
+  while (/[ \t]/u.test(text[cursor] ?? '')) cursor += 1
+
+  let foundCitation = false
+  while (text[cursor] === '[') {
+    const citation = /^\[S\d+\]/u.exec(text.slice(cursor))
+    if (citation === null) break
+    foundCitation = true
+    cursor += citation[0].length
+    while (/[ \t]/u.test(text[cursor] ?? '')) cursor += 1
+  }
+  return foundCitation ? cursor : start
+}
+
+function preservesSourceMarkers(original: string, bounded: string): boolean {
+  const markers = original.match(/\[S\d+\]/gu) ?? []
+  if (markers.length === 0) return true
+  const boundedMarkers = bounded.match(/\[S\d+\]/gu) ?? []
+  return markers.every((marker, index) => boundedMarkers[index] === marker)
+}
+
+function findSourceAreaStart(lines: readonly SourceLine[]): number {
+  let inCodeBlock = false
+  for (const [index, line] of lines.entries()) {
+    if (isFence(line.content)) {
+      inCodeBlock = !inCodeBlock
+      continue
+    }
+    if (!inCodeBlock && /^\s*来源\s*[:：]?\s*$/u.test(line.content)) return index
+  }
+  return -1
+}
+
+function removeNaturalSignatures(text: string, ranges: readonly ProtectedRange[]): string {
+  let result = ''
+  for (let index = 0; index < text.length;) {
+    if (text.startsWith(YEYE_REPLY_SIGNATURE, index) && !isProtectedIndex(index, ranges)) {
+      index += YEYE_REPLY_SIGNATURE.length
+      continue
+    }
+    result += text[index] ?? ''
+    index += 1
+  }
+  return result
+}
+
+function countNaturalSignatures(text: string, ranges?: readonly ProtectedRange[]): number {
+  if (ranges !== undefined) {
+    let count = 0
+    for (let index = 0; index <= text.length - YEYE_REPLY_SIGNATURE.length; index += 1) {
+      if (text.startsWith(YEYE_REPLY_SIGNATURE, index) && !isProtectedIndex(index, ranges)) count += 1
+    }
+    return count
+  }
+
+  const lines = splitLines(text)
+  const sourceStart = findSourceAreaStart(lines)
+  const bodyLines = sourceStart < 0 ? lines : lines.slice(0, sourceStart)
+  let inCodeBlock = false
+  let count = 0
+  for (const line of bodyLines) {
+    if (isFence(line.content)) {
+      inCodeBlock = !inCodeBlock
+      continue
+    }
+    if (inCodeBlock) continue
+    const lineRanges = collectProtectedRanges(line.content)
+    if (isProtectedOrStructuralLine(line.content, lineRanges)) continue
+    count += countNaturalSignatures(line.content, lineRanges)
+  }
+  return count
+}
+
+function hasNaturalLanguage(text: string, ranges: readonly ProtectedRange[]): boolean {
+  return /[\p{Script=Han}\p{Letter}]/u.test(removeProtectedRanges(text, ranges).replaceAll(YEYE_REPLY_SIGNATURE, ''))
+}
+
+function appendReplyLevelSignature(line: string): string {
+  const trailingWhitespace = line.match(/[ \t]+$/u)?.[0] ?? ''
+  const core = trailingWhitespace.length === 0 ? line : line.slice(0, -trailingWhitespace.length)
+  if (core.length === 0) return line
 
   const citationTail = /((?:\s*\[S\d+\])+)$/.exec(core)
   if (citationTail !== null && citationTail.index !== undefined) {
     const beforeCitation = core.slice(0, citationTail.index)
-    if (beforeCitation.trim().length > 0 && beforeCitation.endsWith(YEYE_REPLY_SIGNATURE)) return rendered
     if (beforeCitation.trim().length > 0) {
       const citation = citationTail[1] ?? ''
-      return `${beforeCitation}${YEYE_REPLY_SIGNATURE}${citation.startsWith(' ') ? '' : ' '}${citation}${trailingWhitespace}`
+      return `${appendSignatureBeforeTrailingUrl(beforeCitation)}${citation.startsWith(' ') ? '' : ' '}${citation}${trailingWhitespace}`
     }
   }
 
-  if (isSourceUrlLine(original.trim())) return rendered
-  return `${core}${YEYE_REPLY_SIGNATURE}${trailingWhitespace}`
+  return `${appendSignatureBeforeTrailingUrl(core)}${trailingWhitespace}`
+}
+
+function appendSignatureBeforeTrailingUrl(text: string): string {
+  const urlMatch = /https?:\/\/[^\s<>()]+$/u.exec(text)
+  if (urlMatch !== null && urlMatch.index > 0) {
+    if (/[。！？]$/u.test(urlMatch[0])) return `${text}${YEYE_REPLY_SIGNATURE}`
+    const beforeUrl = text.slice(0, urlMatch.index).trimEnd()
+    if (/[\p{Script=Han}\p{Letter}]/u.test(beforeUrl)) {
+      const url = text.slice(urlMatch.index)
+      return `${beforeUrl}${YEYE_REPLY_SIGNATURE} ${url}`
+    }
+  }
+  return `${text}${YEYE_REPLY_SIGNATURE}`
 }

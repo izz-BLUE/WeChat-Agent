@@ -1,7 +1,13 @@
 import { strict as assert } from 'node:assert'
 import { buildUserPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import { appendGroundedSources, type WebSearchResult } from './web-search.js'
-import { decorateYeyeReplySignature, renderHumanChat, YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
+import {
+  boundGroupReply,
+  decorateYeyeReplySignature,
+  GROUP_REPLY_LENGTH_BUDGETS,
+  renderHumanChat,
+  YEYE_REPLY_SIGNATURE,
+} from './chat-renderer.js'
 import type { AgentRequest } from './agent-adapter.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { GroupAmbientContext } from './group-ambient-context.js'
@@ -90,10 +96,10 @@ await runCase('simple-chat-is-unchanged', () => {
   assert.equal(renderHumanChat(answer), answer)
 })
 
-await runCase('signature-is-sentence-level-and-deterministic', () => {
+await runCase('signature-is-reply-level-and-deterministic', () => {
   assert.equal(
     decorateYeyeReplySignature('你好。今天继续测试！准备好了吗？\nThat works! Really?'),
-    `你好。${YEYE_REPLY_SIGNATURE}今天继续测试！${YEYE_REPLY_SIGNATURE}准备好了吗？${YEYE_REPLY_SIGNATURE}\nThat works!${YEYE_REPLY_SIGNATURE} Really?${YEYE_REPLY_SIGNATURE}`,
+    `你好。今天继续测试！准备好了吗？\nThat works! Really?${YEYE_REPLY_SIGNATURE}`,
   )
   assert.equal(decorateYeyeReplySignature('知道了'), `知道了${YEYE_REPLY_SIGNATURE}`)
 })
@@ -113,12 +119,68 @@ await runCase('signature-preserves-protected-content', () => {
   assert.equal(decorateYeyeReplySignature('请运行 `const x = 1;`。'), `请运行 \`const x = 1;\`。${YEYE_REPLY_SIGNATURE}`)
   assert.equal(decorateYeyeReplySignature('https://example.com'), 'https://example.com')
   assert.equal(decorateYeyeReplySignature('结论成立。[S1]'), `结论成立。${YEYE_REPLY_SIGNATURE} [S1]`)
-  assert.equal(decorateYeyeReplySignature('- 第一条说明。\n1. 第二条说明？'), `- 第一条说明。${YEYE_REPLY_SIGNATURE}\n1. 第二条说明？${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(decorateYeyeReplySignature('- 第一条说明。\n1. 第二条说明？'), `- 第一条说明。\n1. 第二条说明？${YEYE_REPLY_SIGNATURE}`)
   assert.equal(decorateYeyeReplySignature(sourceList), sourceList)
   assert.equal(decorateYeyeReplySignature('const x = 1;'), 'const x = 1;')
   assert.equal(decorateYeyeReplySignature('{"answer":"hello"}'), '{"answer":"hello"}')
   assert.equal(decorateYeyeReplySignature('$ npm run build'), '$ npm run build')
   assert.equal(decorateYeyeReplySignature('Error: request failed'), 'Error: request failed')
+})
+
+await runCase('reply-level-signature-covers-source-and-structural-cases', () => {
+  const results: WebSearchResult[] = [{ sourceId: 'S1', title: '真实来源', url: 'https://real.example/source', snippet: '摘要' }]
+  const grounded = appendGroundedSources('正文第一句。正文第二句。[S1]', results)
+  const decorated = decorateYeyeReplySignature(grounded)
+  assert.equal(decorated.match(new RegExp(YEYE_REPLY_SIGNATURE, 'gu'))?.length, 1)
+  check(decorated.indexOf(YEYE_REPLY_SIGNATURE) < decorated.indexOf('来源：'), 'signature was placed after the source section')
+  check(decorated.includes('1. 真实来源 https://real.example/source'), 'source URL changed')
+  check(!decorated.slice(decorated.indexOf('来源：')).includes(YEYE_REPLY_SIGNATURE), 'source section was decorated')
+
+  const codeOnly = '```ts\nconst answer = "你好。";\n```\nhttps://example.com/source [S1]'
+  assert.equal(decorateYeyeReplySignature(codeOnly), codeOnly)
+  assert.equal(decorateYeyeReplySignature(decorateYeyeReplySignature('第一段。\n\n第二段。')).match(new RegExp(YEYE_REPLY_SIGNATURE, 'gu'))?.length, 1)
+  assert.equal(decorateYeyeReplySignature(`正文。${YEYE_REPLY_SIGNATURE}`), `正文。${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(
+    decorateYeyeReplySignature('请看 `const x = 1;`，或访问 https://example.com/a?x=1。'),
+    `请看 \`const x = 1;\`，或访问 https://example.com/a?x=1。${YEYE_REPLY_SIGNATURE}`,
+  )
+})
+
+await runCase('group-reply-length-boundary-is-safe-and-profile-driven', () => {
+  const longStory = Array.from({ length: 20 }, (_, index) => `第${index + 1}段先交代气氛，然后推进人物关系，最后留下一个完整的转折。`).join('\n\n')
+  const shortHigh = boundGroupReply(longStory, { responseDepth: 'SHORT', groupReplyPressure: 'HIGH' })
+  check(shortHigh.bounded, 'SHORT + HIGH did not apply the fallback boundary')
+  check(shortHigh.afterChars <= GROUP_REPLY_LENGTH_BUDGETS.SHORT.HIGH, 'SHORT + HIGH exceeded its budget')
+  check(/[。！？]$/u.test(shortHigh.text), 'Chinese boundary cut did not end at sentence punctuation')
+
+  const normalHigh = boundGroupReply(longStory, { responseDepth: 'NORMAL', groupReplyPressure: 'HIGH' })
+  const normalMedium = boundGroupReply(longStory, { responseDepth: 'NORMAL', groupReplyPressure: 'MEDIUM' })
+  check(normalHigh.bounded && normalHigh.afterChars < longStory.length, 'NORMAL + HIGH did not reduce the runaway reply')
+  check(normalMedium.afterChars > normalHigh.afterChars, 'MEDIUM pressure did not allow a wider ordinary reply')
+
+  const detailed = boundGroupReply(longStory, { responseDepth: 'DETAILED', groupReplyPressure: 'HIGH' })
+  check(!detailed.bounded && detailed.boundaryType === 'BYPASS_DETAILED', 'DETAILED was mechanically compressed')
+
+  const shortReply = boundGroupReply('收到。', { responseDepth: 'SHORT', groupReplyPressure: 'HIGH' })
+  assert.equal(shortReply.text, '收到。')
+
+  const english = boundGroupReply('First sentence is complete. Second sentence is also complete. Third sentence keeps going without a cut. Fourth sentence is deliberately beyond the compact reply budget.', {
+    responseDepth: 'SHORT',
+    groupReplyPressure: 'HIGH',
+  })
+  check(english.bounded && english.text.endsWith('.'), 'English sentence boundary was not preserved')
+
+  const fenced = `前置说明。\n\n\`\`\`js\n${'const item = 1;\n'.repeat(40)}\`\`\``
+  const codeResult = boundGroupReply(fenced, { responseDepth: 'SHORT', groupReplyPressure: 'HIGH' })
+  assert.equal(codeResult.boundaryType, 'BYPASS_CODE')
+  assert.equal(codeResult.text, fenced)
+
+  const searched = boundGroupReply(`${'搜索结论先说清楚。'.repeat(8)}[S1]\n\n后续展开。`, {
+    responseDepth: 'NORMAL',
+    groupReplyPressure: 'HIGH',
+  })
+  check(searched.text.includes('[S1]'), 'safe bound dropped the source citation')
+  check(!searched.text.endsWith('搜'), 'safe bound cut a Chinese sentence')
 })
 
 await runCase('production-final-and-staged-outbound-use-one-signed-text', async () => {
@@ -135,6 +197,29 @@ await runCase('production-final-and-staged-outbound-use-one-signed-text', async 
   })
   assert.equal(ack.accepted, true)
   assert.equal(ambient.entries(SIGNATURE_REQUEST.conversationId).find((line) => line.speakerType === 'ASSISTANT')?.text, answer)
+})
+
+await runCase('long-story-regression-is-bounded-and-signed-once', async () => {
+  const longStory = Array.from({ length: 24 }, (_, index) =>
+    `第${index + 1}段写两个人慢慢靠近，先把场景铺开，再补一点情绪变化，最后留下一个完整转折。`,
+  ).join('\n\n')
+  const provider = stubProvider([longStory])
+  try {
+    const agent = new ProductionChatAgent(new ChatService('https://provider.invalid/v1', 'key', 'model'))
+    const answer = await agent.complete({
+      ...SIGNATURE_REQUEST,
+      messageId: 'renderer-long-story-request',
+      text: '我想要更加亲密的剧情',
+      rawText: '我想要更加亲密的剧情',
+      userContentSpan: { trust: 'VALID', span: { start: 0, length: 10 } },
+    })
+    check(answer.length < longStory.length, 'runaway story was not bounded')
+    check(answer.match(new RegExp(YEYE_REPLY_SIGNATURE, 'gu'))?.length === 1, 'runaway story signature is not exactly once')
+    check(/[。！？]/u.test(answer.slice(0, -YEYE_REPLY_SIGNATURE.length).slice(-1)), 'runaway story ended at an unsafe boundary')
+    assert.equal(provider.calls.length, 1)
+  } finally {
+    provider.restore()
+  }
 })
 
 await runCase('production-decorates-deadline-fallback-and-keeps-owner-empty', async () => {
