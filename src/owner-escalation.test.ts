@@ -1,4 +1,7 @@
 import { strict as assert } from 'node:assert'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { guardFinalAnswer } from './answer-guard.js'
 import {
   classifyMemoryKind,
@@ -7,7 +10,11 @@ import {
   memoryKindWriteRejection,
 } from './assistant-identity.js'
 import { type ChatRequestContext } from './chat.js'
+import { MENTION_SEPARATOR } from './canonical-user-text.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
+import { MemoryExtractor } from './memory-extractor.js'
+import { MemoryService } from './memory-service.js'
+import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import {
   renderOwnerEscalationHint,
@@ -78,6 +85,62 @@ class CapturingChatService {
   }
 }
 
+interface MemoryHarness {
+  service: MemoryService
+  store: MemoryStore
+  logs: string[]
+  mutateCalls: number
+  dispose(): void
+}
+
+const BOT_TOKEN = `@测试助手${MENTION_SEPARATOR}`
+
+function memoryRequest(overrides: Partial<AgentRequest> = {}): AgentRequest {
+  const canonicalText = overrides.text ?? '你好'
+  const rawText = `${BOT_TOKEN}${canonicalText}`
+  return request({
+    ...overrides,
+    text: rawText,
+    rawText,
+    mentionState: 'MENTIONED',
+    botMentionSpans: { trust: 'VALID', spans: [{ start: 0, length: BOT_TOKEN.length }] },
+    userContentSpan: { trust: 'VALID', span: { start: 0, length: rawText.length } },
+  })
+}
+
+function createMemoryHarness(mutation = '{"operation":"NONE"}'): MemoryHarness {
+  const directory = mkdtempSync(join(tmpdir(), 'wechat-owner-escalation-'))
+  const logs: string[] = []
+  let mutateCalls = 0
+  const store = new MemoryStore({
+    filePath: memoryFileIn(directory),
+    log: (message) => logs.push(message),
+    pathSource: 'TEST',
+  })
+  const service = new MemoryService({
+    store,
+    extractor: new MemoryExtractor(async () => '[]'),
+    mutate: async () => {
+      mutateCalls += 1
+      return mutation
+    },
+    log: (message) => logs.push(message),
+    enableTimer: false,
+  })
+  return {
+    service,
+    store,
+    logs,
+    get mutateCalls() {
+      return mutateCalls
+    },
+    dispose: () => {
+      service.close()
+      rmSync(directory, { recursive: true, force: true })
+    },
+  }
+}
+
 async function main(): Promise<void> {
   await test('trusted runtime owner facts are explicit and not Memory', () => {
     const facts = createTrustedAssistantRuntimeFacts('椰椰', true, OWNER_NAME)
@@ -127,6 +190,106 @@ async function main(): Promise<void> {
     }))
     assert.equal(answer, `这个需要${OWNER_NAME}来处理。${YEYE_REPLY_SIGNATURE}`)
     assert.equal(chat.calls.length, 0)
+  })
+
+  await test('memory-enabled member Owner-only request keeps the admission boundary and short-circuits', async () => {
+    const memory = createMemoryHarness()
+    try {
+      const chat = new CapturingChatService('普通回复')
+      const agent = new ProductionChatAgent(chat as never, { memory: memory.service })
+      const answer = await agent.complete(memoryRequest({
+        text: '记住这个群每周五聚餐',
+        ownerConfigured: true,
+        ownerDisplayName: OWNER_NAME,
+      }))
+
+      assert.equal(answer, `这个需要${OWNER_NAME}来处理。${YEYE_REPLY_SIGNATURE}`)
+      assert.equal(chat.calls.length, 0)
+      assert.equal(memory.mutateCalls, 0)
+      assert.equal(memory.service.recordCount, 0)
+      assert(memory.logs.some((line) =>
+        line.includes('MEMORY_ADMISSION') &&
+        line.includes('role=MEMBER') &&
+        line.includes('blocker=ROLE_NOT_OWNER'),
+      ))
+    } finally {
+      memory.dispose()
+    }
+  })
+
+  await test('memory-enabled Owner explicit group memory keeps the original mutation path', async () => {
+    const memory = createMemoryHarness(JSON.stringify({
+      operation: 'ADD',
+      target: null,
+      content: '这个群每周五聚餐',
+      scope: 'GROUP',
+    }))
+    try {
+      const chat = new CapturingChatService('普通回复')
+      const agent = new ProductionChatAgent(chat as never, { memory: memory.service })
+      const answer = await agent.complete(memoryRequest({
+        text: '记住这个群每周五聚餐',
+        requesterRole: 'OWNER',
+        ownerConfigured: true,
+        ownerDisplayName: OWNER_NAME,
+      }))
+
+      assert.equal(chat.calls.length, 0)
+      assert.equal(memory.mutateCalls, 1)
+      assert.equal(memory.service.recordCount, 1)
+      assert(!answer.includes(`这个需要${OWNER_NAME}来处理。`))
+    } finally {
+      memory.dispose()
+    }
+  })
+
+  await test('memory-enabled member self-address preference does not escalate', async () => {
+    const memory = createMemoryHarness()
+    try {
+      const chat = new CapturingChatService('普通回复')
+      const agent = new ProductionChatAgent(chat as never, { memory: memory.service })
+      const answer = await agent.complete(memoryRequest({ text: '以后叫我公主' }))
+
+      assert.equal(answer, `好，以后叫你公主。${YEYE_REPLY_SIGNATURE}`)
+      assert.equal(chat.calls.length, 0)
+      assert.equal(memory.mutateCalls, 0)
+      assert.equal(memory.service.recordCount, 1)
+      assert(!answer.includes('来处理'))
+    } finally {
+      memory.dispose()
+    }
+  })
+
+  await test('other-member mutation does not trigger Owner escalation', async () => {
+    const memory = createMemoryHarness()
+    try {
+      const chat = new CapturingChatService('普通回复')
+      const agent = new ProductionChatAgent(chat as never, { memory: memory.service })
+      const answer = await agent.complete(memoryRequest({ text: '把张三的称呼改成公主' }))
+
+      assert.equal(answer, `普通回复${YEYE_REPLY_SIGNATURE}`)
+      assert.equal(chat.calls.length, 1)
+      assert.equal(memory.mutateCalls, 0)
+      assert(!answer.includes(OWNER_NAME))
+    } finally {
+      memory.dispose()
+    }
+  })
+
+  await test('ordinary group chat does not trigger Owner escalation', async () => {
+    const memory = createMemoryHarness()
+    try {
+      const chat = new CapturingChatService('普通回复')
+      const agent = new ProductionChatAgent(chat as never, { memory: memory.service })
+      const answer = await agent.complete(memoryRequest({ text: '这个群每周五聚餐' }))
+
+      assert.equal(answer, `普通回复${YEYE_REPLY_SIGNATURE}`)
+      assert.equal(chat.calls.length, 1)
+      assert.equal(memory.mutateCalls, 0)
+      assert(!answer.includes(OWNER_NAME))
+    } finally {
+      memory.dispose()
+    }
   })
 
   await test('unconfigured Owner never fabricates a name', async () => {

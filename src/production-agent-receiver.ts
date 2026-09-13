@@ -628,8 +628,7 @@ export class ProductionChatAgent implements AgentExecutor {
     // clear Owner-only branch may explain the authorization boundary without an
     // extra model call. Other-member mutations do not satisfy the GROUP scope
     // contract here and continue through the normal safety/identity path.
-    if (this.memory === null &&
-        request.requesterRole !== 'OWNER' &&
+    if (request.requesterRole !== 'OWNER' &&
         isExplicitMemoryCommand(question.text) &&
         GROUP_SCOPE_KEYWORDS.some((keyword) => question.text.includes(keyword))) {
       return renderOwnerEscalationHint('OWNER_ONLY_ACTION', assistantRuntime)

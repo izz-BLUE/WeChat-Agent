@@ -920,13 +920,13 @@ async function testAmbientRequesterContextAndMemoryCompose(): Promise<void> {
 
     // A previous active turn by the same requester, then ordinary chatter by
     // someone else, then the current request.
-    await ask(harness, { text: '帮我记一下这个群的部署机器', messageId: 'prior-1' })
+    await ask(harness, { text: '这个群的部署机器昨晚挂了', messageId: 'prior-1' })
     observePassive(harness, { messageId: 'ambient-1', text: '那台机器昨晚又挂了', senderId: REQUESTER_B, timestamp: FIXED_NOW + 2 })
     await ask(harness, { text: '那它现在怎么样了', messageId: 'compose-1' })
 
     assert(providerCallCount(harness) === 2, `expected two active turns, got ${providerCallCount(harness)} provider calls`)
     const prompt = harness.calls[1] as ProviderCall
-    assert(prompt.user.includes('帮我记一下这个群的部署机器'), 'the requester conversation history is missing')
+    assert(prompt.user.includes('这个群的部署机器昨晚挂了'), 'the requester conversation history is missing')
     assert(prompt.user.includes('那台机器昨晚又挂了'), 'the ambient line is missing')
     assert(prompt.user.includes(NAME_MEMORY), 'the persistent memory is missing')
     assert(prompt.user.includes('那它现在怎么样了'), 'the current request is missing')
