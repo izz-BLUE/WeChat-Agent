@@ -1,5 +1,6 @@
 import {
   ChatService,
+  MIN_FINAL_ANSWER_BUDGET_MS,
   REQUEST_DEADLINE_FALLBACK_REPLY,
   type ChatMentionFact,
   type ChatPromptMessage,
@@ -973,6 +974,9 @@ export class ProductionChatAgent implements AgentExecutor {
               continue
             }
             if (providerIndex + 1 < providers.length) {
+              if (!this.allowSearchProviderFallback(deadline, msgIdToken)) {
+                return failed(window)
+              }
               break
             }
             return failed(window)
@@ -984,6 +988,9 @@ export class ProductionChatAgent implements AgentExecutor {
           this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
           if (bounded.results.length === 0) {
             if (providerIndex + 1 < providers.length) {
+              if (!this.allowSearchProviderFallback(deadline, msgIdToken)) {
+                return failed(window)
+              }
               break
             }
             return failed(window)
@@ -1005,6 +1012,9 @@ export class ProductionChatAgent implements AgentExecutor {
           this.logWebSearch('FAIL', 0, reason, msgIdToken)
           this.logWebSearchContext(0, 0, false, msgIdToken)
           if (providerIndex + 1 < providers.length) {
+            if (!this.allowSearchProviderFallback(deadline, msgIdToken)) {
+              return failed(window)
+            }
             break
           }
           return failed(window)
@@ -1013,6 +1023,29 @@ export class ProductionChatAgent implements AgentExecutor {
     }
 
     return failed(windows[windows.length - 1] ?? primaryWindow)
+  }
+
+  private allowSearchProviderFallback(deadline: RequestDeadline, msgIdToken: string): boolean {
+    const remainingMs = deadline.remainingMs()
+    const requiredMs = MIN_FINAL_ANSWER_BUDGET_MS + this.webSearchTimeoutMs
+    if (remainingMs >= requiredMs) {
+      return true
+    }
+
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'OPTIONAL_STAGE_BUDGET',
+      {
+        stage: 'SEARCH_PROVIDER_FALLBACK',
+        remainingMs,
+        requiredMs,
+        reservedFinalAnswerMs: MIN_FINAL_ANSWER_BUDGET_MS,
+        result: 'SKIP',
+        msgIdToken,
+      },
+    )
+    return false
   }
 
   private logWebSearchExecution(

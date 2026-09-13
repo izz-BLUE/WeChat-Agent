@@ -436,7 +436,32 @@ const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 
 export const WEB_SEARCH_GROUNDING_FAILURE_REPLY = '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。'
 export const REQUEST_DEADLINE_FALLBACK_REPLY = '这次处理有点超时了，稍后再问我一次。'
-export const MIN_GROUNDING_REPAIR_BUDGET_MS = 8_000
+export const MIN_FINAL_ANSWER_BUDGET_MS = 8_000
+export const MIN_GROUNDING_REPAIR_BUDGET_MS = MIN_FINAL_ANSWER_BUDGET_MS
+
+type OptionalStageBudgetName = 'PROVIDER_CONTROL_REPAIR' | 'ANSWER_GUARD_REGENERATION'
+
+function logOptionalStageBudgetSkip(
+  persistentSink: PersistentRuntimeLogSink | undefined,
+  stage: OptionalStageBudgetName,
+  deadline: RequestDeadline,
+  requiredMs: number,
+  msgIdToken: string,
+): void {
+  emitDiagnostic(
+    (line: string) => console.log(line),
+    persistentSink,
+    'OPTIONAL_STAGE_BUDGET',
+    {
+      stage,
+      remainingMs: deadline.remainingMs(),
+      requiredMs,
+      reservedFinalAnswerMs: MIN_FINAL_ANSWER_BUDGET_MS,
+      result: 'SKIP',
+      msgIdToken,
+    },
+  )
+}
 
 function remainingBudgetBucket(remainingMs: number): string {
   if (remainingMs <= 0) return 'EXHAUSTED'
@@ -876,6 +901,17 @@ export class ChatService {
         { stage: 'FINAL', result: 'BLOCKED', kinds: firstKinds },
       )
 
+      if (deadline !== undefined && deadline.remainingMs() < MIN_FINAL_ANSWER_BUDGET_MS) {
+        logOptionalStageBudgetSkip(
+          persistentSink,
+          'PROVIDER_CONTROL_REPAIR',
+          deadline,
+          MIN_FINAL_ANSWER_BUDGET_MS,
+          msgIdToken,
+        )
+        throw new Error('Provider control markup was blocked')
+      }
+
       try {
         // The blocked protocol is deliberately not included in the repair prompt.
         draft = await this.requestFinalAnswer(
@@ -946,32 +982,42 @@ export class ChatService {
       // One bounded re-generation with the same grounded facts. A draft carrying a
       // raw identity value never takes this path: it is not provider-safe material,
       // not even for a rewrite request.
-      try {
-        const rewritten = await this.requestFinalAnswer(
-          REWRITE_SYSTEM_PROMPT,
-          rewriteUserPrompt(context, question, request, draft, presentation),
+      if (deadline !== undefined && deadline.remainingMs() < MIN_FINAL_ANSWER_BUDGET_MS) {
+        logOptionalStageBudgetSkip(
           persistentSink,
-          messageId,
-          deadline,
           'ANSWER_GUARD_REGENERATION',
+          deadline,
+          MIN_FINAL_ANSWER_BUDGET_MS,
+          msgIdToken,
         )
-        guard = guardFinalAnswer(rewritten, guardFacts)
-      } catch (error) {
-        if (isRequestDeadlineExceeded(error)) {
-          throw error
+      } else {
+        try {
+          const rewritten = await this.requestFinalAnswer(
+            REWRITE_SYSTEM_PROMPT,
+            rewriteUserPrompt(context, question, request, draft, presentation),
+            persistentSink,
+            messageId,
+            deadline,
+            'ANSWER_GUARD_REGENERATION',
+          )
+          guard = guardFinalAnswer(rewritten, guardFacts)
+        } catch (error) {
+          if (isRequestDeadlineExceeded(error)) {
+            throw error
+          }
+          // A re-generation that fails or returns nothing keeps the draft blocked.
+          console.log(formatDiagnosticLine('AGENT_ANSWER_GUARD', {
+            outcome: 'BLOCKED',
+            result: 'REGENERATION_FAILED',
+            msgIdToken,
+          }))
+          persistentSink?.writeStructured('ANSWER_GUARD', {
+            result: 'BLOCKED',
+            phase: 'regeneration',
+            errorCode: 'REGENERATION_FAILED',
+            msgIdToken,
+          })
         }
-        // A re-generation that fails or returns nothing keeps the draft blocked.
-        console.log(formatDiagnosticLine('AGENT_ANSWER_GUARD', {
-          outcome: 'BLOCKED',
-          result: 'REGENERATION_FAILED',
-          msgIdToken,
-        }))
-        persistentSink?.writeStructured('ANSWER_GUARD', {
-          result: 'BLOCKED',
-          phase: 'regeneration',
-          errorCode: 'REGENERATION_FAILED',
-          msgIdToken,
-        })
       }
     }
 

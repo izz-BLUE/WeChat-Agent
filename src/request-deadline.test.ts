@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import {
   ChatService,
+  MIN_FINAL_ANSWER_BUDGET_MS,
   MIN_GROUNDING_REPAIR_BUDGET_MS,
   WEB_SEARCH_GROUNDING_FAILURE_REPLY,
   type ChatRequestContext,
@@ -111,6 +112,22 @@ const GROUNDING_QUESTION: GroupMessage = {
   messageId: 'grounding-request',
 }
 
+const FINAL_REQUEST: ChatRequestContext = {
+  botDisplayName: '椰椰',
+  mention: 'MENTIONED',
+  requesterRole: 'MEMBER',
+  ownerConfigured: false,
+}
+
+const FINAL_QUESTION: GroupMessage = {
+  senderId: 'sender',
+  senderName: 'CURRENT_REQUESTER',
+  publicDisplayName: '测试成员',
+  text: '低预算测试',
+  timestamp: 1,
+  messageId: 'final-budget-request',
+}
+
 async function testDirectSufficient(): Promise<void> {
   let calls = 0
   await withMockFetch(async () => {
@@ -132,6 +149,87 @@ async function testDirectSufficient(): Promise<void> {
     assert.equal(result, '正常回复')
     assert.equal(calls, 1)
     assert.notEqual(agent.takeOutboundIdentity({ ...REQUEST, conversationType: 'DIRECT', conversationId: 'direct-sufficient' }, result), null)
+  })
+}
+
+async function testFinalAnswerRunsWithLowBudget(): Promise<void> {
+  let calls = 0
+  const deadline = new RequestDeadline(MIN_FINAL_ANSWER_BUDGET_MS - 1, () => 0, 0)
+  await withMockFetch(async () => {
+    calls += 1
+    return completionResponse('低预算仍然执行最终回答')
+  }, async () => {
+    const result = await new ChatService('https://provider.invalid/v1', 'test-key', 'test-model').reply(
+      [],
+      FINAL_QUESTION,
+      FINAL_REQUEST,
+      [],
+      undefined,
+      FINAL_QUESTION.messageId,
+      deadline,
+    )
+    assert.equal(result, '低预算仍然执行最终回答')
+    assert.equal(calls, 1)
+  })
+}
+
+async function testProviderControlRepairBudgetGate(): Promise<void> {
+  let calls = 0
+  let now = 0
+  const deadline = new RequestDeadline(MIN_FINAL_ANSWER_BUDGET_MS + 1, () => now, 0)
+  await withMockFetch(async () => {
+    calls += 1
+    now = 100
+    return completionResponse('<tool_call>search</tool_call>')
+  }, async () => {
+    await assert.rejects(
+      () => new ChatService('https://provider.invalid/v1', 'test-key', 'test-model').reply(
+        [],
+        FINAL_QUESTION,
+        FINAL_REQUEST,
+        [],
+        undefined,
+        FINAL_QUESTION.messageId,
+        deadline,
+      ),
+      /Provider control markup was blocked/u,
+    )
+    assert.equal(calls, 1)
+    assert.ok(deadline.remainingMs() < MIN_FINAL_ANSWER_BUDGET_MS)
+  })
+}
+
+async function testAnswerGuardRegenerationBudgetGate(): Promise<void> {
+  let calls = 0
+  let now = 0
+  const deadline = new RequestDeadline(MIN_FINAL_ANSWER_BUDGET_MS + 1, () => now, 0)
+  const context: GroupMessage[] = [{
+    senderId: 'other-sender',
+    senderName: 'MEMBER_1',
+    publicDisplayName: '其他成员',
+    text: '给你取了名字',
+    timestamp: 1,
+    messageId: 'other-message',
+  }]
+  await withMockFetch(async () => {
+    calls += 1
+    now = 100
+    return completionResponse('你就是 MEMBER_1，刚才给我取了名字。')
+  }, async () => {
+    await assert.rejects(
+      () => new ChatService('https://provider.invalid/v1', 'test-key', 'test-model').reply(
+        context,
+        FINAL_QUESTION,
+        { ...FINAL_REQUEST, currentSpeakerLabel: 'CURRENT_REQUESTER' },
+        [],
+        undefined,
+        FINAL_QUESTION.messageId,
+        deadline,
+      ),
+      /internal runtime labels/u,
+    )
+    assert.equal(calls, 1)
+    assert.ok(deadline.remainingMs() < MIN_FINAL_ANSWER_BUDGET_MS)
   })
 }
 
@@ -252,6 +350,9 @@ async function run(): Promise<void> {
   }
 
   await testDirectSufficient()
+  await testFinalAnswerRunsWithLowBudget()
+  await testProviderControlRepairBudgetGate()
+  await testAnswerGuardRegenerationBudgetGate()
   await testSearchAndFinalWithinDeadline()
   await testGroundingRepairAllowed()
   await testGroundingRepairBudgetGate()

@@ -1755,9 +1755,9 @@ async function main(): Promise<void> {
     }
   })
 
-  await test('fallback uses only the remaining RequestDeadline budget', async () => {
+  await test('low remaining budget skips provider fallback without fake success', async () => {
     const final = fakeFinalChat('deadline fallback[S1]')
-    let fallbackTimeout = 0
+    let fallbackCalls = 0
     try {
       const agent = new ProductionChatAgent(final.chat, {
         requestDeadlineMs: 500,
@@ -1769,15 +1769,15 @@ async function main(): Promise<void> {
           },
         },
         tavilyWebSearchProvider: {
-          search: async (searchRequest) => {
-            fallbackTimeout = searchRequest.timeoutMs
+          search: async () => {
+            fallbackCalls += 1
             return { results: [result('S1', 'remaining budget fallback')] }
           },
       },
       })
       const answer = await agent.complete(request())
-      check(fallbackTimeout > 0 && fallbackTimeout < 8_000, 'fallback received a fresh full provider timeout')
-      check(answer.includes('remaining budget fallback'), 'remaining-budget fallback did not complete')
+      check(fallbackCalls === 0, 'low-budget provider fallback was not skipped')
+      check(answer.includes('当前没有成功取得联网结果') && !answer.includes('remaining budget fallback'), 'low-budget fallback fabricated a search success')
     } finally {
       final.restore()
     }
