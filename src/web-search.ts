@@ -115,6 +115,20 @@ function cleanUrl(value: unknown): string | null {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return null
     }
+    parsed.hash = ''
+    for (const key of [...parsed.searchParams.keys()]) {
+      const normalizedKey = key.toLocaleLowerCase()
+      if (
+        normalizedKey.startsWith('utm_') ||
+        normalizedKey === 'spm' ||
+        normalizedKey === 'from' ||
+        normalizedKey === 'source' ||
+        normalizedKey === 'ref' ||
+        normalizedKey === 'ref_src'
+      ) {
+        parsed.searchParams.delete(key)
+      }
+    }
     return parsed.href
   } catch {
     return null
@@ -145,6 +159,277 @@ export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchR
     results.push(normalized)
   }
   return results
+}
+
+export interface WebSearchQualityOptions {
+  query: string
+  mode: WebSearchMode
+  window?: WebSearchWindow
+  runtimeLocalDate?: string
+  runtimeUtcIso?: string
+  runtimeTimeZone?: string
+}
+
+export interface WebSearchQualityReport {
+  inputCount: number
+  dedupedCount: number
+  selectedCount: number
+  reordered: boolean
+  uniqueHostCount: number
+  mode: WebSearchMode
+  datedResultCount: number
+  duplicateDroppedCount: number
+}
+
+export interface RankedWebSearchResults {
+  results: WebSearchResult[]
+  report: WebSearchQualityReport
+}
+
+const TITLE_SOURCE_SUFFIX = /\s*(?:[-|_]\s*(?:the paper|腾讯新闻))$/iu
+
+function normalizeTitleForDedup(title: string): string {
+  return title
+    .normalize('NFKC')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .toLocaleLowerCase()
+    .replace(TITLE_SOURCE_SUFFIX, '')
+    .trim()
+}
+
+function canonicalizeKnownUrl(url: string): string {
+  return cleanUrl(url) ?? url
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.toLocaleLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+function deduplicateQualityResults(input: readonly WebSearchResult[]): WebSearchResult[] {
+  const seenUrls = new Set<string>()
+  const seenTitles = new Set<string>()
+  const deduped: WebSearchResult[] = []
+  for (const item of input) {
+    const url = canonicalizeKnownUrl(item.url)
+    if (seenUrls.has(url)) {
+      continue
+    }
+    const titleKey = normalizeTitleForDedup(item.title)
+    if (titleKey.length > 0 && seenTitles.has(titleKey)) {
+      continue
+    }
+    seenUrls.add(url)
+    if (titleKey.length > 0) {
+      seenTitles.add(titleKey)
+    }
+    deduped.push({ ...item, url })
+  }
+  return deduped
+}
+
+function normalizeRelevanceText(value: string): string {
+  return value.normalize('NFKC').toLocaleLowerCase().replace(/\s+/gu, ' ').trim()
+}
+
+function chineseSegments(value: string): string[] {
+  return [...value.matchAll(/[\p{Script=Han}]{2,}/gu)].map((match) => match[0] ?? '').filter(Boolean)
+}
+
+function englishTokens(value: string): string[] {
+  return [...value.matchAll(/[a-z0-9][a-z0-9._-]{1,}/giu)].map((match) => (match[0] ?? '').toLocaleLowerCase())
+}
+
+function relevanceScore(query: string, item: WebSearchResult): number {
+  const normalizedQuery = normalizeRelevanceText(query)
+  const title = normalizeRelevanceText(item.title)
+  const snippet = normalizeRelevanceText(item.snippet)
+  if (normalizedQuery.length === 0) {
+    return 0
+  }
+
+  let score = 0
+  if (title.includes(normalizedQuery)) score += 100
+  if (snippet.includes(normalizedQuery)) score += 25
+
+  for (const segment of chineseSegments(normalizedQuery)) {
+    if (title.includes(segment)) score += Math.min(36, segment.length * 6)
+    if (snippet.includes(segment)) score += Math.min(12, segment.length * 2)
+  }
+
+  const queryTokens = [...new Set(englishTokens(normalizedQuery))]
+  for (const token of queryTokens) {
+    if (title.includes(token)) score += 18
+    if (snippet.includes(token)) score += 5
+  }
+  return score
+}
+
+interface ParsedPublishedAt {
+  localDate: string
+  timestamp: number
+}
+
+function parsedPublishedAt(value: string | null | undefined, timeZone: string): ParsedPublishedAt | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+  const normalized = value.trim()
+  if (normalized.length === 0) {
+    return null
+  }
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(normalized)
+  if (dateOnly !== null) {
+    const timestamp = Date.UTC(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    const date = new Date(timestamp)
+    if (
+      Number.isNaN(timestamp) ||
+      date.getUTCFullYear() !== Number(dateOnly[1]) ||
+      date.getUTCMonth() !== Number(dateOnly[2]) - 1 ||
+      date.getUTCDate() !== Number(dateOnly[3])
+    ) {
+      return null
+    }
+    return { localDate: normalized, timestamp }
+  }
+  const timestamp = Date.parse(normalized)
+  if (Number.isNaN(timestamp)) {
+    return null
+  }
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      calendar: 'gregory',
+      numberingSystem: 'latn',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date(timestamp))
+    const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]))
+    return { localDate: `${values.year}-${values.month}-${values.day}`, timestamp }
+  } catch {
+    return null
+  }
+}
+
+function dateDistanceInDays(runtimeLocalDate: string, publishedLocalDate: string): number | null {
+  const runtime = Date.parse(`${runtimeLocalDate}T00:00:00Z`)
+  const published = Date.parse(`${publishedLocalDate}T00:00:00Z`)
+  if (Number.isNaN(runtime) || Number.isNaN(published)) {
+    return null
+  }
+  return Math.floor((runtime - published) / 86_400_000)
+}
+
+function freshnessRank(
+  parsed: ParsedPublishedAt | null,
+  runtimeLocalDate: string | undefined,
+  window: WebSearchWindow,
+): number {
+  if (parsed === null || runtimeLocalDate === undefined) {
+    return 3
+  }
+  const distance = dateDistanceInDays(runtimeLocalDate, parsed.localDate)
+  if (distance === null || distance < 0) {
+    return 4
+  }
+  const windowDays = window === 'DAY_1' ? 0 : window === 'DAY_3' ? 2 : Number.POSITIVE_INFINITY
+  if (distance > windowDays) {
+    return 4
+  }
+  if (distance === 0) return 0
+  if (distance === 1) return 1
+  return 2
+}
+
+function compareNumbers(left: number, right: number): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
+
+function publishedTimeDistance(parsed: ParsedPublishedAt | null, runtimeUtcIso: string | undefined): number | null {
+  if (parsed === null || runtimeUtcIso === undefined) {
+    return null
+  }
+  const runtimeTimestamp = Date.parse(runtimeUtcIso)
+  if (Number.isNaN(runtimeTimestamp)) {
+    return null
+  }
+  return Math.abs(runtimeTimestamp - parsed.timestamp)
+}
+
+function diversifyByHostname(items: readonly {
+  item: WebSearchResult
+  host: string
+}[]): WebSearchResult[] {
+  const remaining = [...items]
+  const hostCounts = new Map<string, number>()
+  const selected: WebSearchResult[] = []
+  while (remaining.length > 0) {
+    const nextIndex = remaining.findIndex(({ host }) => (hostCounts.get(host) ?? 0) < 2)
+    const selectedIndex = nextIndex === -1 ? 0 : nextIndex
+    const next = remaining.splice(selectedIndex, 1)[0]
+    if (next === undefined) break
+    selected.push(next.item)
+    hostCounts.set(next.host, (hostCounts.get(next.host) ?? 0) + 1)
+  }
+  return selected
+}
+
+/** Normalize, deduplicate, rank, diversify, and reassign final source ids. */
+export function rankWebSearchResults(
+  input: readonly WebSearchResult[],
+  options: WebSearchQualityOptions,
+): RankedWebSearchResults {
+  const deduped = deduplicateQualityResults(input)
+  const runtimeTimeZone = options.runtimeTimeZone ?? 'UTC'
+  const window = options.window ?? (options.mode === 'NEWS_RECENT' ? 'DAY_3' : 'GENERAL')
+  const decorated = deduped.map((item, providerIndex) => ({
+    item,
+    providerIndex,
+    relevance: relevanceScore(options.query, item),
+    published: parsedPublishedAt(item.publishedAt, runtimeTimeZone),
+  }))
+  const sorted = [...decorated].sort((left, right) => {
+    if (options.mode === 'NEWS_RECENT') {
+      const freshness = compareNumbers(
+        freshnessRank(left.published, options.runtimeLocalDate, window),
+        freshnessRank(right.published, options.runtimeLocalDate, window),
+      )
+      if (freshness !== 0) return freshness
+      const leftDistance = publishedTimeDistance(left.published, options.runtimeUtcIso)
+      const rightDistance = publishedTimeDistance(right.published, options.runtimeUtcIso)
+      if (leftDistance !== null && rightDistance !== null) {
+        const distance = compareNumbers(leftDistance, rightDistance)
+        if (distance !== 0) return distance
+      }
+    }
+    const relevance = compareNumbers(right.relevance, left.relevance)
+    if (relevance !== 0) return relevance
+    return compareNumbers(left.providerIndex, right.providerIndex)
+  })
+  const diversified = diversifyByHostname(sorted.map(({ item }) => ({ item, host: hostOf(item.url) })))
+  const results = diversified.map((item, index) => ({ ...item, sourceId: `S${index + 1}` }))
+  const originalOrder = deduped.map((item) => item.url)
+  const reordered = results.some((item, index) => item.url !== originalOrder[index])
+  const uniqueHostCount = new Set(results.map((item) => hostOf(item.url)).filter(Boolean)).size
+  const datedResultCount = decorated.filter((item) => item.published !== null).length
+  return {
+    results,
+    report: {
+      inputCount: input.length,
+      dedupedCount: deduped.length,
+      selectedCount: results.length,
+      reordered,
+      uniqueHostCount,
+      mode: options.mode,
+      datedResultCount,
+      duplicateDroppedCount: input.length - deduped.length,
+    },
+  }
 }
 
 export interface WebSearchContext {

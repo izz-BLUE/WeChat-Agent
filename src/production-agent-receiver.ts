@@ -32,6 +32,7 @@ import { SpeakerLabelRegistry } from './speaker-labels.js'
 import {
   buildWebSearchContext,
   normalizeWebSearchResults,
+  rankWebSearchResults,
   SearXNGWebSearchProvider,
   TavilyWebSearchProvider,
   WebSearchError,
@@ -1045,8 +1046,20 @@ export class ProductionChatAgent implements AgentExecutor {
             return failed(window)
           }
 
-          this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length, msgIdToken)
-          const bounded = buildWebSearchContext(normalized, this.webSearchMaxContextChars)
+          const ranked = rankWebSearchResults(normalized, {
+            query: decision.query,
+            mode,
+            window,
+            runtimeLocalDate: runtimeTime.localDate,
+            runtimeUtcIso: runtimeTime.utcIso,
+            runtimeTimeZone: runtimeTime.timeZone,
+          })
+          this.logWebSearchExecution(mode, window, attempt, 'PASS', ranked.results.length, msgIdToken)
+          const bounded = buildWebSearchContext(ranked.results, this.webSearchMaxContextChars)
+          this.logWebSearchQuality({
+            ...ranked.report,
+            selectedCount: bounded.results.length,
+          }, msgIdToken)
           this.logWebSearch('PASS', bounded.results.length, 'NONE', msgIdToken)
           this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
           if (bounded.results.length === 0) {
@@ -1146,6 +1159,18 @@ export class ProductionChatAgent implements AgentExecutor {
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
       'WEB_SEARCH_CONTEXT',
       { resultCount, chars, truncated, msgIdToken },
+    )
+  }
+
+  private logWebSearchQuality(
+    report: ReturnType<typeof rankWebSearchResults>['report'],
+    msgIdToken: string,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'WEB_SEARCH_RESULT_QUALITY',
+      { ...report, result: 'PASS', msgIdToken },
     )
   }
 }

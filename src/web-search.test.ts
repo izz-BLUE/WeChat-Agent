@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { appendGroundedSources, SearXNGWebSearchProvider, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
+import { appendGroundedSources, rankWebSearchResults, SearXNGWebSearchProvider, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
 import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
@@ -1338,12 +1338,80 @@ async function main(): Promise<void> {
 
   await test('invalid and duplicate URLs are dropped', () => {
     const normalized = normalizeWebSearchResults([
-      { title: 'A', url: 'https://example.com/a', content: 'one' },
-      { title: 'duplicate', url: 'https://example.com/a', content: 'two' },
+      { title: 'A', url: 'https://example.com/a?utm_source=feed#top', content: 'one' },
+      { title: 'duplicate', url: 'https://example.com/a?utm_source=other#copy', content: 'two' },
       { title: 'bad', url: 'javascript:alert(1)', content: 'three' },
       { title: '', url: 'https://example.com/empty', content: '' },
     ])
     check(normalized.length === 1 && normalized[0]?.sourceId === 'S1', 'URL normalization did not fail closed')
+    check(normalized[0]?.url === 'https://example.com/a', 'tracking parameters or fragment were not canonicalized')
+  })
+
+  await test('search result quality layer applies bounded deterministic ranking', () => {
+    const canonical = normalizeWebSearchResults([
+      { title: '同一新闻', url: 'https://news.example/a?utm_medium=feed', content: '摘要一' },
+      { title: '同一新闻', url: 'https://news.example/a?from=search', content: '摘要二' },
+      { title: '不同新闻', url: 'https://other.example/b?keep=1', content: '摘要三' },
+    ])
+    check(canonical.length === 2, 'canonical URL dedup did not remove only the tracking duplicate')
+    const titleDedup = rankWebSearchResults([
+      result('S1', '重大进展 - The Paper', 'https://paper.example/a'),
+      result('S2', '重大进展', 'https://paper.example/b'),
+      result('S3', '另一条新闻', 'https://paper.example/c'),
+    ], { query: '新闻', mode: 'GENERAL' })
+    check(titleDedup.results.length === 2 && titleDedup.report.duplicateDroppedCount === 1, 'high-confidence title dedup did not behave conservatively')
+
+    const today = result('S9', '今天目标新闻', 'https://today.example/news', '2026-09-11')
+    const yesterday = result('S8', '昨天目标新闻', 'https://yesterday.example/news', '2026-09-10')
+    const unknown = result('S7', '未知日期目标新闻', 'https://unknown.example/news')
+    const news = rankWebSearchResults([unknown, yesterday, today], {
+      query: '目标新闻',
+      mode: 'NEWS_RECENT',
+      window: 'DAY_3',
+      runtimeLocalDate: RUNTIME_TIME.localDate,
+      runtimeTimeZone: RUNTIME_TIME.timeZone,
+    })
+    check(news.results.map((item) => item.title).join('|') === '今天目标新闻|昨天目标新闻|未知日期目标新闻', 'NEWS_RECENT freshness order is incorrect')
+    check(news.report.datedResultCount === 2 && news.report.mode === 'NEWS_RECENT', 'NEWS_RECENT quality report is incomplete')
+
+    const oldHighRank = result('S1', '旧目标新闻', 'https://old.example/news', '2026-09-01')
+    const todayLowerRank = result('S2', '今天目标新闻', 'https://fresh.example/news', '2026-09-11')
+    const freshness = rankWebSearchResults([oldHighRank, todayLowerRank], {
+      query: '目标新闻',
+      mode: 'NEWS_RECENT',
+      window: 'DAY_3',
+      runtimeLocalDate: RUNTIME_TIME.localDate,
+      runtimeTimeZone: RUNTIME_TIME.timeZone,
+    })
+    check(freshness.results[0]?.title === '今天目标新闻', 'today result did not outrank old provider rank')
+
+    const general = rankWebSearchResults([
+      result('S1', '无关天气预报', 'https://general.example/weather'),
+      result('S2', 'Java 21 发布说明', 'https://general.example/java'),
+    ], { query: 'Java 21', mode: 'GENERAL' })
+    check(general.results[0]?.title === 'Java 21 发布说明', 'GENERAL relevance did not outrank weak result')
+
+    const chinese = rankWebSearchResults([
+      result('S1', '上海天气预报', 'https://general.example/weather'),
+      result('S2', '上海今天最离谱但是真的新闻', 'https://general.example/news'),
+    ], { query: '今天最离谱但是真的新闻', mode: 'GENERAL' })
+    check(chinese.results[0]?.title === '上海今天最离谱但是真的新闻', 'Chinese relevance relied on whitespace tokenization or failed')
+
+    const diverse = rankWebSearchResults([
+      result('S1', '目标一', 'https://same.example/1'),
+      result('S2', '目标二', 'https://same.example/2'),
+      result('S3', '目标三', 'https://same.example/3'),
+      result('S4', '目标四', 'https://other.example/4'),
+      result('S5', '目标五', 'https://third.example/5'),
+    ], { query: '目标', mode: 'GENERAL' })
+    const hosts = diverse.results.map((item) => new URL(item.url).hostname)
+    check(hosts.slice(0, 4).join('|') === 'same.example|same.example|other.example|third.example', 'hostname diversity did not shape the bounded prefix')
+    check(diverse.results.length === 5 && diverse.report.uniqueHostCount === 3, 'diversity strategy dropped usable results')
+    check(diverse.results.every((item, index) => item.sourceId === `S${index + 1}`), 'reranked source ids are not continuous')
+
+    const grounded = appendGroundedSources(`结论[${diverse.results[0]?.sourceId}]`, diverse.results)
+    check(grounded.includes(`${diverse.results[0]?.title} ${diverse.results[0]?.url}`), 'Grounding did not use reranked source ids')
+    check(!grounded.includes('[S1]'), 'reranked source marker remained visible')
   })
 
   await test('web search context budget keeps ranked prefix only', () => {
