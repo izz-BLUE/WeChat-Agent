@@ -122,7 +122,7 @@ RECENCY_WINDOW 是受限的语义时间窗口，不是关键词路由：
 - NEWS_RECENT 如果语义要求今天、今日、刚刚、过去24小时、recent 24 hours、从昨晚到现在、截至今晚或等价的约一天范围，输出 RECENCY_WINDOW=DAY_1。
 - NEWS_RECENT 如果语义只是最近、近期、本周动态、最新消息或等价的较短近期范围，但没有明确约一天窗口，输出 RECENCY_WINDOW=DAY_3。
 - 这些只是语义示例；不要用字符串包含、固定关键词或机械词表代替语义判断。
-Runtime 会根据 RECENCY_WINDOW 和可信 Runtime Time 决定有限的日期窗口；你不要输出任意日期参数、days、start_date、end_date、time_range 或其它 Tavily 参数。
+Runtime 会根据 RECENCY_WINDOW 和可信 Runtime Time 决定有限的日期窗口；你不要输出任意日期参数、days、start_date、end_date、time_range 或其它 Provider 参数。
 
 DIRECT 必须输出：ACTION=DIRECT、REASON=DIRECT_SUFFICIENT、QUERY=（空）、SEARCH_MODE=GENERAL、RECENCY_WINDOW=NONE。
 GENERAL SEARCH 必须输出：SEARCH_MODE=GENERAL、RECENCY_WINDOW=NONE。
@@ -170,7 +170,7 @@ REASON=...
 QUERY=...
 SEARCH_MODE=...
 RECENCY_WINDOW=...
-Runtime 会在你输出 SEARCH 协议后自行执行 Tavily。`
+Runtime 会在你输出 SEARCH 协议后自行选择现有 Web Search Provider 执行一次搜索。`
 
 export function buildWebSearchPlannerUserPrompt(input: WebSearchPlanInput): string {
   const splitActiveContext = input.currentRequesterActiveContext !== undefined || input.otherMemberActiveContext !== undefined

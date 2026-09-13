@@ -137,9 +137,12 @@ export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchR
       continue
     }
     seen.add(url)
-    const publishedValue = record.publishedAt ?? record.published_date
-    const publishedAt = typeof publishedValue === 'string' ? publishedValue.slice(0, 80) : null
-    results.push({ sourceId: `S${results.length + 1}`, title, url, snippet, publishedAt })
+    const publishedValue = record.publishedAt ?? record.publishedDate ?? record.published_date
+    const normalized: WebSearchResult = { sourceId: `S${results.length + 1}`, title, url, snippet }
+    if (typeof publishedValue === 'string') {
+      normalized.publishedAt = publishedValue.slice(0, 80)
+    }
+    results.push(normalized)
   }
   return results
 }
@@ -314,6 +317,100 @@ export class TavilyWebSearchProvider implements WebSearchProvider {
         throw new WebSearchError('INVALID_RESPONSE')
       }
       return { results: normalizeWebSearchResults(record.results).slice(0, request.maxResults) }
+    } finally {
+      clearTimeout(timeout)
+      request.signal?.removeEventListener('abort', abortExternal)
+    }
+  }
+}
+
+export class SearXNGWebSearchProvider implements WebSearchProvider {
+  private readonly engines: readonly string[]
+
+  public constructor(
+    private readonly apiBase: string,
+    engines: readonly string[] = ['360search', 'sogou'],
+  ) {
+    this.engines = engines.map((engine) => engine.trim()).filter((engine) => engine.length > 0)
+  }
+
+  public async search(request: WebSearchRequest): Promise<WebSearchResponse> {
+    if (!this.apiBase) {
+      throw new WebSearchError('DISABLED')
+    }
+
+    const base = this.apiBase.replace(/\/+$/u, '')
+    const endpoint = base.endsWith('/search') ? base : `${base}/search`
+    let url: URL
+    try {
+      url = new URL(endpoint)
+    } catch {
+      throw new WebSearchError('HTTP_ERROR')
+    }
+    url.searchParams.set('q', request.query)
+    url.searchParams.set('format', 'json')
+    url.searchParams.set('language', 'zh-CN')
+    if (this.engines.length > 0) {
+      url.searchParams.set('engines', this.engines.join(','))
+    }
+    if (request.mode === 'NEWS_RECENT' && request.days !== undefined) {
+      // SearXNG exposes a day-level range, not the exact three-day bounds used
+      // by Tavily. Keep the window bounded and let NEWS_RECENT prefer Tavily.
+      url.searchParams.set('time_range', 'day')
+    }
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), Math.max(1, request.timeoutMs))
+    const abortExternal = (): void => controller.abort()
+    if (request.signal?.aborted) {
+      controller.abort()
+    }
+    request.signal?.addEventListener('abort', abortExternal, { once: true })
+    try {
+      let response: Response
+      try {
+        response = await fetch(url, {
+          method: 'GET',
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (controller.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
+          throw new WebSearchError('TIMEOUT')
+        }
+        throw new WebSearchError('HTTP_ERROR')
+      }
+
+      if (!response.ok) {
+        throw new WebSearchError('HTTP_ERROR')
+      }
+
+      let data: unknown
+      try {
+        data = await response.json()
+      } catch {
+        throw new WebSearchError('INVALID_RESPONSE')
+      }
+      const record = asRecord(data)
+      if (!record || !Array.isArray(record.results)) {
+        throw new WebSearchError('INVALID_RESPONSE')
+      }
+
+      const mappedResults = record.results.map((item) => {
+        const result = asRecord(item)
+        if (!result) {
+          return item
+        }
+        const mapped: Record<string, unknown> = {
+          title: result.title,
+          url: result.url,
+          snippet: result.content,
+        }
+        if (Object.prototype.hasOwnProperty.call(result, 'publishedDate')) {
+          mapped.publishedAt = result.publishedDate
+        }
+        return mapped
+      })
+      return { results: normalizeWebSearchResults(mappedResults).slice(0, request.maxResults) }
     } finally {
       clearTimeout(timeout)
       request.signal?.removeEventListener('abort', abortExternal)

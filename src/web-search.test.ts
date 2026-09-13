@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { appendGroundedSources, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
+import { appendGroundedSources, SearXNGWebSearchProvider, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
 import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
@@ -1515,6 +1515,239 @@ async function main(): Promise<void> {
       )
     } finally {
       globalThis.fetch = original
+    }
+  })
+
+  await test('SearXNG adapter URL-encodes query, applies Chinese JSON options, and normalizes content', async () => {
+    const original = globalThis.fetch
+    try {
+      let requestedUrl = ''
+      let requestedMethod = ''
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        requestedUrl = String(input)
+        requestedMethod = init?.method ?? ''
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ results: [{
+            title: '中文标题',
+            url: 'https://example.com/searxng',
+            content: '<p>中文摘要</p>',
+            publishedDate: '2026-09-12',
+            engine: 'sogou',
+            engines: ['sogou'],
+            positions: [1],
+            score: 1,
+            category: 'general',
+          }] }),
+        }
+      }) as unknown as typeof fetch
+      const response = await new SearXNGWebSearchProvider('http://127.0.0.1:8088', ['360search', 'sogou']).search({
+        query: '中文 查询 & 价格', maxResults: 3, timeoutMs: 100, mode: 'GENERAL',
+      })
+      const url = new URL(requestedUrl)
+      check(requestedMethod === 'GET', 'SearXNG did not use GET')
+      check(url.pathname === '/search', 'SearXNG endpoint path is incorrect')
+      check(url.searchParams.get('q') === '中文 查询 & 价格', 'SearXNG query was not URL encoded safely')
+      check(url.searchParams.get('format') === 'json' && url.searchParams.get('language') === 'zh-CN', 'SearXNG JSON language options are missing')
+      check(url.searchParams.get('engines') === '360search,sogou', 'SearXNG engine allowlist is incorrect')
+      check(response.results.length === 1 && response.results[0]?.title === '中文标题' && response.results[0]?.snippet === '中文摘要', 'SearXNG fields were not normalized')
+      check(response.results[0]?.publishedAt === '2026-09-12', 'SearXNG publishedDate was not mapped')
+      check(!requestedUrl.includes('score') && !requestedUrl.includes('engines%5B'), 'SearXNG response metadata leaked into the request path')
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  await test('SearXNG NEWS_RECENT maps bounded windows to day without expanding to month', async () => {
+    const original = globalThis.fetch
+    try {
+      let requestedUrl = ''
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        requestedUrl = String(input)
+        return { ok: true, status: 200, json: async () => ({ results: [] }) }
+      }) as unknown as typeof fetch
+      await new SearXNGWebSearchProvider('http://127.0.0.1:8088', ['360search', 'sogou']).search({
+        query: '近期新闻', maxResults: 3, timeoutMs: 100, mode: 'NEWS_RECENT', days: 3,
+      })
+      const url = new URL(requestedUrl)
+      check(url.searchParams.get('time_range') === 'day', 'SearXNG did not use the bounded day time_range')
+      check(url.searchParams.get('time_range') !== 'month', 'SearXNG widened the recency window to month')
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  await test('SearXNG missing publishedDate does not fabricate publishedAt', async () => {
+    const original = globalThis.fetch
+    try {
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ results: [{ title: '无日期标题', url: 'https://example.com/no-date', content: '无日期摘要' }] }),
+      })) as unknown as typeof fetch
+      const response = await new SearXNGWebSearchProvider('http://127.0.0.1:8088').search({
+        query: '无日期', maxResults: 3, timeoutMs: 100, mode: 'GENERAL',
+      })
+      check(response.results.length === 1 && !Object.prototype.hasOwnProperty.call(response.results[0], 'publishedAt'), 'missing publishedDate was fabricated')
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  await test('malformed SearXNG JSON is INVALID_RESPONSE', async () => {
+    const original = globalThis.fetch
+    try {
+      globalThis.fetch = (async () => ({ ok: true, status: 200, json: async () => ({ results: 'not-an-array' }) })) as unknown as typeof fetch
+      await assert.rejects(
+        () => new SearXNGWebSearchProvider('http://127.0.0.1:8088').search({ query: 'q', maxResults: 1, timeoutMs: 100, mode: 'GENERAL' }),
+        (error: unknown) => error instanceof WebSearchError && error.reason === 'INVALID_RESPONSE',
+      )
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  await test('SearXNG adapter aborts on timeout', async () => {
+    const original = globalThis.fetch
+    try {
+      globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => await new Promise((_, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          const error = new Error('aborted')
+          error.name = 'AbortError'
+          reject(error)
+        }, { once: true })
+      })) as unknown as typeof fetch
+      await assert.rejects(
+        () => new SearXNGWebSearchProvider('http://127.0.0.1:8088').search({ query: 'q', maxResults: 1, timeoutMs: 5, mode: 'GENERAL' }),
+        (error: unknown) => error instanceof WebSearchError && error.reason === 'TIMEOUT',
+      )
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  await test('Chinese GENERAL routes to SearXNG primary and preserves S1 grounding', async () => {
+    const final = fakeFinalChat('中文结论[S1]')
+    const calls: string[] = []
+    const makeProvider = (name: string): WebSearchProvider => ({
+      search: async () => {
+        calls.push(name)
+        return { results: [result('S1', `${name} 来源`, `https://example.com/${name}`)] }
+      },
+    })
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=中文资料\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        tavilyWebSearchProvider: makeProvider('tavily'),
+        searxngWebSearchProvider: makeProvider('searxng'),
+      })
+      const answer = await agent.complete(request())
+      check(calls.join(',') === 'searxng', 'Chinese GENERAL did not use SearXNG as primary')
+      check(answer.includes('searxng 来源 https://example.com/searxng') && !answer.includes('[S1]'), 'SearXNG result did not preserve the existing grounding contract')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('English GENERAL routes to Tavily primary and keeps global search behavior', async () => {
+    const final = fakeFinalChat('English conclusion[S1]')
+    const calls: string[] = []
+    const makeProvider = (name: string): WebSearchProvider => ({
+      search: async () => {
+        calls.push(name)
+        return { results: [result('S1', `${name} source`, `https://example.com/${name}`)] }
+      },
+    })
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=OpenAI stable facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        tavilyWebSearchProvider: makeProvider('tavily'),
+        searxngWebSearchProvider: makeProvider('searxng'),
+      })
+      const answer = await agent.complete(request({ text: '@椰椰 OpenAI stable facts', rawText: '@椰椰 OpenAI stable facts' }))
+      check(calls.join(',') === 'tavily', 'English GENERAL did not use Tavily as primary')
+      check(answer.includes('tavily source https://example.com/tavily'), 'Tavily global search result changed')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('Chinese SearXNG NO_RESULTS falls back to Tavily once', async () => {
+    const final = fakeFinalChat('fallback 结论[S1]')
+    const calls: string[] = []
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=中文资料\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        searxngWebSearchProvider: { search: async () => { calls.push('searxng'); return { results: [] } } },
+        tavilyWebSearchProvider: { search: async () => { calls.push('tavily'); return { results: [result('S1', 'Tavily fallback')] } } },
+      })
+      const answer = await agent.complete(request())
+      check(calls.join(',') === 'searxng,tavily', 'NO_RESULTS did not trigger exactly one Tavily fallback')
+      check(answer.includes('Tavily fallback'), 'Tavily fallback result was not grounded')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('Chinese SearXNG TIMEOUT falls back to Tavily once', async () => {
+    const final = fakeFinalChat('timeout fallback[S1]')
+    const calls: string[] = []
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=中文资料\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        searxngWebSearchProvider: { search: async () => { calls.push('searxng'); throw new WebSearchError('TIMEOUT') } },
+        tavilyWebSearchProvider: { search: async () => { calls.push('tavily'); return { results: [result('S1', 'Tavily timeout fallback')] } } },
+      })
+      const answer = await agent.complete(request())
+      check(calls.join(',') === 'searxng,tavily', 'TIMEOUT did not trigger exactly one Tavily fallback')
+      check(answer.includes('Tavily timeout fallback'), 'Tavily timeout fallback result was not grounded')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('NEWS_RECENT keeps Tavily primary even for Chinese queries', async () => {
+    const final = fakeFinalChat('近期新闻[S1]')
+    const calls: string[] = []
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI 最近新闻\nSEARCH_MODE=NEWS_RECENT\nRECENCY_WINDOW=DAY_3'),
+        tavilyWebSearchProvider: { search: async () => { calls.push('tavily'); return { results: [result('S1', 'Tavily recent')] } } },
+        searxngWebSearchProvider: { search: async () => { calls.push('searxng'); return { results: [result('S1', 'SearXNG recent')] } } },
+      })
+      await agent.complete(request())
+      check(calls.join(',') === 'tavily', 'NEWS_RECENT Chinese query changed the Tavily primary')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('fallback uses only the remaining RequestDeadline budget', async () => {
+    const final = fakeFinalChat('deadline fallback[S1]')
+    let fallbackTimeout = 0
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        requestDeadlineMs: 500,
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=中文资料\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        searxngWebSearchProvider: {
+          search: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 20))
+            throw new WebSearchError('TIMEOUT')
+          },
+        },
+        tavilyWebSearchProvider: {
+          search: async (searchRequest) => {
+            fallbackTimeout = searchRequest.timeoutMs
+            return { results: [result('S1', 'remaining budget fallback')] }
+          },
+      },
+      })
+      const answer = await agent.complete(request())
+      check(fallbackTimeout > 0 && fallbackTimeout < 8_000, 'fallback received a fresh full provider timeout')
+      check(answer.includes('remaining budget fallback'), 'remaining-budget fallback did not complete')
+    } finally {
+      final.restore()
     }
   })
 

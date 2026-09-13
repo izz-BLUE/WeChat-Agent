@@ -30,6 +30,7 @@ import { SpeakerLabelRegistry } from './speaker-labels.js'
 import {
   buildWebSearchContext,
   normalizeWebSearchResults,
+  SearXNGWebSearchProvider,
   TavilyWebSearchProvider,
   WebSearchError,
   type WebSearchMode,
@@ -177,7 +178,10 @@ export interface ProductionChatAgentOptions {
   persistentLog?: PersistentRuntimeLog
   /** Optional autonomous web-search seam. Absent means zero planner/provider calls. */
   webSearchPlanner?: WebSearchPlannerLike | null
+  /** Backwards-compatible single-provider seam used by existing tests/callers. */
   webSearchProvider?: WebSearchProvider | null
+  tavilyWebSearchProvider?: WebSearchProvider | null
+  searxngWebSearchProvider?: WebSearchProvider | null
   webSearchMaxResults?: number
   webSearchTimeoutMs?: number
   webSearchMaxContextChars?: number
@@ -200,7 +204,8 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly memory: MemoryService | null
   private readonly persistentLog: PersistentRuntimeLog | null
   private readonly webSearchPlanner: WebSearchPlannerLike | null
-  private readonly webSearchProvider: WebSearchProvider | null
+  private readonly tavilyWebSearchProvider: WebSearchProvider | null
+  private readonly searxngWebSearchProvider: WebSearchProvider | null
   private readonly webSearchMaxResults: number
   private readonly webSearchTimeoutMs: number
   private readonly webSearchMaxContextChars: number
@@ -220,7 +225,9 @@ export class ProductionChatAgent implements AgentExecutor {
     this.memory = options.memory ?? null
     this.persistentLog = options.persistentLog ?? null
     this.webSearchPlanner = options.webSearchPlanner ?? null
-    this.webSearchProvider = options.webSearchProvider ?? null
+    const legacyWebSearchProvider = options.webSearchProvider ?? null
+    this.tavilyWebSearchProvider = options.tavilyWebSearchProvider ?? legacyWebSearchProvider
+    this.searxngWebSearchProvider = options.searxngWebSearchProvider ?? legacyWebSearchProvider
     this.webSearchMaxResults = options.webSearchMaxResults ?? config.webSearchMaxResults
     this.webSearchTimeoutMs = options.webSearchTimeoutMs ?? config.webSearchTimeoutMs
     this.webSearchMaxContextChars = options.webSearchMaxContextChars ?? config.webSearchMaxContextChars
@@ -908,6 +915,16 @@ export class ProductionChatAgent implements AgentExecutor {
         ? 'DAY_3'
         : 'GENERAL'
     const windows = primaryWindow === 'DAY_1' ? ['DAY_1', 'DAY_3'] as const : [primaryWindow] as const
+    const preferSearXng = mode === 'GENERAL' && /\p{Script=Han}/u.test(decision.query)
+    const providerCandidates = preferSearXng
+      ? [this.searxngWebSearchProvider, this.tavilyWebSearchProvider]
+      : [this.tavilyWebSearchProvider, this.searxngWebSearchProvider]
+    const providers: WebSearchProvider[] = []
+    for (const candidate of providerCandidates) {
+      if (candidate !== null && !providers.includes(candidate)) {
+        providers.push(candidate)
+      }
+    }
     const failed = (window: WebSearchWindow) => ({
       used: true as const,
       status: 'FAILED' as const,
@@ -917,66 +934,81 @@ export class ProductionChatAgent implements AgentExecutor {
       window,
     })
 
-    if (this.webSearchProvider === null) {
+    if (providers.length === 0) {
       this.logWebSearchExecution(mode, primaryWindow, 1, 'FAILED', 0, msgIdToken)
       this.logWebSearch('FAIL', 0, 'DISABLED', msgIdToken)
       this.logWebSearchContext(0, 0, false, msgIdToken)
       return failed(primaryWindow)
     }
 
-    for (const [index, window] of windows.entries()) {
-      const attempt = index + 1
-      try {
-        const days = window === 'DAY_1' ? 1 : window === 'DAY_3' ? 3 : undefined
-        deadline.mark('WEB_SEARCH')
-        deadline.throwIfExpired()
-        const response = await withRequestDeadline(deadline, (signal) => this.webSearchProvider!.search({
-          query: decision.query!,
-          maxResults: this.webSearchMaxResults,
-          timeoutMs: Math.min(this.webSearchTimeoutMs, Math.max(1, deadline.remainingMs())),
-          mode,
-          signal,
-          ...(days === undefined ? {} : {
-            days: days as 1 | 3,
-            startDate: dateDaysBefore(runtimeTime.localDate, days - 1),
-            endDate: runtimeTime.localDate,
-          }),
-        }))
-        const normalized = normalizeWebSearchResults(response.results)
-        if (normalized.length === 0) {
-          this.logWebSearchExecution(mode, window, attempt, 'NO_RESULTS', 0, msgIdToken)
-          this.logWebSearch('FAIL', 0, 'NO_RESULTS', msgIdToken)
+    let attempt = 0
+    for (const [providerIndex, provider] of providers.entries()) {
+      const providerWindows = mode === 'NEWS_RECENT' && provider === this.tavilyWebSearchProvider
+        ? windows
+        : [primaryWindow] as const
+      for (const [windowIndex, window] of providerWindows.entries()) {
+        attempt += 1
+        try {
+          const days = window === 'DAY_1' ? 1 : window === 'DAY_3' ? 3 : undefined
+          deadline.mark('WEB_SEARCH')
+          deadline.throwIfExpired()
+          const response = await withRequestDeadline(deadline, (signal) => provider.search({
+            query: decision.query!,
+            maxResults: this.webSearchMaxResults,
+            timeoutMs: Math.min(this.webSearchTimeoutMs, Math.max(1, deadline.remainingMs())),
+            mode,
+            signal,
+            ...(days === undefined ? {} : {
+              days: days as 1 | 3,
+              startDate: dateDaysBefore(runtimeTime.localDate, days - 1),
+              endDate: runtimeTime.localDate,
+            }),
+          }))
+          const normalized = normalizeWebSearchResults(response.results)
+          if (normalized.length === 0) {
+            this.logWebSearchExecution(mode, window, attempt, 'NO_RESULTS', 0, msgIdToken)
+            this.logWebSearch('FAIL', 0, 'NO_RESULTS', msgIdToken)
+            this.logWebSearchContext(0, 0, false, msgIdToken)
+            if (windowIndex + 1 < providerWindows.length) {
+              continue
+            }
+            if (providerIndex + 1 < providers.length) {
+              break
+            }
+            return failed(window)
+          }
+
+          this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length, msgIdToken)
+          const bounded = buildWebSearchContext(normalized, this.webSearchMaxContextChars)
+          this.logWebSearch('PASS', bounded.results.length, 'NONE', msgIdToken)
+          this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
+          if (bounded.results.length === 0) {
+            if (providerIndex + 1 < providers.length) {
+              break
+            }
+            return failed(window)
+          }
+          return {
+            used: true,
+            status: 'PASS',
+            results: bounded.results,
+            maxContextChars: this.webSearchMaxContextChars,
+            mode,
+            window,
+          }
+        } catch (error) {
+          if (isRequestDeadlineExceeded(error)) throw error
+          const reason: WebSearchFailureReason = error instanceof WebSearchError
+            ? error.reason
+            : 'HTTP_ERROR'
+          this.logWebSearchExecution(mode, window, attempt, 'FAILED', 0, msgIdToken)
+          this.logWebSearch('FAIL', 0, reason, msgIdToken)
           this.logWebSearchContext(0, 0, false, msgIdToken)
-          if (attempt < windows.length) {
-            continue
+          if (providerIndex + 1 < providers.length) {
+            break
           }
           return failed(window)
         }
-
-        this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length, msgIdToken)
-        const bounded = buildWebSearchContext(normalized, this.webSearchMaxContextChars)
-        this.logWebSearch('PASS', bounded.results.length, 'NONE', msgIdToken)
-        this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
-        if (bounded.results.length === 0) {
-          return failed(window)
-        }
-        return {
-          used: true,
-          status: 'PASS',
-          results: bounded.results,
-          maxContextChars: this.webSearchMaxContextChars,
-          mode,
-          window,
-        }
-      } catch (error) {
-        if (isRequestDeadlineExceeded(error)) throw error
-        const reason: WebSearchFailureReason = error instanceof WebSearchError
-          ? error.reason
-          : 'HTTP_ERROR'
-        this.logWebSearchExecution(mode, window, attempt, 'FAILED', 0, msgIdToken)
-        this.logWebSearch('FAIL', 0, reason, msgIdToken)
-        this.logWebSearchContext(0, 0, false, msgIdToken)
-        return failed(window)
       }
     }
 
@@ -1070,11 +1102,15 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
   const webSearchProvider = config.webSearchEnabled
     ? new TavilyWebSearchProvider(config.tavilyApiBase, config.tavilyApiKey)
     : null
+  const searxngWebSearchProvider = config.webSearchEnabled && config.searxngEnabled
+    ? new SearXNGWebSearchProvider(config.searxngApiBase, config.searxngEngines)
+    : null
   return new ProductionChatAgent(chatService, {
     memory: createMemoryService(chatService, options.persistentLog),
     persistentLog: options.persistentLog,
     webSearchPlanner,
-    webSearchProvider,
+    tavilyWebSearchProvider: webSearchProvider,
+    searxngWebSearchProvider,
     webSearchMaxResults: config.webSearchMaxResults,
     webSearchTimeoutMs: config.webSearchTimeoutMs,
     webSearchMaxContextChars: config.webSearchMaxContextChars,

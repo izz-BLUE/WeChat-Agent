@@ -77,6 +77,12 @@ export const config = {
   webSearchProvider: process.env.WEB_SEARCH_PROVIDER?.trim() || 'tavily',
   tavilyApiBase: process.env.TAVILY_API_BASE?.trim() ?? '',
   tavilyApiKey: process.env.TAVILY_API_KEY ?? '',
+  searxngEnabled: (process.env.SEARXNG_ENABLED ?? '0').trim() === '1',
+  searxngApiBase: process.env.SEARXNG_API_BASE?.trim() || 'http://127.0.0.1:8088',
+  searxngEngines: (process.env.SEARXNG_ENGINES?.trim() || '360search,sogou')
+    .split(',')
+    .map((engine) => engine.trim())
+    .filter((engine) => engine.length > 0),
   webSearchMaxResults: positiveInteger('WEB_SEARCH_MAX_RESULTS', 5),
   webSearchTimeoutMs: positiveInteger('WEB_SEARCH_TIMEOUT_MS', 8_000),
   webSearchMaxContextChars: positiveInteger('WEB_SEARCH_MAX_CONTEXT_CHARS', 6_000),
@@ -103,13 +109,15 @@ export function validateChatConfig(): void {
     if (config.webSearchProvider !== 'tavily') {
       throw new Error(`Unsupported WEB_SEARCH_PROVIDER: ${config.webSearchProvider}`)
     }
-    const webSearchMissing = [
-      ['TAVILY_API_BASE', config.tavilyApiBase],
-      ['TAVILY_API_KEY', config.tavilyApiKey],
-    ]
-      .filter(([, value]) => !value)
-      .map(([name]) => name)
-    if (webSearchMissing.length > 0) {
+    const tavilyConfigured = Boolean(config.tavilyApiBase && config.tavilyApiKey)
+    const searxngConfigured = config.searxngEnabled && Boolean(config.searxngApiBase)
+    if (!tavilyConfigured && !searxngConfigured) {
+      const webSearchMissing = [
+        ['TAVILY_API_BASE', config.tavilyApiBase],
+        ['TAVILY_API_KEY', config.tavilyApiKey],
+      ]
+        .filter(([, value]) => !value)
+        .map(([name]) => name)
       throw new Error(`Web search requires: ${webSearchMissing.join(', ')}`)
     }
   }
