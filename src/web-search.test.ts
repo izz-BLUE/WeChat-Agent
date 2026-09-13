@@ -7,6 +7,7 @@ import { ProductionChatAgent } from './production-agent-receiver.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
 import { type RuntimeTimeFacts } from './runtime-time.js'
+import { RequestDeadline, RequestDeadlineExceededError } from './request-deadline.js'
 
 let cases = 0
 let failures = 0
@@ -472,64 +473,52 @@ async function main(): Promise<void> {
     }
   })
 
-  await test('planner repairs one provider control response then searches once', async () => {
-    let plannerAttempts = 0
-    let repairSystem = ''
-    const planner = new WebSearchPlanner(async (system) => {
-      plannerAttempts += 1
-      if (plannerAttempts === 2) {
-        repairSystem = system
-      }
-      return plannerAttempts === 1
-        ? '<|minimax|><tool_call>web_search</tool_call>'
-        : 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'
-    })
-    const final = fakeFinalChat('根据[S1]回答')
-    const fake = fakeProvider([result('S1', 'OpenAI news')])
-    const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: planner,
-      webSearchProvider: fake.provider,
-      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
-      runtimeTimeZone: 'Asia/Shanghai',
-    })
-    const answer = await agent.complete(request())
-    check(plannerAttempts === 2, `expected 2 planner attempts, got ${plannerAttempts}`)
-    check(repairSystem.includes('严格只输出五行') && repairSystem.includes('不要调用任何工具'), 'planner repair boundary missing')
-    check(fake.calls === 1, `expected one Tavily call, got ${fake.calls}`)
-    check(answer.includes('https://example.com/s1') && !answer.includes('tool_call'), 'repaired search answer was not clean')
-    final.restore()
-  })
-
-  await test('planner repairs one invalid text protocol then searches once', async () => {
-    let plannerAttempts = 0
-    const plannerUsers: string[] = []
-    const planner = new WebSearchPlanner(async (_system, user) => {
-      plannerAttempts += 1
-      plannerUsers.push(user)
-      return plannerAttempts === 1
-        ? 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI\n多余文本'
-        : 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI recent news\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'
-    })
-    const final = fakeFinalChat('根据[S1]回答')
-    const fake = fakeProvider([result('S1', 'OpenAI news')])
-    const agent = new ProductionChatAgent(final.chat, {
-      webSearchPlanner: planner,
-      webSearchProvider: fake.provider,
-      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
-      runtimeTimeZone: 'Asia/Shanghai',
-    })
-    const answer = await agent.complete(request())
-    check(plannerAttempts === 2 && fake.calls === 1, 'invalid protocol was not repaired with one search')
-    check(plannerUsers.length === 2 && plannerUsers.every((user) => user.includes('CURRENT_TIME_UTC=2026-09-11T07:40:00.000Z')), 'Runtime Time was not shared across planner attempts')
-    check(answer.includes('https://example.com/s1'), 'repaired protocol did not reach grounded final answer')
-    final.restore()
-  })
-
-  await test('planner fails closed after two control responses without searching', async () => {
+  await test('planner provider control failure stops after one attempt without searching', async () => {
     let plannerAttempts = 0
     const planner = new WebSearchPlanner(async () => {
       plannerAttempts += 1
       return '<|minimax|><tool_call>web_search</tool_call>'
+    })
+    const final = fakeFinalChat('根据[S1]回答')
+    const fake = fakeProvider([result('S1', 'OpenAI news')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    const answer = await agent.complete(request())
+    check(plannerAttempts === 1, `expected one planner attempt, got ${plannerAttempts}`)
+    check(fake.calls === 0, `provider-control planner failure invoked Search Provider ${fake.calls} times`)
+    check(answer === '根据[S1]回答' && !answer.includes('tool_call'), 'planner failure did not retain the safe direct path')
+    final.restore()
+  })
+
+  await test('planner invalid text protocol stops after one attempt without searching', async () => {
+    let plannerAttempts = 0
+    const planner = new WebSearchPlanner(async () => {
+      plannerAttempts += 1
+      return 'ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI\n多余文本'
+    })
+    const final = fakeFinalChat('根据[S1]回答')
+    const fake = fakeProvider([result('S1', 'OpenAI news')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      webSearchProvider: fake.provider,
+      runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+      runtimeTimeZone: 'Asia/Shanghai',
+    })
+    const answer = await agent.complete(request())
+    check(plannerAttempts === 1 && fake.calls === 0, 'invalid protocol was retried or reached Search Provider')
+    check(answer === '根据[S1]回答', 'invalid protocol did not retain the safe direct path')
+    final.restore()
+  })
+
+  await test('planner provider exception stops after one attempt without searching', async () => {
+    let plannerAttempts = 0
+    const planner = new WebSearchPlanner(async () => {
+      plannerAttempts += 1
+      throw new Error('planner provider unavailable')
     })
     const final = fakeFinalChat('普通回答')
     const fake = fakeProvider([result('S1')])
@@ -540,9 +529,52 @@ async function main(): Promise<void> {
       runtimeTimeZone: 'Asia/Shanghai',
     })
     const answer = await agent.complete(request())
-    check(plannerAttempts === 2 && fake.calls === 0, 'planner control failure invoked Search Provider')
-    check(answer === '普通回答' && !answer.includes('tool_call'), 'planner fail-safe leaked protocol')
+    check(plannerAttempts === 1 && fake.calls === 0, 'planner provider exception was retried or reached Search Provider')
+    check(answer === '普通回答', 'planner provider exception did not fail closed')
     final.restore()
+  })
+
+  await test('explicit search planner failure never reports a fake search success', async () => {
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
+    const explicitText = '帮我搜一下 OpenAI 最新消息'
+    const planner = new WebSearchPlanner(async () => 'not a planner protocol')
+    const final = fakeFinalChat('普通回答')
+    const fake = fakeProvider([result('S1')])
+    const agent = new ProductionChatAgent(final.chat, {
+      webSearchPlanner: planner,
+      webSearchProvider: fake.provider,
+    })
+    try {
+      const answer = await agent.complete(request({
+        text: explicitText,
+        rawText: explicitText,
+        botMentionSpans: { trust: 'ABSENT', spans: [] },
+        userContentSpan: { trust: 'VALID', span: { start: 0, length: explicitText.length } },
+      }))
+      const decisionLog = logs.find((line) => line.includes('[WEB_SEARCH_DECISION]')) ?? ''
+      check(fake.calls === 0, 'explicit search planner failure invoked Search Provider')
+      check(decisionLog.includes('action=DIRECT') && decisionLog.includes('result=FAIL') && decisionLog.includes('plannerAttempts=1'), 'explicit search planner failure was not logged as one-attempt fail-closed')
+      check(!decisionLog.includes('searchUsed=true') && answer === '普通回答', 'explicit search planner failure reported fake search success')
+    } finally {
+      console.log = originalLog
+      final.restore()
+    }
+  })
+
+  await test('planner deadline stops after one attempt', async () => {
+    let plannerAttempts = 0
+    const planner = new WebSearchPlanner(async () => {
+      plannerAttempts += 1
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return 'ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY=\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'
+    })
+    await assert.rejects(
+      () => planner.plan(BASE_INPUT, [], new RequestDeadline(5)),
+      (error: unknown) => error instanceof RequestDeadlineExceededError,
+    )
+    check(plannerAttempts === 1, `planner deadline invoked ${plannerAttempts} attempts`)
   })
 
   await test('planner diagnostic reports invalid protocol failure reason without query text', async () => {
