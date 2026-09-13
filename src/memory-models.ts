@@ -11,7 +11,7 @@
  * HISTORICAL_SEMANTIC (v02):
  *  - ScopeType: Owner | Member | Group.
  *  - Visibility: Private | Shared.
- *  - Origin: Automatic | ExplicitOwner.
+ *  - Origin: Automatic | ExplicitOwner | ExplicitSelfAddress.
  *  - WriteStatus: Written | Skipped | Failed | Disabled | Invalid.
  *  - MemoryRecord carries scope + scope id + content + visibility + origin +
  *    source conversation/sender + created/updated timestamps + soft delete.
@@ -36,7 +36,7 @@ export type MemoryScopeType =
 
 export type MemoryVisibility = 'PRIVATE' | 'SHARED'
 
-export type MemoryOrigin = 'AUTOMATIC' | 'EXPLICIT_OWNER'
+export type MemoryOrigin = 'AUTOMATIC' | 'EXPLICIT_OWNER' | 'EXPLICIT_SELF_ADDRESS'
 
 export type MemoryWriteStatus = 'WRITTEN' | 'SKIPPED' | 'FAILED' | 'DISABLED' | 'INVALID'
 

@@ -146,6 +146,76 @@ export class MemoryStore {
     return 'WRITTEN'
   }
 
+  /**
+   * Keep one live CURRENT_REQUESTER ADDRESS_PREFERENCE per personal scope.
+   * The service is responsible for authorizing the scope; the store only
+   * performs the atomic single-value replacement.
+   */
+  public upsertAddressPreference(record: MemoryRecord): MemoryWriteStatus {
+    if (!this.enabled) {
+      return 'DISABLED'
+    }
+    if ((record.scopeType !== 'OWNER' && record.scopeType !== 'MEMBER') ||
+        record.scopeId.trim().length === 0 ||
+        record.visibility !== 'SHARED' ||
+        record.kind !== 'ADDRESS_PREFERENCE' || record.subject !== 'CURRENT_REQUESTER') {
+      return 'INVALID'
+    }
+
+    const content = MemoryText.normalize(record.content)
+    if (content.length === 0) {
+      return 'INVALID'
+    }
+    const hash = MemoryText.hash(content)
+    const matches = this.records
+      .map((existing, index) => ({ existing, index }))
+      .filter(({ existing }) =>
+        !existing.isDeleted &&
+        existing.scopeType === record.scopeType &&
+        existing.scopeId === record.scopeId &&
+        existing.kind === 'ADDRESS_PREFERENCE' &&
+        existing.subject === 'CURRENT_REQUESTER',
+      )
+      .sort((left, right) =>
+        right.existing.updatedAt - left.existing.updatedAt ||
+        (left.existing.memoryId < right.existing.memoryId ? -1 : left.existing.memoryId > right.existing.memoryId ? 1 : 0),
+      )
+
+    if (matches.length === 1 && matches[0]?.existing.contentHash === hash) {
+      return 'SKIPPED'
+    }
+
+    const previous = this.records
+    if (matches.length === 0) {
+      this.records = [...this.records, { ...record, content, contentHash: hash }]
+    } else {
+      const primaryIndex = matches[0]!.index
+      const matchingIndexes = new Set(matches.map(({ index }) => index))
+      this.records = this.records.map((existing, index) => {
+        if (index === primaryIndex) {
+          return {
+            ...existing,
+            content,
+            contentHash: hash,
+            updatedAt: record.updatedAt,
+            origin: record.origin,
+            kind: 'ADDRESS_PREFERENCE',
+            subject: 'CURRENT_REQUESTER',
+          }
+        }
+        return matchingIndexes.has(index)
+          ? { ...existing, isDeleted: true, updatedAt: record.updatedAt }
+          : existing
+      })
+    }
+
+    if (!this.save()) {
+      this.records = previous
+      return 'FAILED'
+    }
+    return 'WRITTEN'
+  }
+
   public update(
     memoryId: string,
     content: string,
@@ -368,7 +438,7 @@ function parseRecord(value: unknown): MemoryRecord | null {
   if (typeof record.content !== 'string' || record.content.length === 0) return null
   if (typeof record.contentHash !== 'string' || record.contentHash.length === 0) return null
   if (typeof visibility !== 'string' || !VISIBILITIES.includes(visibility as MemoryVisibility)) return null
-  if (record.origin !== 'AUTOMATIC' && record.origin !== 'EXPLICIT_OWNER') return null
+  if (record.origin !== 'AUTOMATIC' && record.origin !== 'EXPLICIT_OWNER' && record.origin !== 'EXPLICIT_SELF_ADDRESS') return null
   if (record.kind !== undefined &&
       (typeof record.kind !== 'string' || !MEMORY_KINDS.includes(record.kind as MemoryKind))) return null
   if (record.subject !== undefined &&

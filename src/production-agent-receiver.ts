@@ -553,7 +553,7 @@ export class ProductionChatAgent implements AgentExecutor {
       // Historical order: explicit memory intent short-circuits the chat turn,
       // then the message feeds the automatic extractor, then retrieval. All three
       // see the SAME canonical text the chat turn will see.
-      const explicit = await this.memory.tryHandleExplicit({
+      const memoryRequest = {
         conversationType: request.conversationType,
         conversationId: request.conversationId,
         requesterId: request.requesterId,
@@ -569,7 +569,12 @@ export class ProductionChatAgent implements AgentExecutor {
         userContentSpanTrust: userContentSpan.trust,
         requestDeadline: deadline,
         msgIdToken,
-      })
+      }
+      const selfAddress = this.memory.tryHandleSelfAddressPreference?.(memoryRequest) ?? { handled: false, reply: '' }
+      if (selfAddress.handled) {
+        return selfAddress.reply
+      }
+      const explicit = await this.memory.tryHandleExplicit(memoryRequest)
       if (explicit.handled) {
         return explicit.reply
       }

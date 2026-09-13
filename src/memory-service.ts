@@ -72,6 +72,11 @@ import { MemoryExtractor, type StructuredCompletion } from './memory-extractor.j
 import type { MemoryStore } from './memory-store.js'
 import type { ConversationType, RequesterRole } from './message-contract.js'
 import {
+  AddressPreferenceSafetyPolicy,
+  parseSelfAddressPreference,
+  SELF_ADDRESS_PREFERENCE_REJECT_REPLY,
+} from './self-address-preference.js'
+import {
   isRequestDeadlineExceeded,
   RequestDeadline,
 } from './request-deadline.js'
@@ -599,6 +604,102 @@ export class MemoryService {
       result: 'SKIPPED',
       reason: 'USER_CONTENT_SPAN_UNTRUSTED',
     })
+  }
+
+  /**
+   * Deterministic requester-local address preference write. This is deliberately
+   * separate from the OWNER-only structured "记住" mutation path: the current
+   * requester may choose their own address, but cannot use this path to write
+   * any other memory kind or scope.
+   */
+  public tryHandleSelfAddressPreference(request: ExplicitMemoryRequest): ExplicitMemoryResult {
+    const parsed = parseSelfAddressPreference(request.question)
+    if (parsed.outcome === 'MISS' || request.conversationType !== 'GROUP') {
+      return { handled: false, reply: '' }
+    }
+    if (!this.hasTrustedBotMention(request) || !this.hasTrustedUserContentSpan(request)) {
+      this.emit('MEMORY_TRIGGER', {
+        trigger: 'SELF_ADDRESS_PREFERENCE_FAST_PATH',
+        role: request.requesterRole,
+        result: 'SKIPPED',
+        reason: 'UNTRUSTED_FRAMING',
+      })
+      return { handled: false, reply: '' }
+    }
+
+    if (parsed.outcome === 'REJECT') {
+      this.emit('MEMORY_WRITE', {
+        scope: this.personalScope(request.requesterRole),
+        visibility: 'SHARED',
+        result: 'FAIL',
+        reason: parsed.reason,
+      })
+      this.emit('MEMORY_TRIGGER', {
+        trigger: 'SELF_ADDRESS_PREFERENCE_FAST_PATH',
+        role: request.requesterRole,
+        result: 'FAIL',
+        reason: parsed.reason,
+      })
+      return { handled: true, reply: SELF_ADDRESS_PREFERENCE_REJECT_REPLY }
+    }
+
+    const scopeType = this.personalScope(request.requesterRole)
+    if (!this.store.isEnabled || request.requesterId.trim().length === 0) {
+      this.emit('MEMORY_WRITE', {
+        scope: scopeType,
+        visibility: 'SHARED',
+        result: 'FAIL',
+        reason: !this.store.isEnabled ? 'STORE_UNAVAILABLE' : 'REQUESTER_IDENTITY_MISSING',
+      })
+      this.emit('MEMORY_TRIGGER', {
+        trigger: 'SELF_ADDRESS_PREFERENCE_FAST_PATH',
+        role: request.requesterRole,
+        result: 'FAIL',
+        reason: !this.store.isEnabled ? 'STORE_UNAVAILABLE' : 'REQUESTER_IDENTITY_MISSING',
+      })
+      return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
+    }
+
+    const rejection = validateContent(parsed.nickname, [request.requesterId, request.conversationId])
+    if (rejection !== null) {
+      this.emit('MEMORY_WRITE', { scope: scopeType, visibility: 'SHARED', result: 'FAIL', reason: rejection })
+      this.emit('MEMORY_TRIGGER', {
+        trigger: 'SELF_ADDRESS_PREFERENCE_FAST_PATH',
+        role: request.requesterRole,
+        result: 'FAIL',
+        reason: rejection,
+      })
+      return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
+    }
+
+    const now = this.now()
+    const status = this.store.upsertAddressPreference({
+      memoryId: this.idFactory(),
+      scopeType,
+      scopeId: request.requesterId,
+      content: parsed.nickname,
+      contentHash: '',
+      visibility: 'SHARED',
+      origin: 'EXPLICIT_SELF_ADDRESS',
+      sourceConversationType: request.conversationType,
+      sourceConversationId: request.conversationId,
+      sourceSenderId: request.requesterId,
+      createdAt: now,
+      updatedAt: now,
+      isDeleted: false,
+      kind: 'ADDRESS_PREFERENCE',
+      subject: 'CURRENT_REQUESTER',
+    })
+    this.emit('MEMORY_WRITE', { scope: scopeType, visibility: 'SHARED', result: status })
+    this.emit('MEMORY_TRIGGER', {
+      trigger: 'SELF_ADDRESS_PREFERENCE_FAST_PATH',
+      role: request.requesterRole,
+      result: status === 'WRITTEN' || status === 'SKIPPED' ? 'PASS' : 'FAIL',
+      reason: status,
+    })
+    return status === 'WRITTEN' || status === 'SKIPPED'
+      ? { handled: true, reply: `好，以后叫你${parsed.nickname}。` }
+      : { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
   }
 
   /**

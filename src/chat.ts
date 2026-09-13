@@ -573,7 +573,12 @@ export function requesterDisplayLabel(facts: RequesterDisplayFacts): string {
 
 function memorySection(items: readonly MemoryPromptItem[] | undefined, scope: MemoryPromptItem['scope']): string {
   const selected = (items ?? []).filter((item) => item.scope === scope)
-  return selected.length === 0 ? '（无）' : selected.map((item) => `- ${item.content}`).join('\n')
+  return selected.length === 0 ? '（无）' : selected.map((item) => {
+    const content = item.kind === 'ADDRESS_PREFERENCE'
+      ? `当前请求者的称呼偏好：${item.content}`
+      : item.content
+    return `- ${content}`
+  }).join('\n')
 }
 
 function webSearchSection(webSearch: ChatRequestContext['webSearch']): string {
