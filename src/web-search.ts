@@ -14,6 +14,7 @@ export interface WebSearchRequest {
 
 export type WebSearchMode = 'GENERAL' | 'NEWS_RECENT'
 export type WebSearchWindow = 'GENERAL' | 'DAY_1' | 'DAY_3'
+export type WebSearchQueryOrigin = 'PRIMARY' | 'ALTERNATE'
 
 export interface WebSearchResult {
   sourceId: string
@@ -21,6 +22,8 @@ export interface WebSearchResult {
   url: string
   snippet: string
   publishedAt?: string | null
+  /** Internal merge metadata; never rendered into the search context. */
+  queryOrigin?: WebSearchQueryOrigin
   pageText?: string
   pageFetchStatus?: 'PASS' | 'FAILED' | 'SKIPPED'
 }
@@ -158,6 +161,9 @@ export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchR
     seen.add(url)
     const publishedValue = record.publishedAt ?? record.publishedDate ?? record.published_date
     const normalized: WebSearchResult = { sourceId: `S${results.length + 1}`, title, url, snippet }
+    if (record.queryOrigin === 'PRIMARY' || record.queryOrigin === 'ALTERNATE') {
+      normalized.queryOrigin = record.queryOrigin
+    }
     if (typeof publishedValue === 'string') {
       normalized.publishedAt = publishedValue.slice(0, 80)
     }
@@ -168,6 +174,7 @@ export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchR
 
 export interface WebSearchQualityOptions {
   query: string
+  alternateQuery?: string | null
   mode: WebSearchMode
   window?: WebSearchWindow
   runtimeLocalDate?: string
@@ -272,6 +279,14 @@ function relevanceScore(query: string, item: WebSearchResult): number {
     if (snippet.includes(token)) score += 5
   }
   return score
+}
+
+function combinedRelevanceScore(options: WebSearchQualityOptions, item: WebSearchResult): number {
+  const primaryScore = relevanceScore(options.query, item)
+  const alternateScore = options.alternateQuery === undefined || options.alternateQuery === null
+    ? 0
+    : relevanceScore(options.alternateQuery, item)
+  return Math.max(primaryScore, alternateScore)
 }
 
 interface ParsedPublishedAt {
@@ -395,7 +410,7 @@ export function rankWebSearchResults(
   const decorated = deduped.map((item, providerIndex) => ({
     item,
     providerIndex,
-    relevance: relevanceScore(options.query, item),
+    relevance: combinedRelevanceScore(options, item),
     published: parsedPublishedAt(item.publishedAt, runtimeTimeZone),
   }))
   const sorted = [...decorated].sort((left, right) => {
@@ -414,6 +429,10 @@ export function rankWebSearchResults(
     }
     const relevance = compareNumbers(right.relevance, left.relevance)
     if (relevance !== 0) return relevance
+    const leftOrigin = left.item.queryOrigin === 'ALTERNATE' ? 1 : 0
+    const rightOrigin = right.item.queryOrigin === 'ALTERNATE' ? 1 : 0
+    const originPriority = compareNumbers(leftOrigin, rightOrigin)
+    if (originPriority !== 0) return originPriority
     return compareNumbers(left.providerIndex, right.providerIndex)
   })
   const diversified = diversifyByHostname(sorted.map(({ item }) => ({ item, host: hostOf(item.url) })))

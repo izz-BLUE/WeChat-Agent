@@ -1,9 +1,9 @@
 import { strict as assert } from 'node:assert'
 import { appendGroundedSources, enrichWebSearchResultsWithPageEvidence, extractWebPageText, fetchWebPage, rankWebSearchResults, SearXNGWebSearchProvider, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebPageDnsLookup, type WebPageFetchImplementation, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
-import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
+import { formatWebSearchDecisionProtocol, WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
-import { calculateSearchProviderFallbackBudget, MIN_SEARCH_FALLBACK_BUDGET_MS, ProductionChatAgent } from './production-agent-receiver.js'
+import { calculateSearchProviderFallbackBudget, MIN_ALT_QUERY_SEARCH_BUDGET_MS, MIN_SEARCH_FALLBACK_BUDGET_MS, ProductionChatAgent } from './production-agent-receiver.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
@@ -2086,6 +2086,418 @@ async function main(): Promise<void> {
     } finally {
       final.restore()
     }
+  })
+
+  await test('P2.6 extended protocol carries one alternate query', () => {
+    const parsed = parseWebSearchDecisionProtocol(
+      'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE',
+    )
+    check(parsed.valid && parsed.decision.alternateQuery === 'alternate facts', 'ALT_QUERY was not parsed')
+    check(formatWebSearchDecisionProtocol(parsed.decision).includes('ALT_QUERY=alternate facts'), 'ALT_QUERY was not formatted')
+  })
+
+  await test('P2.6 DIRECT requires an empty alternate query', () => {
+    const parsed = parseWebSearchDecisionProtocol(
+      'ACTION=DIRECT\nREASON=DIRECT_SUFFICIENT\nQUERY=\nALT_QUERY=should-not-search\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE',
+    )
+    check(!parsed.valid && parsed.failureReason === 'INVALID_PROTOCOL', 'DIRECT accepted a non-empty ALT_QUERY')
+  })
+
+  await test('P2.6 alternate identity is rejected fail closed', () => {
+    const parsed = parseWebSearchDecisionProtocol(
+      'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=public facts\nALT_QUERY=requester-secret-001\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE',
+      ['requester-secret-001'],
+    )
+    check(!parsed.valid && parsed.failureReason === 'IDENTITY_GUARD', 'ALT_QUERY identity was accepted')
+  })
+
+  await test('P2.6 alternate JSON/list syntax is rejected', () => {
+    const parsed = parseWebSearchDecisionProtocol(
+      'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=public facts\nALT_QUERY=["unrelated", "facts"]\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE',
+    )
+    check(!parsed.valid && parsed.failureReason === 'INVALID_PROTOCOL', 'ALT_QUERY list syntax was accepted')
+  })
+
+  await test('P2.6 Planner emits ALT_QUERY with exactly one LLM attempt', async () => {
+    let calls = 0
+    let system = ''
+    const planner = new WebSearchPlanner(async (systemPrompt) => {
+      calls += 1
+      system = systemPrompt
+      return 'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'
+    })
+    const planned = await planner.plan(BASE_INPUT)
+    check(planned.result === 'PASS' && planned.decision.alternateQuery === 'alternate facts', 'Planner did not return ALT_QUERY')
+    check(calls === 1 && system.includes('固定的六行文本协议') && system.includes('ALT_QUERY='), 'Planner protocol or call count changed')
+  })
+
+  await test('P2.6 empty ALT_QUERY executes primary only', async () => {
+    const final = fakeFinalChat('primary[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary result')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=primary facts\nALT_QUERY=\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      check(provider.requests.length === 1 && provider.requests[0]?.query === 'primary facts', 'empty ALT_QUERY triggered another search')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 primary and alternate execute at most two logical queries', async () => {
+    const final = fakeFinalChat('merged[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary result')], [result('S2', 'alternate result')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      check(provider.requests.length === 2, `expected two logical query calls, got ${provider.requests.length}`)
+      check(provider.requests[0]?.query === 'primary facts' && provider.requests[1]?.query === 'alternate facts', 'query order was not primary then alternate')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 primary success plus alternate failure remains Search PASS', async () => {
+    const final = fakeFinalChat('primary survives[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary result')], new WebSearchError('HTTP_ERROR')])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      const answer = await agent.complete(request())
+      check(answer.includes('primary result'), 'primary result was lost after alternate failure')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 primary failure plus alternate success remains Search PASS', async () => {
+    const final = fakeFinalChat('alternate survives[S1]')
+    const provider = scriptedSearchProvider([new WebSearchError('HTTP_ERROR'), [result('S1', 'alternate result')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      const answer = await agent.complete(request())
+      check(answer.includes('alternate result'), 'alternate result was not used after primary failure')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 both unusable queries keep the existing Search failure contract', async () => {
+    const final = fakeFinalChat('must not fabricate[S1]')
+    const provider = scriptedSearchProvider([new WebSearchError('HTTP_ERROR'), new WebSearchError('HTTP_ERROR')])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      const answer = await agent.complete(request())
+      check(answer.includes('当前没有成功取得联网结果') && !answer.includes('来源：'), 'both failed queries fabricated grounded success')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 alternate keeps primary mode, window, and provider routing', async () => {
+    const final = fakeFinalChat('news[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary news')], [result('S2', 'alternate news')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=primary news\nALT_QUERY=alternate news\nSEARCH_MODE=NEWS_RECENT\nRECENCY_WINDOW=DAY_3'),
+        webSearchProvider: provider.provider,
+        runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+        runtimeTimeZone: 'Asia/Shanghai',
+      })
+      await agent.complete(request())
+      check(provider.requests.length === 2 && provider.requests.every((item) => item.mode === 'NEWS_RECENT' && item.days === 3), 'alternate changed NEWS_RECENT routing')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 Chinese GENERAL sends both queries to SearXNG primary route', async () => {
+    const final = fakeFinalChat('中文[S1]')
+    const calls: string[] = []
+    const searxng: WebSearchProvider = { search: async (request) => { calls.push(`searxng:${request.query}`); return { results: [result('S1', request.query)] } } }
+    const tavily: WebSearchProvider = { search: async () => { calls.push('tavily'); return { results: [result('S2', 'wrong route')] } } }
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=中文主要资料\nALT_QUERY=English supporting facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        searxngWebSearchProvider: searxng,
+        tavilyWebSearchProvider: tavily,
+      })
+      await agent.complete(request())
+      check(calls.join('|') === 'searxng:中文主要资料|searxng:English supporting facts', 'alternate changed the Chinese GENERAL provider route')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 English GENERAL sends both queries to Tavily primary route', async () => {
+    const final = fakeFinalChat('English[S1]')
+    const calls: string[] = []
+    const tavily: WebSearchProvider = { search: async (request) => { calls.push(`tavily:${request.query}`); return { results: [result('S1', request.query)] } } }
+    const searxng: WebSearchProvider = { search: async () => { calls.push('searxng'); return { results: [result('S2', 'wrong route')] } } }
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=中文补充资料\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        searxngWebSearchProvider: searxng,
+        tavilyWebSearchProvider: tavily,
+      })
+      await agent.complete(request())
+      check(calls.join('|') === 'tavily:primary facts|tavily:中文补充资料', 'alternate changed the English GENERAL provider route')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 cross-query canonical URL dedup keeps the primary source', async () => {
+    const final = fakeFinalChat('same page[S1]')
+    const provider = scriptedSearchProvider([[
+      result('S1', 'primary title', 'https://example.com/page?utm_source=one'),
+    ], [
+      result('S2', 'alternate title', 'https://example.com/page?utm_source=two'),
+    ]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      const answer = await agent.complete(request())
+      check(answer.includes('primary title') && !answer.includes('alternate title'), 'cross-query canonical URL dedup did not keep primary')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 cross-query normalized title dedup drops the duplicate title', async () => {
+    const final = fakeFinalChat('same title[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'Same Title', 'https://example.com/one')], [result('S2', 'same title', 'https://example.com/two')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      const answer = await agent.complete(request())
+      check(answer.includes('https://example.com/one') && !answer.includes('https://example.com/two'), 'cross-query title dedup failed')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 merged sources receive continuous source ids', async () => {
+    const final = fakeFinalChat('merged sources[S1]')
+    const provider = scriptedSearchProvider([[
+      result('X', 'first', 'https://example.com/first'),
+      result('Y', 'second', 'https://example.com/second'),
+    ], [
+      result('Z', 'third', 'https://example.com/third'),
+    ]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      const context = final.calls[0]?.user ?? ''
+      check(context.includes('[S1]') && context.includes('[S2]') && context.includes('[S3]') && !context.includes('[S4]'), 'merged source ids were not continuous')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 merged ranking lets clearly relevant alternate outrank weak primary', async () => {
+    const final = fakeFinalChat('ranked[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'unrelated primary', 'https://example.com/primary')], [result('S2', 'alternate target', 'https://example.com/alternate')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary topic\nALT_QUERY=alternate target\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      const context = final.calls[0]?.user ?? ''
+      check(context.indexOf('Title: alternate target') < context.indexOf('Title: unrelated primary'), 'alternate relevance did not survive merged rerank')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 P2.5 page fetch runs only on final merged Top-N', async () => {
+    const final = fakeFinalChat('page evidence[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary page', 'https://one.example/1'), result('S2', 'primary page 2', 'https://two.example/2')], [result('S3', 'alternate page', 'https://three.example/3'), result('S4', 'alternate page 2', 'https://four.example/4')]])
+    const fetched: string[] = []
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary page\nALT_QUERY=alternate page\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+        webPageFetchEnabled: true,
+        webPageFetchMaxResults: 2,
+        webPageFetchImplementation: async (input) => { fetched.push(String(input)); return htmlResponse('<p>merged evidence</p>') },
+        webPageDnsLookup: PUBLIC_PAGE_LOOKUP,
+      })
+      await agent.complete(request())
+      check(fetched.length === 2 && !fetched.some((url) => url.includes('three.example') || url.includes('four.example')), 'page fetch was not bounded to final merged Top-N')
+      check(final.calls[0]?.user.includes('PageEvidence: merged evidence'), 'merged page evidence did not reach Final Chat')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 merged result remains available to Grounding', async () => {
+    const final = fakeFinalChat('grounded alternate[S2]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary source', 'https://example.com/primary')], [result('S2', 'alternate source', 'https://example.com/alternate')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      const answer = await agent.complete(request())
+      check(answer.includes('alternate source https://example.com/alternate') && !answer.includes('[S2]'), 'Grounding did not use the merged alternate source')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 Planner and Final Chat remain the only LLM calls', async () => {
+    let plannerCalls = 0
+    const final = fakeFinalChat('one final answer[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'source one')], [result('S2', 'source two')]])
+    const planner = new WebSearchPlanner(async () => {
+      plannerCalls += 1
+      return 'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'
+    })
+    try {
+      const agent = new ProductionChatAgent(final.chat, { webSearchPlanner: planner, webSearchProvider: provider.provider })
+      await agent.complete(request())
+      check(plannerCalls === 1 && final.calls.length === 1, 'multi-query search added an LLM call')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 alternate budget skip preserves the final-answer reserve', async () => {
+    const final = fakeFinalChat('primary only[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary result')]])
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        requestDeadlineMs: 10_100,
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      const budgetLog = logs.find((line) => line.includes('stage=ALTERNATE_QUERY_SEARCH')) ?? ''
+      check(provider.requests.length === 1, 'alternate query ignored the minimum budget boundary')
+      check(budgetLog.includes('result=SKIP') && budgetLog.includes(`minimumAlternateBudgetMs=${MIN_ALT_QUERY_SEARCH_BUDGET_MS}`), 'alternate budget skip diagnostic is incomplete')
+    } finally {
+      console.log = originalLog
+      final.restore()
+    }
+  })
+
+  await test('P2.6 multi-query diagnostics are count-only', async () => {
+    const final = fakeFinalChat('diagnostic answer[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'public title', 'https://public.example/1')], [result('S2', 'public title 2', 'https://public.example/2')]])
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=secret query one\nALT_QUERY=secret query two\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      const line = logs.find((item) => item.includes('[WEB_SEARCH_MULTI_QUERY]')) ?? ''
+      check(line.includes('plannedQueryCount=2') && line.includes('executedQueryCount=2') && line.includes('mergedResultCount=2'), 'multi-query counts are missing')
+      check(!line.includes('secret query') && !line.includes('public title') && !line.includes('https://'), 'multi-query diagnostic leaked search data')
+    } finally {
+      console.log = originalLog
+      final.restore()
+    }
+  })
+
+  await test('P2.6 alternate NEWS query preserves runtime-derived date bounds', async () => {
+    const final = fakeFinalChat('dated news[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary news')], [result('S2', 'alternate news')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=primary news\nALT_QUERY=alternate news\nSEARCH_MODE=NEWS_RECENT\nRECENCY_WINDOW=DAY_1'),
+        webSearchProvider: provider.provider,
+        runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
+        runtimeTimeZone: 'Asia/Shanghai',
+      })
+      await agent.complete(request())
+      check(provider.requests.every((item) => item.startDate === '2026-09-11' && item.endDate === '2026-09-11'), 'alternate did not preserve runtime-derived DAY_1 dates')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('P2.6 primary wins only an otherwise equal merged-rank tie', () => {
+    const ranked = rankWebSearchResults([
+      { ...result('S2', 'same facts alternate', 'https://example.com/alternate'), queryOrigin: 'ALTERNATE' },
+      { ...result('S1', 'same facts primary', 'https://example.com/primary'), queryOrigin: 'PRIMARY' },
+    ], { query: 'same facts', alternateQuery: 'same facts', mode: 'GENERAL' })
+    check(ranked.results[0]?.url === 'https://example.com/primary', 'primary did not win the equal-relevance tie')
+  })
+
+  await test('P2.6 alternate failure is visible as PARTIAL only when primary still succeeds', async () => {
+    const final = fakeFinalChat('partial[S1]')
+    const provider = scriptedSearchProvider([[result('S1', 'primary result')], new WebSearchError('TIMEOUT')])
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      const line = logs.find((item) => item.includes('[WEB_SEARCH_MULTI_QUERY]')) ?? ''
+      check(line.includes('result=PASS') && line.includes('alternateResultCount=0'), 'primary success was not classified as Search PASS')
+    } finally {
+      console.log = originalLog
+      final.restore()
+    }
+  })
+
+  await test('P2.6 primary failure plus skipped alternate never reports a fake multi-query PASS', async () => {
+    const final = fakeFinalChat('no result[S1]')
+    const provider = scriptedSearchProvider([new WebSearchError('HTTP_ERROR')])
+    const originalLog = console.log
+    const logs: string[] = []
+    console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        requestDeadlineMs: 10_100,
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        webSearchProvider: provider.provider,
+      })
+      await agent.complete(request())
+      const line = logs.find((item) => item.includes('[WEB_SEARCH_MULTI_QUERY]')) ?? ''
+      check(line.includes('result=SKIPPED') && !line.includes('result=PASS'), 'failed primary plus skipped alternate was marked PASS')
+    } finally {
+      console.log = originalLog
+      final.restore()
+    }
+  })
+
+  await test('P2.6 no third query can enter the fixed protocol', () => {
+    const parsed = parseWebSearchDecisionProtocol(
+      'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nTHIRD_QUERY=unexpected\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE',
+    )
+    check(!parsed.valid && parsed.failureReason === 'INVALID_PROTOCOL', 'a third query line escaped the fixed protocol')
   })
 
   await test('low remaining budget skips provider fallback without fake success', async () => {

@@ -20,6 +20,8 @@ export type WebSearchReasonCode =
 export interface WebSearchDecision {
   action: WebSearchAction
   query: string | null
+  /** Optional second query for bounded same-intent recall. */
+  alternateQuery?: string | null
   reasonCode: WebSearchReasonCode
   mode: WebSearchMode
   recencyWindow: WebSearchRecencyWindow
@@ -66,11 +68,12 @@ const SEARCH_REASON_CODES = new Set<WebSearchReasonCode>([
   'EXPLICIT_SEARCH_REQUEST',
 ])
 
-const PLANNER_SYSTEM_PROMPT = `你是 Web Search Planner，只负责判断当前问题是否需要一次联网搜索，不生成最终用户回复。
-只能输出下面固定的五行文本协议，绝对不要输出 JSON、Markdown 解释或最终答案：
+const PLANNER_SYSTEM_PROMPT = `你是 Web Search Planner，只负责判断当前问题是否需要联网搜索，不生成最终用户回复。
+只能输出下面固定的六行文本协议，绝对不要输出 JSON、Markdown 解释或最终答案：
 ACTION=DIRECT 或 ACTION=SEARCH
 REASON=<allowed enum>
 QUERY=<query，可为空>
+ALT_QUERY=<可为空；最多一个与 QUERY 同意图的补充 query>
 SEARCH_MODE=GENERAL 或 SEARCH_MODE=NEWS_RECENT
 RECENCY_WINDOW=NONE 或 RECENCY_WINDOW=DAY_1 或 RECENCY_WINDOW=DAY_3
 
@@ -124,10 +127,11 @@ RECENCY_WINDOW 是受限的语义时间窗口，不是关键词路由：
 - 这些只是语义示例；不要用字符串包含、固定关键词或机械词表代替语义判断。
 Runtime 会根据 RECENCY_WINDOW 和可信 Runtime Time 决定有限的日期窗口；你不要输出任意日期参数、days、start_date、end_date、time_range 或其它 Provider 参数。
 
-DIRECT 必须输出：ACTION=DIRECT、REASON=DIRECT_SUFFICIENT、QUERY=（空）、SEARCH_MODE=GENERAL、RECENCY_WINDOW=NONE。
+DIRECT 必须输出：ACTION=DIRECT、REASON=DIRECT_SUFFICIENT、QUERY=（空）、ALT_QUERY=（空）、SEARCH_MODE=GENERAL、RECENCY_WINDOW=NONE。
 GENERAL SEARCH 必须输出：SEARCH_MODE=GENERAL、RECENCY_WINDOW=NONE。
 NEWS_RECENT SEARCH 必须输出：SEARCH_MODE=NEWS_RECENT、RECENCY_WINDOW=DAY_1 或 RECENCY_WINDOW=DAY_3。
 SEARCH 必须输出非空单行 QUERY 和一个非 DIRECT_SUFFICIENT 的 allowed reason。QUERY 只描述要查找的外部事实，不得包含任何运行时身份、内部标签、账号、会话标识或长期个人记忆内容，也不得包含 |。
+ALT_QUERY 可以为空；非空时只能是最多一个、与 QUERY 保持同一意图的补充检索表达，不得扩展到无关主题，不得包含运行时身份、内部标签、账号、会话标识或长期个人记忆内容，不得包含 |、JSON 数组或列表。不要为了生成 ALT_QUERY 而改变 SEARCH_MODE 或 RECENCY_WINDOW。
 allowed reason 只有：DIRECT_SUFFICIENT、FRESH_INFORMATION、EXTERNAL_VERIFICATION、KNOWLEDGE_UNCERTAIN、EXPLICIT_SEARCH_REQUEST。
 
 格式示例（只演示格式，不是关键词路由规则）：
@@ -135,6 +139,7 @@ Current: 1+1等于几？
 ACTION=DIRECT
 REASON=DIRECT_SUFFICIENT
 QUERY=
+ALT_QUERY=
 SEARCH_MODE=GENERAL
 RECENCY_WINDOW=NONE
 
@@ -142,6 +147,7 @@ Current: OpenAI 最近有什么最新消息？
 ACTION=SEARCH
 REASON=FRESH_INFORMATION
 QUERY=OpenAI recent news
+ALT_QUERY=OpenAI latest updates
 SEARCH_MODE=NEWS_RECENT
 RECENCY_WINDOW=DAY_3
 
@@ -149,6 +155,7 @@ Current: 帮我查一下广州今天的天气政策预警
 ACTION=SEARCH
 REASON=EXPLICIT_SEARCH_REQUEST
 QUERY=广州 今日 天气 政策预警
+ALT_QUERY=
 SEARCH_MODE=NEWS_RECENT
 RECENCY_WINDOW=DAY_1
 
@@ -217,21 +224,25 @@ export function parseWebSearchDecisionProtocol(
   forbiddenValues: readonly string[] = [],
 ): { valid: true; decision: WebSearchDecision } | { valid: false; decision: WebSearchDecision; failureReason: WebSearchPlannerFailure } {
   const lines = unwrapProtocolFence(raw).split(/\r\n|\n|\r/u)
-  if (lines.length !== 5) {
+  // Accept the pre-P2.6 five-line form for callers that still return the
+  // frozen legacy fixture. New Planner output is always the six-line form.
+  if (lines.length !== 5 && lines.length !== 6) {
     return invalid('INVALID_PROTOCOL')
   }
 
   const action = lines[0]
   const reasonLine = lines[1]
   const queryLine = lines[2]
-  const modeLine = lines[3]
-  const recencyLine = lines[4]
-  if ((action !== 'ACTION=DIRECT' && action !== 'ACTION=SEARCH') || !reasonLine.startsWith('REASON=') || !queryLine.startsWith('QUERY=') || !modeLine?.startsWith('SEARCH_MODE=') || !recencyLine?.startsWith('RECENCY_WINDOW=')) {
+  const alternateLine = lines.length === 6 ? lines[3] : undefined
+  const modeLine = lines.length === 6 ? lines[4] : lines[3]
+  const recencyLine = lines.length === 6 ? lines[5] : lines[4]
+  if ((action !== 'ACTION=DIRECT' && action !== 'ACTION=SEARCH') || !reasonLine.startsWith('REASON=') || !queryLine.startsWith('QUERY=') || (alternateLine !== undefined && !alternateLine.startsWith('ALT_QUERY=')) || !modeLine?.startsWith('SEARCH_MODE=') || !recencyLine?.startsWith('RECENCY_WINDOW=')) {
     return invalid('INVALID_PROTOCOL')
   }
 
   const reason = reasonLine.slice('REASON='.length)
   const query = queryLine.slice('QUERY='.length).trim()
+  const alternateQuery = alternateLine === undefined ? '' : alternateLine.slice('ALT_QUERY='.length).trim()
   const mode = modeLine.slice('SEARCH_MODE='.length)
   const recencyWindow = recencyLine.slice('RECENCY_WINDOW='.length)
   if (mode !== 'GENERAL' && mode !== 'NEWS_RECENT') {
@@ -246,7 +257,7 @@ export function parseWebSearchDecisionProtocol(
   }
 
   if (action === 'ACTION=DIRECT') {
-    return reason === 'DIRECT_SUFFICIENT' && query.length === 0 && mode === 'GENERAL' && recencyWindow === 'NONE'
+    return reason === 'DIRECT_SUFFICIENT' && query.length === 0 && alternateQuery.length === 0 && mode === 'GENERAL' && recencyWindow === 'NONE'
       ? { valid: true, decision: directDecision() }
       : invalid('INVALID_PROTOCOL')
   }
@@ -255,11 +266,14 @@ export function parseWebSearchDecisionProtocol(
     return invalid('INVALID_PROTOCOL')
   }
 
-  const identityGuard = containsInternalSpeakerLabel(query) || forbiddenValues.some((forbidden) => forbidden.length > 0 && query.includes(forbidden))
+  const identityGuard = containsInternalSpeakerLabel(query) || containsInternalSpeakerLabel(alternateQuery) || forbiddenValues.some((forbidden) => forbidden.length > 0 && (query.includes(forbidden) || alternateQuery.includes(forbidden)))
   if (identityGuard) {
     return invalid('IDENTITY_GUARD')
   }
   if (reason === 'DIRECT_SUFFICIENT' || query.length === 0 || query.length > 200 || query.includes('|')) {
+    return invalid('INVALID_PROTOCOL')
+  }
+  if (alternateQuery.length > 200 || alternateQuery.includes('|') || /[\[\]{}]/u.test(alternateQuery)) {
     return invalid('INVALID_PROTOCOL')
   }
 
@@ -268,6 +282,7 @@ export function parseWebSearchDecisionProtocol(
     decision: {
       action: 'SEARCH',
       query,
+      alternateQuery: alternateQuery.length === 0 ? null : alternateQuery,
       reasonCode: reason as Exclude<WebSearchReasonCode, 'DIRECT_SUFFICIENT'>,
       mode,
       recencyWindow,
@@ -276,7 +291,7 @@ export function parseWebSearchDecisionProtocol(
 }
 
 export function formatWebSearchDecisionProtocol(decision: WebSearchDecision): string {
-  return `ACTION=${decision.action}\nREASON=${decision.reasonCode}\nQUERY=${decision.query ?? ''}\nSEARCH_MODE=${decision.mode}\nRECENCY_WINDOW=${decision.recencyWindow}`
+  return `ACTION=${decision.action}\nREASON=${decision.reasonCode}\nQUERY=${decision.query ?? ''}\nALT_QUERY=${decision.alternateQuery ?? ''}\nSEARCH_MODE=${decision.mode}\nRECENCY_WINDOW=${decision.recencyWindow}`
 }
 
 export class WebSearchPlanner implements WebSearchPlannerLike {

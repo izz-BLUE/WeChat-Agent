@@ -41,6 +41,7 @@ import {
   type WebSearchFailureReason,
   type WebSearchProvider,
   type WebSearchResult,
+  type WebSearchQueryOrigin,
   type WebSearchWindow,
   type WebPageDnsLookup,
   type WebPageFetchImplementation,
@@ -85,6 +86,7 @@ function finalizeYeyeReply(answer: string): string {
 }
 
 export const MIN_SEARCH_FALLBACK_BUDGET_MS = 3_000
+export const MIN_ALT_QUERY_SEARCH_BUDGET_MS = 3_000
 export const MIN_PAGE_FETCH_BUDGET_MS = 2_500
 
 export interface SearchProviderFallbackBudget {
@@ -113,6 +115,47 @@ export function calculateSearchProviderFallbackBudget(
     minimumFallbackBudgetMs: MIN_SEARCH_FALLBACK_BUDGET_MS,
     effectiveFallbackTimeoutMs,
     result: availableFallbackBudgetMs >= MIN_SEARCH_FALLBACK_BUDGET_MS ? 'RUN' : 'SKIP',
+  }
+}
+
+/**
+ * Bound one provider call to the search-stage budget while keeping the parent
+ * RequestDeadline as the authoritative whole-request timeout. The local timer
+ * is important for providers that do not honor their numeric timeout field.
+ */
+async function withSearchStageBudget<T>(
+  deadline: RequestDeadline,
+  budgetMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const effectiveBudgetMs = Math.min(
+    Math.max(1, Math.floor(budgetMs)),
+    Math.max(1, deadline.remainingMs()),
+  )
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const operationPromise = withRequestDeadline(deadline, (deadlineSignal) => {
+    const abortFromDeadline = (): void => controller.abort()
+    if (deadlineSignal.aborted) {
+      controller.abort()
+    }
+    deadlineSignal.addEventListener('abort', abortFromDeadline, { once: true })
+    return operation(controller.signal).finally(() => {
+      deadlineSignal.removeEventListener('abort', abortFromDeadline)
+    })
+  })
+  const budgetTimeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort()
+      reject(new WebSearchError('TIMEOUT'))
+    }, effectiveBudgetMs)
+  })
+  try {
+    return await Promise.race([operationPromise, budgetTimeout])
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer)
+    }
   }
 }
 
@@ -995,6 +1038,7 @@ export class ProductionChatAgent implements AgentExecutor {
     }
 
     const mode = decision.mode
+    const alternateQuery = decision.alternateQuery?.trim() || null
     const recencyWindow: WebSearchRecencyWindow = decision.recencyWindow
     const primaryWindow: WebSearchWindow = recencyWindow === 'DAY_1'
       ? 'DAY_1'
@@ -1002,6 +1046,9 @@ export class ProductionChatAgent implements AgentExecutor {
         ? 'DAY_3'
         : 'GENERAL'
     const windows = primaryWindow === 'DAY_1' ? ['DAY_1', 'DAY_3'] as const : [primaryWindow] as const
+    // Provider routing is resolved once from the primary query and reused for
+    // the alternate query. The two logical queries must keep identical mode,
+    // recency, and provider-routing semantics.
     const preferSearXng = mode === 'GENERAL' && /\p{Script=Han}/u.test(decision.query)
     const providerCandidates = preferSearXng
       ? [this.searxngWebSearchProvider, this.tavilyWebSearchProvider]
@@ -1012,6 +1059,7 @@ export class ProductionChatAgent implements AgentExecutor {
         providers.push(candidate)
       }
     }
+    const plannedQueryCount = alternateQuery === null ? 1 : 2
     const failed = (window: WebSearchWindow) => ({
       used: true as const,
       status: 'FAILED' as const,
@@ -1022,30 +1070,179 @@ export class ProductionChatAgent implements AgentExecutor {
     })
 
     if (providers.length === 0) {
+      this.logWebSearchMultiQuery({
+        plannedQueryCount,
+        executedQueryCount: 0,
+        skippedQueryCount: plannedQueryCount,
+        primaryResultCount: 0,
+        alternateResultCount: 0,
+        mergedResultCount: 0,
+        dedupedResultCount: 0,
+        result: 'SKIPPED',
+      }, msgIdToken)
       this.logWebSearchExecution(mode, primaryWindow, 1, 'FAILED', 0, msgIdToken)
       this.logWebSearch('FAIL', 0, 'DISABLED', msgIdToken)
       this.logWebSearchContext(0, 0, false, msgIdToken)
       return failed(primaryWindow)
     }
 
+    // Preserve the existing primary-search behavior. Only the optional
+    // alternate query gets a hard search-stage ceiling that leaves the final
+    // answer reserve untouched.
+    const alternateSearchStageDeadlineAt = deadline.deadlineAt - MIN_FINAL_ANSWER_BUDGET_MS
+    const primary = await this.executeWebSearchQuery(
+      decision.query,
+      'PRIMARY',
+      mode,
+      primaryWindow,
+      windows,
+      providers,
+      runtimeTime,
+      deadline,
+      deadline.deadlineAt,
+      msgIdToken,
+    )
+
+    let alternate: {
+      status: 'PASS' | 'FAILED' | 'SKIPPED'
+      results: WebSearchResult[]
+      window: WebSearchWindow
+    } = {
+      status: 'SKIPPED',
+      results: [],
+      window: primary.window,
+    }
+    let skippedQueryCount = 0
+    if (alternateQuery !== null) {
+      const availableAlternateBudgetMs = Math.max(0, deadline.remainingMs() - MIN_FINAL_ANSWER_BUDGET_MS)
+      if (availableAlternateBudgetMs >= MIN_ALT_QUERY_SEARCH_BUDGET_MS) {
+        alternate = await this.executeWebSearchQuery(
+          alternateQuery,
+          'ALTERNATE',
+          mode,
+          primaryWindow,
+          windows,
+          providers,
+          runtimeTime,
+          deadline,
+          alternateSearchStageDeadlineAt,
+          msgIdToken,
+        )
+      } else {
+        skippedQueryCount = 1
+        emitDiagnostic(
+          (line: string) => console.log(line),
+          this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+          'OPTIONAL_STAGE_BUDGET',
+          {
+            stage: 'ALTERNATE_QUERY_SEARCH',
+            remainingMs: Math.max(0, deadline.remainingMs()),
+            reservedFinalAnswerMs: MIN_FINAL_ANSWER_BUDGET_MS,
+            availableAlternateBudgetMs,
+            minimumAlternateBudgetMs: MIN_ALT_QUERY_SEARCH_BUDGET_MS,
+            result: 'SKIP',
+            msgIdToken,
+          },
+        )
+      }
+    }
+
+    const merged = [...primary.results, ...alternate.results]
+    if (merged.length === 0) {
+      this.logWebSearchMultiQuery({
+        plannedQueryCount,
+        executedQueryCount: plannedQueryCount - skippedQueryCount,
+        skippedQueryCount,
+        primaryResultCount: primary.results.length,
+        alternateResultCount: alternate.results.length,
+        mergedResultCount: 0,
+        dedupedResultCount: 0,
+        result: skippedQueryCount > 0 ? 'SKIPPED' : 'PARTIAL',
+      }, msgIdToken)
+      return failed(alternate.window ?? primary.window)
+    }
+
+    // Each provider response is normalized before this merge. Normalize once
+    // more at the boundary so cross-query URL canonicalization is guaranteed;
+    // P2.4 then performs title deduplication, reranking, and source-id repair.
+    const normalizedMerged = normalizeWebSearchResults(merged)
+    const ranked = rankWebSearchResults(normalizedMerged, {
+      query: decision.query,
+      alternateQuery,
+      mode,
+      window: primary.window,
+      runtimeLocalDate: runtimeTime.localDate,
+      runtimeUtcIso: runtimeTime.utcIso,
+      runtimeTimeZone: runtimeTime.timeZone,
+    })
+    const multiQueryResult = skippedQueryCount > 0 ? 'PARTIAL' : 'PASS'
+    this.logWebSearchMultiQuery({
+      plannedQueryCount,
+      executedQueryCount: plannedQueryCount - skippedQueryCount,
+      skippedQueryCount,
+      primaryResultCount: primary.results.length,
+      alternateResultCount: alternate.results.length,
+      mergedResultCount: merged.length,
+      dedupedResultCount: ranked.report.dedupedCount,
+      result: multiQueryResult,
+    }, msgIdToken)
+    const enriched = await this.enrichPageEvidence(ranked.results, deadline, msgIdToken)
+    const bounded = buildWebSearchContext(enriched, this.webSearchMaxContextChars)
+    this.logWebSearchQuality({
+      ...ranked.report,
+      selectedCount: bounded.results.length,
+    }, msgIdToken)
+    this.logWebSearch('PASS', bounded.results.length, 'NONE', msgIdToken)
+    this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
+    if (bounded.results.length === 0) {
+      return failed(primary.window)
+    }
+    return {
+      used: true,
+      status: 'PASS',
+      results: bounded.results,
+      maxContextChars: this.webSearchMaxContextChars,
+      mode,
+      window: primary.window,
+    }
+  }
+
+  private async executeWebSearchQuery(
+    query: string,
+    queryOrigin: WebSearchQueryOrigin,
+    mode: WebSearchMode,
+    primaryWindow: WebSearchWindow,
+    windows: readonly WebSearchWindow[],
+    providers: readonly WebSearchProvider[],
+    runtimeTime: RuntimeTimeFacts,
+    deadline: RequestDeadline,
+    searchStageDeadlineAt: number,
+    msgIdToken: string,
+  ): Promise<{ status: 'PASS' | 'FAILED'; results: WebSearchResult[]; window: WebSearchWindow }> {
     let attempt = 0
     let fallbackTimeoutMs: number | null = null
+    let lastWindow = primaryWindow
     for (const [providerIndex, provider] of providers.entries()) {
       const providerWindows = mode === 'NEWS_RECENT' && provider === this.tavilyWebSearchProvider
         ? windows
         : [primaryWindow] as const
       for (const [windowIndex, window] of providerWindows.entries()) {
+        lastWindow = window
         attempt += 1
+        const availableSearchBudgetMs = Math.max(0, searchStageDeadlineAt - Date.now())
+        if (availableSearchBudgetMs < 1) {
+          return { status: 'FAILED', results: [], window }
+        }
         try {
           const days = window === 'DAY_1' ? 1 : window === 'DAY_3' ? 3 : undefined
           deadline.mark('WEB_SEARCH')
           deadline.throwIfExpired()
-          const response = await withRequestDeadline(deadline, (signal) => provider.search({
-            query: decision.query!,
+          const response = await withSearchStageBudget(deadline, availableSearchBudgetMs, (signal) => provider.search({
+            query,
             maxResults: this.webSearchMaxResults,
             timeoutMs: providerIndex > 0
-              ? Math.max(1, fallbackTimeoutMs ?? 0)
-              : Math.min(this.webSearchTimeoutMs, Math.max(1, deadline.remainingMs())),
+              ? Math.min(Math.max(1, fallbackTimeoutMs ?? 0), availableSearchBudgetMs)
+              : Math.min(this.webSearchTimeoutMs, availableSearchBudgetMs),
             mode,
             signal,
             ...(days === undefined ? {} : {
@@ -1054,7 +1251,10 @@ export class ProductionChatAgent implements AgentExecutor {
               endDate: runtimeTime.localDate,
             }),
           }))
-          const normalized = normalizeWebSearchResults(response.results)
+          const normalized = normalizeWebSearchResults(response.results).map((item) => ({
+            ...item,
+            queryOrigin,
+          }))
           if (normalized.length === 0) {
             this.logWebSearchExecution(mode, window, attempt, 'NO_RESULTS', 0, msgIdToken)
             this.logWebSearch('FAIL', 0, 'NO_RESULTS', msgIdToken)
@@ -1065,48 +1265,15 @@ export class ProductionChatAgent implements AgentExecutor {
             if (providerIndex + 1 < providers.length) {
               fallbackTimeoutMs = this.allowSearchProviderFallback(deadline, msgIdToken)
               if (fallbackTimeoutMs === null) {
-                return failed(window)
+                return { status: 'FAILED', results: [], window }
               }
               break
             }
-            return failed(window)
+            return { status: 'FAILED', results: [], window }
           }
 
-          const ranked = rankWebSearchResults(normalized, {
-            query: decision.query,
-            mode,
-            window,
-            runtimeLocalDate: runtimeTime.localDate,
-            runtimeUtcIso: runtimeTime.utcIso,
-            runtimeTimeZone: runtimeTime.timeZone,
-          })
-          this.logWebSearchExecution(mode, window, attempt, 'PASS', ranked.results.length, msgIdToken)
-          const enriched = await this.enrichPageEvidence(ranked.results, deadline, msgIdToken)
-          const bounded = buildWebSearchContext(enriched, this.webSearchMaxContextChars)
-          this.logWebSearchQuality({
-            ...ranked.report,
-            selectedCount: bounded.results.length,
-          }, msgIdToken)
-          this.logWebSearch('PASS', bounded.results.length, 'NONE', msgIdToken)
-          this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
-          if (bounded.results.length === 0) {
-            if (providerIndex + 1 < providers.length) {
-              fallbackTimeoutMs = this.allowSearchProviderFallback(deadline, msgIdToken)
-              if (fallbackTimeoutMs === null) {
-                return failed(window)
-              }
-              break
-            }
-            return failed(window)
-          }
-          return {
-            used: true,
-            status: 'PASS',
-            results: bounded.results,
-            maxContextChars: this.webSearchMaxContextChars,
-            mode,
-            window,
-          }
+          this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length, msgIdToken)
+          return { status: 'PASS', results: normalized, window }
         } catch (error) {
           if (isRequestDeadlineExceeded(error)) throw error
           const reason: WebSearchFailureReason = error instanceof WebSearchError
@@ -1118,16 +1285,15 @@ export class ProductionChatAgent implements AgentExecutor {
           if (providerIndex + 1 < providers.length) {
             fallbackTimeoutMs = this.allowSearchProviderFallback(deadline, msgIdToken)
             if (fallbackTimeoutMs === null) {
-              return failed(window)
+              return { status: 'FAILED', results: [], window }
             }
             break
           }
-          return failed(window)
+          return { status: 'FAILED', results: [], window }
         }
       }
     }
-
-    return failed(windows[windows.length - 1] ?? primaryWindow)
+    return { status: 'FAILED', results: [], window: lastWindow }
   }
 
   private allowSearchProviderFallback(deadline: RequestDeadline, msgIdToken: string): number | null {
@@ -1275,6 +1441,27 @@ export class ProductionChatAgent implements AgentExecutor {
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
       'WEB_SEARCH_RESULT_QUALITY',
       { ...report, result: 'PASS', msgIdToken },
+    )
+  }
+
+  private logWebSearchMultiQuery(
+    report: {
+      plannedQueryCount: number
+      executedQueryCount: number
+      skippedQueryCount: number
+      primaryResultCount: number
+      alternateResultCount: number
+      mergedResultCount: number
+      dedupedResultCount: number
+      result: 'PASS' | 'PARTIAL' | 'SKIPPED'
+    },
+    msgIdToken: string,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'WEB_SEARCH_MULTI_QUERY',
+      { ...report, msgIdToken },
     )
   }
 }
