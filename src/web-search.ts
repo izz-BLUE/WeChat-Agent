@@ -1,3 +1,6 @@
+import { lookup as dnsLookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
+
 export interface WebSearchRequest {
   query: string
   maxResults: number
@@ -18,6 +21,8 @@ export interface WebSearchResult {
   url: string
   snippet: string
   publishedAt?: string | null
+  pageText?: string
+  pageFetchStatus?: 'PASS' | 'FAILED' | 'SKIPPED'
 }
 
 export interface WebSearchResponse {
@@ -432,6 +437,455 @@ export function rankWebSearchResults(
   }
 }
 
+export type WebPageFetchReason =
+  | 'HTTP_ERROR'
+  | 'TIMEOUT'
+  | 'NON_HTML'
+  | 'TOO_LARGE'
+  | 'UNSAFE_URL'
+  | 'PARSE_FAILED'
+  | 'REDIRECT_LIMIT'
+
+export type WebPageFetchImplementation = (input: string | URL, init?: RequestInit) => Promise<Response>
+export type WebPageDnsLookup = (hostname: string) => Promise<readonly string[]>
+
+export interface WebPageFetchOptions {
+  timeoutMs: number
+  maxCharsPerPage: number
+  maxHtmlBytes?: number
+  maxRedirects?: number
+  signal?: AbortSignal
+  fetchImpl?: WebPageFetchImplementation
+  lookup?: WebPageDnsLookup
+}
+
+export interface WebPageFetchResult {
+  status: 'PASS' | 'FAILED'
+  pageText?: string
+  reason?: WebPageFetchReason
+}
+
+export interface WebPageEvidenceOptions extends WebPageFetchOptions {
+  maxResults: number
+  maxTotalChars: number
+  budgetMs: number
+}
+
+export interface WebPageFetchReport {
+  attemptedCount: number
+  successCount: number
+  failedCount: number
+  skippedCount: number
+  totalEvidenceChars: number
+  budgetMs: number
+  result: 'PASS' | 'PARTIAL' | 'SKIPPED'
+}
+
+export interface EnrichedWebSearchResults {
+  results: WebSearchResult[]
+  report: WebPageFetchReport
+}
+
+const DEFAULT_MAX_HTML_BYTES = 512 * 1024
+const DEFAULT_MAX_REDIRECTS = 3
+
+class WebPageFetchError extends Error {
+  public constructor(public readonly reason: WebPageFetchReason) {
+    super(`Web page fetch failed: ${reason}`)
+    this.name = 'WebPageFetchError'
+  }
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308
+}
+
+function ipv4Parts(address: string): number[] | null {
+  const parts = address.split('.').map((part) => Number(part))
+  return parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255) ? parts : null
+}
+
+function isPrivateIpv4(address: string): boolean {
+  const parts = ipv4Parts(address)
+  if (parts === null) return false
+  const [first, second] = parts
+  return (
+    first === 0 ||
+    first === 10 ||
+    first === 127 ||
+    (first === 100 && second !== undefined && second >= 64 && second <= 127) ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second !== undefined && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168) ||
+    (first === 198 && second !== undefined && second >= 18 && second <= 19) ||
+    first >= 224
+  )
+}
+
+function ipv6Words(address: string): number[] | null {
+  const normalized = address.toLocaleLowerCase()
+  const sections = normalized.split('::')
+  if (sections.length > 2) return null
+  const expand = (section: string): number[] => section.length === 0
+    ? []
+    : section.split(':').flatMap((part) => {
+      if (part.includes('.')) {
+        const ipv4 = ipv4Parts(part)
+        return ipv4 === null ? [] : [(ipv4[0]! << 8) | ipv4[1]!, (ipv4[2]! << 8) | ipv4[3]!]
+      }
+      return /^[\da-f]{1,4}$/u.test(part) ? [Number.parseInt(part, 16)] : []
+    })
+  const left = expand(sections[0] ?? '')
+  const right = expand(sections[1] ?? '')
+  if (sections.length === 1) return left.length === 8 ? left : null
+  const missing = 8 - left.length - right.length
+  return missing > 0 ? [...left, ...Array.from({ length: missing }, () => 0), ...right] : null
+}
+
+function isPrivateIp(address: string): boolean {
+  const normalized = address.trim().toLocaleLowerCase()
+  if (isIP(normalized) === 4) {
+    return isPrivateIpv4(normalized)
+  }
+  if (isIP(normalized) !== 6) {
+    return true
+  }
+  const words = ipv6Words(normalized)
+  if (words === null) return true
+  const first = words[0] ?? 0
+  if (
+    words.every((word) => word === 0) ||
+    words.slice(0, 7).every((word) => word === 0) && words[7] === 1 ||
+    (first & 0xfe00) === 0xfc00 ||
+    (first & 0xffc0) === 0xfe80 ||
+    (first & 0xff00) === 0xff00
+  ) {
+    return true
+  }
+  const mapped = words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff
+  const compatible = words.slice(0, 6).every((word) => word === 0)
+  if (mapped || compatible) {
+    const mappedIpv4 = `${words[6]! >>> 8}.${words[6]! & 0xff}.${words[7]! >>> 8}.${words[7]! & 0xff}`
+    return isPrivateIpv4(mappedIpv4)
+  }
+  return false
+}
+
+function normalizedHostname(url: URL): string {
+  return url.hostname.replace(/^\[|\]$/gu, '').replace(/\.$/u, '').toLocaleLowerCase()
+}
+
+function validatePageFetchUrlShape(rawUrl: string): URL {
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    throw new WebPageFetchError('UNSAFE_URL')
+  }
+  if (
+    (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+    url.username.length > 0 ||
+    url.password.length > 0 ||
+    (url.port.length > 0 && url.port !== '80' && url.port !== '443')
+  ) {
+    throw new WebPageFetchError('UNSAFE_URL')
+  }
+  const hostname = normalizedHostname(url)
+  if (
+    hostname.length === 0 ||
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname === 'local' ||
+    hostname.endsWith('.local')
+  ) {
+    throw new WebPageFetchError('UNSAFE_URL')
+  }
+  if (isIP(hostname) > 0 && isPrivateIp(hostname)) {
+    throw new WebPageFetchError('UNSAFE_URL')
+  }
+  return url
+}
+
+async function defaultPageDnsLookup(hostname: string): Promise<readonly string[]> {
+  const records = await dnsLookup(hostname, { all: true, verbatim: true })
+  return records.map((record) => record.address)
+}
+
+async function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    throw new WebPageFetchError('TIMEOUT')
+  }
+  let abort: (() => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(new WebPageFetchError('TIMEOUT'))
+    signal.addEventListener('abort', abort, { once: true })
+  })
+  try {
+    return await Promise.race([promise, aborted])
+  } finally {
+    if (abort !== undefined) signal.removeEventListener('abort', abort)
+  }
+}
+
+async function validatePageFetchUrl(
+  rawUrl: string,
+  lookup: WebPageDnsLookup,
+  signal: AbortSignal,
+): Promise<URL> {
+  const url = validatePageFetchUrlShape(rawUrl)
+  const hostname = normalizedHostname(url)
+  if (isIP(hostname) > 0) {
+    return url
+  }
+  let addresses: readonly string[]
+  try {
+    addresses = await awaitWithAbort(lookup(hostname), signal)
+  } catch (error) {
+    if (error instanceof WebPageFetchError) throw error
+    throw new WebPageFetchError('UNSAFE_URL')
+  }
+  if (addresses.length === 0 || addresses.some((address) => isPrivateIp(address))) {
+    throw new WebPageFetchError('UNSAFE_URL')
+  }
+  return url
+}
+
+async function readBoundedHtmlBody(response: Response, maxBytes: number): Promise<string> {
+  const contentLength = response.headers.get('content-length')?.trim() ?? ''
+  if (/^\d+$/u.test(contentLength) && Number(contentLength) > maxBytes) {
+    throw new WebPageFetchError('TOO_LARGE')
+  }
+
+  const reader = response.body?.getReader()
+  if (reader !== undefined) {
+    const chunks: Uint8Array[] = []
+    let totalBytes = 0
+    try {
+      while (true) {
+        const next = await reader.read()
+        if (next.done) break
+        const chunk = next.value
+        totalBytes += chunk.byteLength
+        if (totalBytes > maxBytes) {
+          try {
+            await reader.cancel()
+          } catch {
+            // The body is already over the hard byte limit; classification stays TOO_LARGE.
+          }
+          throw new WebPageFetchError('TOO_LARGE')
+        }
+        chunks.push(chunk)
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    const body = new Uint8Array(totalBytes)
+    let offset = 0
+    for (const chunk of chunks) {
+      body.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return new TextDecoder().decode(body)
+  }
+
+  const body = new Uint8Array(await response.arrayBuffer())
+  if (body.byteLength > maxBytes) {
+    throw new WebPageFetchError('TOO_LARGE')
+  }
+  return new TextDecoder().decode(body)
+}
+
+function decodeHtmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: '&',
+    apos: "'",
+    gt: '>',
+    lt: '<',
+    nbsp: ' ',
+    quot: '"',
+  }
+  return value.replace(/&(#x[\da-f]+|#\d+|[a-z][a-z0-9]+);/giu, (entity, token: string) => {
+    const normalized = token.toLocaleLowerCase()
+    if (normalized.startsWith('#x')) {
+      const codePoint = Number.parseInt(normalized.slice(2), 16)
+      return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity
+    }
+    if (normalized.startsWith('#')) {
+      const codePoint = Number.parseInt(normalized.slice(1), 10)
+      return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity
+    }
+    return named[normalized] ?? entity
+  })
+}
+
+/** Extract bounded readable text without a DOM, browser, or Readability dependency. */
+export function extractWebPageText(html: string, maxChars: number): string {
+  const withoutBlocks = html
+    .replace(/<!--[\s\S]*?-->/gu, ' ')
+    .replace(/<\s*(script|style|noscript)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/giu, ' ')
+    .replace(/<[^>]*>/gu, ' ')
+  return decodeHtmlEntities(withoutBlocks)
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .slice(0, Math.max(0, maxChars))
+}
+
+/** Fetch one HTML page with bounded bytes, manual redirects, and SSRF checks. */
+export async function fetchWebPage(rawUrl: string, options: WebPageFetchOptions): Promise<WebPageFetchResult> {
+  const maxHtmlBytes = options.maxHtmlBytes ?? DEFAULT_MAX_HTML_BYTES
+  const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch
+  const lookup = options.lookup ?? defaultPageDnsLookup
+  if (typeof fetchImpl !== 'function' || options.timeoutMs <= 0 || options.maxCharsPerPage <= 0 || maxHtmlBytes <= 0) {
+    return { status: 'FAILED', reason: 'PARSE_FAILED' }
+  }
+
+  const controller = new AbortController()
+  const abortExternal = (): void => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  options.signal?.addEventListener('abort', abortExternal, { once: true })
+  const timeout = setTimeout(() => controller.abort(), Math.max(1, options.timeoutMs))
+  let currentUrl = rawUrl
+  let redirectCount = 0
+  try {
+    while (true) {
+      const safeUrl = await validatePageFetchUrl(currentUrl, lookup, controller.signal)
+      let response: Response
+      try {
+        response = await awaitWithAbort(fetchImpl(safeUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          headers: { Accept: 'text/html' },
+          signal: controller.signal,
+        }), controller.signal)
+      } catch (error) {
+        if (error instanceof WebPageFetchError) throw error
+        throw new WebPageFetchError('HTTP_ERROR')
+      }
+
+      if (isRedirectStatus(response.status)) {
+        const location = response.headers.get('location')
+        if (location === null || location.trim().length === 0) {
+          throw new WebPageFetchError('HTTP_ERROR')
+        }
+        if (redirectCount >= maxRedirects) {
+          throw new WebPageFetchError('REDIRECT_LIMIT')
+        }
+        try {
+          currentUrl = new URL(location, safeUrl).href
+        } catch {
+          throw new WebPageFetchError('UNSAFE_URL')
+        }
+        redirectCount += 1
+        continue
+      }
+      if (!response.ok) {
+        throw new WebPageFetchError('HTTP_ERROR')
+      }
+      const contentType = response.headers.get('content-type')?.toLocaleLowerCase() ?? ''
+      const mediaType = contentType.split(';', 1)[0]?.trim() ?? ''
+      if (mediaType !== 'text/html') {
+        throw new WebPageFetchError('NON_HTML')
+      }
+      const html = await readBoundedHtmlBody(response, maxHtmlBytes)
+      const pageText = extractWebPageText(html, options.maxCharsPerPage)
+      if (pageText.length === 0) {
+        throw new WebPageFetchError('PARSE_FAILED')
+      }
+      return { status: 'PASS', pageText }
+    }
+  } catch (error) {
+    return {
+      status: 'FAILED',
+      reason: error instanceof WebPageFetchError ? error.reason : controller.signal.aborted ? 'TIMEOUT' : 'HTTP_ERROR',
+    }
+  } finally {
+    clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', abortExternal)
+  }
+}
+
+/** Enrich only the ranked prefix with bounded, best-effort page evidence. */
+export async function enrichWebSearchResultsWithPageEvidence(
+  results: readonly WebSearchResult[],
+  options: WebPageEvidenceOptions,
+): Promise<EnrichedWebSearchResults> {
+  const maxResults = Math.min(3, Math.max(0, Math.floor(options.maxResults)))
+  const candidateCount = Math.min(maxResults, results.length)
+  const baseResults = results.map((item) => ({ ...item, pageText: undefined, pageFetchStatus: 'SKIPPED' as const }))
+  const skippedReport = (budgetMs: number): EnrichedWebSearchResults => ({
+    results: baseResults,
+    report: {
+      attemptedCount: 0,
+      successCount: 0,
+      failedCount: 0,
+      skippedCount: results.length,
+      totalEvidenceChars: 0,
+      budgetMs,
+      result: 'SKIPPED',
+    },
+  })
+  if (candidateCount === 0 || options.budgetMs <= 0) {
+    return skippedReport(Math.max(0, options.budgetMs))
+  }
+
+  const controller = new AbortController()
+  const abortExternal = (): void => controller.abort()
+  if (options.signal?.aborted) controller.abort()
+  options.signal?.addEventListener('abort', abortExternal, { once: true })
+  const budgetTimer = setTimeout(() => controller.abort(), Math.max(1, options.budgetMs))
+  const states = Array.from({ length: candidateCount }, () => ({ attempted: false, result: undefined as WebPageFetchResult | undefined }))
+  let nextIndex = 0
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = nextIndex
+      nextIndex += 1
+      if (index >= candidateCount || controller.signal.aborted) return
+      states[index]!.attempted = true
+      states[index]!.result = await fetchWebPage(results[index]!.url, {
+        ...options,
+        signal: controller.signal,
+      })
+    }
+  }
+  try {
+    await Promise.all(Array.from({ length: Math.min(2, candidateCount) }, () => worker()))
+  } finally {
+    clearTimeout(budgetTimer)
+    options.signal?.removeEventListener('abort', abortExternal)
+  }
+
+  let remainingChars = Math.max(0, options.maxTotalChars)
+  let totalEvidenceChars = 0
+  const enriched = baseResults.map((item, index) => {
+    const state = states[index]
+    if (state === undefined) return item
+    if (!state.attempted) return item
+    if (state.result?.status !== 'PASS' || state.result.pageText === undefined) {
+      return { ...item, pageFetchStatus: 'FAILED' as const }
+    }
+    const pageText = state.result.pageText.slice(0, remainingChars)
+    remainingChars -= pageText.length
+    totalEvidenceChars += pageText.length
+    return { ...item, pageText, pageFetchStatus: 'PASS' as const }
+  })
+  const attemptedCount = states.filter((state) => state.attempted).length
+  const successCount = states.filter((state) => state.result?.status === 'PASS').length
+  const failedCount = attemptedCount - successCount
+  return {
+    results: enriched,
+    report: {
+      attemptedCount,
+      successCount,
+      failedCount,
+      skippedCount: results.length - attemptedCount,
+      totalEvidenceChars,
+      budgetMs: Math.max(0, options.budgetMs),
+      result: attemptedCount === 0 ? 'SKIPPED' : successCount === attemptedCount ? 'PASS' : 'PARTIAL',
+    },
+  }
+}
+
 export interface WebSearchContext {
   text: string
   results: readonly WebSearchResult[]
@@ -456,7 +910,8 @@ export function buildWebSearchContext(results: readonly WebSearchResult[], maxCh
       break
     }
     const publishedAt = item.publishedAt ? `PublishedAt: ${item.publishedAt}\n` : ''
-    const block = `[${item.sourceId}]\n${publishedAt}Title: ${item.title}\nSnippet: ${item.snippet}\n`
+    const pageEvidence = item.pageText ? `PageEvidence: ${item.pageText}\n` : ''
+    const block = `[${item.sourceId}]\n${publishedAt}Title: ${item.title}\nSnippet: ${item.snippet}\n${pageEvidence}`
     const remaining = budget - text.length
     if (block.length <= remaining) {
       text += block

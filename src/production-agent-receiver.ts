@@ -31,6 +31,7 @@ import { MemoryStore } from './memory-store.js'
 import { SpeakerLabelRegistry } from './speaker-labels.js'
 import {
   buildWebSearchContext,
+  enrichWebSearchResultsWithPageEvidence,
   normalizeWebSearchResults,
   rankWebSearchResults,
   SearXNGWebSearchProvider,
@@ -41,6 +42,8 @@ import {
   type WebSearchProvider,
   type WebSearchResult,
   type WebSearchWindow,
+  type WebPageDnsLookup,
+  type WebPageFetchImplementation,
 } from './web-search.js'
 import {
   formatWebSearchDecisionProtocol,
@@ -82,6 +85,7 @@ function finalizeYeyeReply(answer: string): string {
 }
 
 export const MIN_SEARCH_FALLBACK_BUDGET_MS = 3_000
+export const MIN_PAGE_FETCH_BUDGET_MS = 2_500
 
 export interface SearchProviderFallbackBudget {
   remainingMs: number
@@ -224,6 +228,14 @@ export interface ProductionChatAgentOptions {
   webSearchMaxResults?: number
   webSearchTimeoutMs?: number
   webSearchMaxContextChars?: number
+  /** Optional bounded page-evidence enrichment. Tests keep this disabled unless explicitly enabled. */
+  webPageFetchEnabled?: boolean
+  webPageFetchMaxResults?: number
+  webPageFetchTimeoutMs?: number
+  webPageFetchMaxCharsPerPage?: number
+  webPageFetchMaxTotalChars?: number
+  webPageFetchImplementation?: WebPageFetchImplementation
+  webPageDnsLookup?: WebPageDnsLookup
   requestDeadlineMs?: number
   runtimeClock?: RuntimeClock
   runtimeTimeZone?: string
@@ -248,6 +260,13 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly webSearchMaxResults: number
   private readonly webSearchTimeoutMs: number
   private readonly webSearchMaxContextChars: number
+  private readonly webPageFetchEnabled: boolean
+  private readonly webPageFetchMaxResults: number
+  private readonly webPageFetchTimeoutMs: number
+  private readonly webPageFetchMaxCharsPerPage: number
+  private readonly webPageFetchMaxTotalChars: number
+  private readonly webPageFetchImplementation: WebPageFetchImplementation | undefined
+  private readonly webPageDnsLookup: WebPageDnsLookup | undefined
   private readonly requestDeadlineMs: number
   private readonly runtimeClock: RuntimeClock
   private readonly runtimeTimeZone: string | undefined
@@ -270,6 +289,13 @@ export class ProductionChatAgent implements AgentExecutor {
     this.webSearchMaxResults = options.webSearchMaxResults ?? config.webSearchMaxResults
     this.webSearchTimeoutMs = options.webSearchTimeoutMs ?? config.webSearchTimeoutMs
     this.webSearchMaxContextChars = options.webSearchMaxContextChars ?? config.webSearchMaxContextChars
+    this.webPageFetchEnabled = options.webPageFetchEnabled ?? false
+    this.webPageFetchMaxResults = Math.min(3, Math.max(0, Math.floor(options.webPageFetchMaxResults ?? config.webPageFetchMaxResults)))
+    this.webPageFetchTimeoutMs = options.webPageFetchTimeoutMs ?? config.webPageFetchTimeoutMs
+    this.webPageFetchMaxCharsPerPage = options.webPageFetchMaxCharsPerPage ?? config.webPageFetchMaxCharsPerPage
+    this.webPageFetchMaxTotalChars = options.webPageFetchMaxTotalChars ?? config.webPageFetchMaxTotalChars
+    this.webPageFetchImplementation = options.webPageFetchImplementation
+    this.webPageDnsLookup = options.webPageDnsLookup
     this.requestDeadlineMs = options.requestDeadlineMs ?? config.agentRequestDeadlineMs
     this.runtimeClock = options.runtimeClock ?? { now: () => new Date() }
     this.runtimeTimeZone = options.runtimeTimeZone ?? config.agentTimeZone
@@ -1055,7 +1081,8 @@ export class ProductionChatAgent implements AgentExecutor {
             runtimeTimeZone: runtimeTime.timeZone,
           })
           this.logWebSearchExecution(mode, window, attempt, 'PASS', ranked.results.length, msgIdToken)
-          const bounded = buildWebSearchContext(ranked.results, this.webSearchMaxContextChars)
+          const enriched = await this.enrichPageEvidence(ranked.results, deadline, msgIdToken)
+          const bounded = buildWebSearchContext(enriched, this.webSearchMaxContextChars)
           this.logWebSearchQuality({
             ...ranked.report,
             selectedCount: bounded.results.length,
@@ -1123,6 +1150,63 @@ export class ProductionChatAgent implements AgentExecutor {
     return budget.result === 'RUN' ? budget.effectiveFallbackTimeoutMs : null
   }
 
+  private async enrichPageEvidence(
+    results: readonly WebSearchResult[],
+    deadline: RequestDeadline,
+    msgIdToken: string,
+  ): Promise<readonly WebSearchResult[]> {
+    const skip = (budgetMs: number): readonly WebSearchResult[] => {
+      this.logWebPageFetch({
+        attemptedCount: 0,
+        successCount: 0,
+        failedCount: 0,
+        skippedCount: results.length,
+        totalEvidenceChars: 0,
+        budgetMs,
+        result: 'SKIPPED',
+      }, msgIdToken)
+      return results
+    }
+    if (!this.webPageFetchEnabled || this.webPageFetchMaxResults === 0) {
+      return skip(0)
+    }
+
+    const availablePageFetchBudgetMs = Math.max(0, deadline.remainingMs() - MIN_FINAL_ANSWER_BUDGET_MS)
+    if (availablePageFetchBudgetMs < MIN_PAGE_FETCH_BUDGET_MS) {
+      return skip(availablePageFetchBudgetMs)
+    }
+
+    const effectivePageFetchBudgetMs = Math.min(this.webPageFetchTimeoutMs, availablePageFetchBudgetMs)
+    deadline.mark('WEB_PAGE_FETCH')
+    try {
+      const enriched = await withRequestDeadline(deadline, (signal) => enrichWebSearchResultsWithPageEvidence(results, {
+        maxResults: this.webPageFetchMaxResults,
+        timeoutMs: Math.min(this.webPageFetchTimeoutMs, effectivePageFetchBudgetMs),
+        maxCharsPerPage: this.webPageFetchMaxCharsPerPage,
+        maxTotalChars: this.webPageFetchMaxTotalChars,
+        budgetMs: effectivePageFetchBudgetMs,
+        signal,
+        fetchImpl: this.webPageFetchImplementation,
+        lookup: this.webPageDnsLookup,
+      }))
+      this.logWebPageFetch(enriched.report, msgIdToken)
+      return enriched.results
+    } catch {
+      // Page fetch is enrichment only. Preserve ranked snippets and leave the
+      // existing Search PASS/Grounding path intact if the optional stage fails.
+      this.logWebPageFetch({
+        attemptedCount: 0,
+        successCount: 0,
+        failedCount: 0,
+        skippedCount: results.length,
+        totalEvidenceChars: 0,
+        budgetMs: effectivePageFetchBudgetMs,
+        result: 'SKIPPED',
+      }, msgIdToken)
+      return results
+    }
+  }
+
   private logWebSearchExecution(
     mode: WebSearchMode,
     window: WebSearchWindow,
@@ -1136,6 +1220,26 @@ export class ProductionChatAgent implements AgentExecutor {
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
       'WEB_SEARCH_EXECUTION',
       { mode, window, attempt, result, resultCount, msgIdToken },
+    )
+  }
+
+  private logWebPageFetch(
+    report: {
+      attemptedCount: number
+      successCount: number
+      failedCount: number
+      skippedCount: number
+      totalEvidenceChars: number
+      budgetMs: number
+      result: 'PASS' | 'PARTIAL' | 'SKIPPED'
+    },
+    msgIdToken: string,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'WEB_PAGE_FETCH',
+      { ...report, msgIdToken },
     )
   }
 
@@ -1234,6 +1338,11 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     webSearchMaxResults: config.webSearchMaxResults,
     webSearchTimeoutMs: config.webSearchTimeoutMs,
     webSearchMaxContextChars: config.webSearchMaxContextChars,
+    webPageFetchEnabled: config.webPageFetchEnabled,
+    webPageFetchMaxResults: config.webPageFetchMaxResults,
+    webPageFetchTimeoutMs: config.webPageFetchTimeoutMs,
+    webPageFetchMaxCharsPerPage: config.webPageFetchMaxCharsPerPage,
+    webPageFetchMaxTotalChars: config.webPageFetchMaxTotalChars,
     requestDeadlineMs: config.agentRequestDeadlineMs,
     runtimeTimeZone: config.agentTimeZone,
     ownerDispatchPlanner: new OwnerDispatchPlanner((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken)),
