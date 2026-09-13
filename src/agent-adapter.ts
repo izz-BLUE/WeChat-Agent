@@ -30,7 +30,7 @@ export interface AgentRequest {
   /** Runtime-decided role fact; consumed as-is, never re-derived here. */
   requesterRole: RequesterRole
     ownerConfigured: boolean
-    /** Display metadata only; never an authorization input. */
+    /** Runtime-supplied Owner display label; never a requester-authorization input. */
     ownerDisplayName: string | null
     /** Local public display metadata; never identity, role or memory input. */
     publicDisplayName?: string | null

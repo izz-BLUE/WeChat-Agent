@@ -27,6 +27,7 @@ import { ASSISTANT_LABEL, CURRENT_REQUESTER_LABEL } from './group-ambient-contex
 import { isInternalSpeakerLabel } from './speaker-labels.js'
 import {
   classifyAssistantIdentityClaims,
+  countTrustedOwnerRelationshipClaims,
   createTrustedAssistantRuntimeFacts,
   type AssistantRuntimeFacts,
 } from './assistant-identity.js'
@@ -438,12 +439,15 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
     blocked = true
   }
 
+  const assistantRuntime = facts.assistantRuntime ?? createTrustedAssistantRuntimeFacts('椰椰')
+
   if (facts.selfIdentityQuery === true && facts.retrievedPersonalMemoryCount === 0) {
     // Public names are presentation metadata, never an exemption for the
     // fail-closed self-identity boundary. A name such as 管理员 must not make
     // "我是管理员" or "你是主人" acceptable here.
     const claims = [...text.matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
-    if (claims > 0) {
+    const trustedOwnerRelationshipClaims = countTrustedOwnerRelationshipClaims(text, assistantRuntime)
+    if (claims > 0 && trustedOwnerRelationshipClaims !== claims) {
       bump('UNGROUNDED_IDENTITY_CLAIM', claims)
       blocked = true
     }
@@ -457,7 +461,6 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
     }
   }
 
-  const assistantRuntime = facts.assistantRuntime ?? createTrustedAssistantRuntimeFacts('椰椰')
   for (const claim of classifyAssistantIdentityClaims(
     text,
     assistantRuntime,

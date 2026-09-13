@@ -55,7 +55,7 @@ export interface RawHookMessage {
    */
   requesterRole?: string | null
   ownerConfigured?: boolean | null
-  /** Display metadata only; it carries no authority. */
+  /** Runtime-supplied Owner display label; it never authorizes the requester by itself. */
   ownerDisplayName?: string | null
   /** Local operator-bound public display metadata; never identity or authority. */
   publicDisplayName?: string | null
@@ -82,6 +82,7 @@ export interface InboundMessage {
   /** Trusted runtime role fact; the Agent never re-judges it. */
   requesterRole: RequesterRole
   ownerConfigured: boolean
+  /** Trusted runtime Owner display label; only paired with ownerConfigured for Owner facts. */
   ownerDisplayName: string | null
   /** Provider-facing public display metadata; never requester/role/memory input. */
   publicDisplayName: string | null

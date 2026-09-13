@@ -3,7 +3,7 @@ import { appendGroundedSources, SearXNGWebSearchProvider, TavilyWebSearchProvide
 import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
-import { ProductionChatAgent } from './production-agent-receiver.js'
+import { calculateSearchProviderFallbackBudget, MIN_SEARCH_FALLBACK_BUDGET_MS, ProductionChatAgent } from './production-agent-receiver.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
@@ -1779,6 +1779,51 @@ async function main(): Promise<void> {
       const answer = await agent.complete(request())
       check(fallbackCalls === 0, 'low-budget provider fallback was not skipped')
       check(answer.includes('当前没有成功取得联网结果') && !answer.includes('remaining budget fallback'), 'low-budget fallback fabricated a search success')
+    } finally {
+      final.restore()
+    }
+  })
+
+  await test('adaptive fallback budget preserves final-answer reserve and caps provider timeout', () => {
+    const dynamic = calculateSearchProviderFallbackBudget(15_348, 8_000)
+    check(dynamic.result === 'RUN', '15,348ms remaining incorrectly skipped fallback')
+    check(dynamic.availableFallbackBudgetMs === 7_348, 'dynamic fallback budget was calculated incorrectly')
+    check(dynamic.effectiveFallbackTimeoutMs === 7_348, 'dynamic fallback timeout was not reduced to the available budget')
+
+    const short = calculateSearchProviderFallbackBudget(12_000, 8_000)
+    check(short.result === 'RUN' && short.availableFallbackBudgetMs === 4_000 && short.effectiveFallbackTimeoutMs === 4_000,
+      '12,000ms remaining did not produce a 4,000ms fallback timeout')
+
+    const tooShort = calculateSearchProviderFallbackBudget(10_000, 8_000)
+    check(tooShort.result === 'SKIP' && tooShort.availableFallbackBudgetMs === 2_000,
+      '10,000ms remaining did not skip below the minimum fallback budget')
+    check(tooShort.minimumFallbackBudgetMs === MIN_SEARCH_FALLBACK_BUDGET_MS,
+      'minimum fallback budget changed unexpectedly')
+
+    const capped = calculateSearchProviderFallbackBudget(18_000, 8_000)
+    check(capped.result === 'RUN' && capped.availableFallbackBudgetMs === 10_000 && capped.effectiveFallbackTimeoutMs === 8_000,
+      'sufficient remaining budget did not cap timeout at the provider timeout')
+    check(capped.reservedFinalAnswerMs === 8_000, 'final-answer reserve changed')
+  })
+
+  await test('adaptive fallback passes only the remaining budget to the secondary provider', async () => {
+    const final = fakeFinalChat('动态 fallback[S1]')
+    const primary = scriptedSearchProvider([new WebSearchError('HTTP_ERROR')])
+    const secondary = scriptedSearchProvider([[result('S1', '动态 secondary')]])
+    try {
+      const agent = new ProductionChatAgent(final.chat, {
+        requestDeadlineMs: 14_000,
+        webSearchTimeoutMs: 8_000,
+        webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=中文资料\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
+        searxngWebSearchProvider: primary.provider,
+        tavilyWebSearchProvider: secondary.provider,
+      })
+      const answer = await agent.complete(request())
+      const fallbackRequest = secondary.requests[0]
+      check(answer.includes('动态 secondary'), 'adaptive secondary result was not used')
+      check(fallbackRequest !== undefined, 'adaptive secondary provider was not called')
+      check(fallbackRequest.timeoutMs >= MIN_SEARCH_FALLBACK_BUDGET_MS && fallbackRequest.timeoutMs <= 6_000,
+        `secondary timeout did not respect remaining budget: ${fallbackRequest.timeoutMs}`)
     } finally {
       final.restore()
     }

@@ -1196,7 +1196,6 @@ async function testNoRawIdentityOrAuthorizationMetadataInThePrompt(): Promise<vo
       RAW_WXID,
       SIGNATURE,
       'Signature',
-      OWNER_DISPLAY_NAME,
       'ownerConfigured',
       'CurrentRequesterRole',
     ]) {
@@ -1205,9 +1204,10 @@ async function testNoRawIdentityOrAuthorizationMetadataInThePrompt(): Promise<vo
     // The role words are named by the system prompt's own safety rules (it
     // forbids being talked into 主人/群主/管理员), so they are checked where they
     // would be DATA: the user prompt.
-    for (const forbidden of ['主人', '群主', '管理员', OWNER_DISPLAY_NAME]) {
+    for (const forbidden of ['主人', '群主', '管理员']) {
       assert(!prompt.user.includes(forbidden), `authorization metadata "${forbidden}" was rendered as prompt data`)
     }
+    assert(prompt.user.includes(`OWNER_DISPLAY_NAME=${OWNER_DISPLAY_NAME}`), 'trusted owner display name was not rendered')
     for (const forbidden of [
       'requesterId',
       'RequesterId',

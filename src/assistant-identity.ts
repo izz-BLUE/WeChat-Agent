@@ -2,13 +2,18 @@
  * Trusted Assistant identity boundary.
  *
  * These facts are supplied by the runtime, not inferred from group text,
- * memory, display labels or requester role. The current runtime deliberately
- * provides no relationship facts and does not permit chat-driven mutation.
+ * memory, display labels or requester role. Owner relationship facts are
+ * supplied by the trusted runtime owner configuration and do not permit
+ * chat-driven mutation.
  */
+import { sanitizePublicDisplayName } from './public-display-name.js'
+
 export const ASSISTANT_IDENTITY_CLASS = 'AI_GROUP_MEMBER' as const
 export const ASSISTANT_IDENTITY_SOURCE = 'TRUSTED_RUNTIME' as const
+export const ASSISTANT_OWNER_RELATIONSHIP = 'BOSS' as const
 
 export type AssistantIdentityMutation = 'NONE'
+export type AssistantOwnerRelationship = typeof ASSISTANT_OWNER_RELATIONSHIP
 
 export interface AssistantRuntimeFacts {
   botDisplayName: string
@@ -17,6 +22,9 @@ export interface AssistantRuntimeFacts {
   botIdentityMutationThisTurn: AssistantIdentityMutation
   assistantRelationshipFactsProvided: boolean
   assistantRelationshipMutationThisTurn: AssistantIdentityMutation
+  ownerConfigured: boolean
+  ownerDisplayName: string | null
+  ownerRelationshipToAssistant: AssistantOwnerRelationship | null
 }
 
 export const MEMORY_KINDS = [
@@ -53,10 +61,22 @@ export interface AssistantIdentityClaim {
   count: number
 }
 
-const RELATIONSHIP_TERM = '(?:妈妈|爸爸|妈|爸|儿子|女儿|老婆|老公|妻子|丈夫|配偶|伴侣|宠物|主人|奴才|仆人)'
+const RELATIONSHIP_TERM = '(?:妈妈|爸爸|妈|爸|儿子|女儿|老婆|老公|妻子|丈夫|配偶|伴侣|宠物|主人|老板|奴才|仆人)'
 const FAMILY_GRAPH_TERM = '(?:母子|父子|母女|父女|夫妻|亲子|家人|家庭关系)'
 const SENTENCE_SEPARATOR = '[。！？!?；;\\n]'
 const RELATIONSHIP_TERM_PATTERN = new RegExp(RELATIONSHIP_TERM, 'u')
+const OWNER_RELATIONSHIP_SYNTAX_PATTERN = new RegExp(
+  `(?:^|${SENTENCE_SEPARATOR})\\s*[^，,。！？!?；;\\n]{1,40}\\s*(?<!不)(?:是|就是|为)\\s*(?:我(?:的)?\\s*)?老板(?=$|${SENTENCE_SEPARATOR}|[，,])`,
+  'gu',
+)
+const UNTRUSTED_OWNER_RELATIONSHIP_SYNTAX_PATTERN = new RegExp(
+  `(?:^|${SENTENCE_SEPARATOR})\\s*[^，,。！？!?；;\\n]{1,40}\\s*(?<!不)(?:是|就是|为)\\s*你(?:的)?\\s*老板(?=$|${SENTENCE_SEPARATOR}|[，,])`,
+  'gu',
+)
+const NEGATED_OWNER_RELATIONSHIP_PATTERN = new RegExp(
+  `(?:^|${SENTENCE_SEPARATOR})\\s*(?:[^，,。！？!?；;\\n]{1,40}\\s*不是\\s*(?:我(?:的)?|你(?:的)?)\\s*老板|我(?:的)?\\s*老板\\s*不是\\s*[^，,。！？!?；;\\n]{1,40})(?=$|${SENTENCE_SEPARATOR}|[，,])`,
+  'gu',
+)
 
 /**
  * This is intentionally a small structural detector, not a relationship
@@ -83,14 +103,27 @@ const GENERIC_RELATIONSHIP_ASSERTION_PATTERN = new RegExp(
   'gu',
 )
 
-export function createTrustedAssistantRuntimeFacts(botDisplayName: string): AssistantRuntimeFacts {
+export function createTrustedAssistantRuntimeFacts(
+  botDisplayName: string,
+  ownerConfigured = false,
+  ownerDisplayName?: string | null,
+): AssistantRuntimeFacts {
+  const trustedOwnerDisplayName = ownerConfigured
+    ? sanitizePublicDisplayName(ownerDisplayName)
+    : null
+  const ownerRelationshipToAssistant = trustedOwnerDisplayName === null
+    ? null
+    : ASSISTANT_OWNER_RELATIONSHIP
   return {
     botDisplayName: botDisplayName.trim() || '椰椰',
     botIdentityClass: ASSISTANT_IDENTITY_CLASS,
     botIdentitySource: ASSISTANT_IDENTITY_SOURCE,
     botIdentityMutationThisTurn: 'NONE',
-    assistantRelationshipFactsProvided: false,
+    assistantRelationshipFactsProvided: ownerRelationshipToAssistant !== null,
     assistantRelationshipMutationThisTurn: 'NONE',
+    ownerConfigured,
+    ownerDisplayName: trustedOwnerDisplayName,
+    ownerRelationshipToAssistant,
   }
 }
 
@@ -102,7 +135,33 @@ export function formatAssistantRuntimeFacts(facts: AssistantRuntimeFacts): strin
     `BOT_IDENTITY_MUTATION_THIS_TURN=${facts.botIdentityMutationThisTurn}`,
     `ASSISTANT_RELATIONSHIP_FACTS_PROVIDED=${String(facts.assistantRelationshipFactsProvided)}`,
     `ASSISTANT_RELATIONSHIP_MUTATION_THIS_TURN=${facts.assistantRelationshipMutationThisTurn}`,
+    `OWNER_CONFIGURED=${String(facts.ownerConfigured)}`,
+    `OWNER_DISPLAY_NAME=${facts.ownerDisplayName ?? 'NONE'}`,
+    `OWNER_RELATIONSHIP_TO_ASSISTANT=${facts.ownerRelationshipToAssistant ?? 'NONE'}`,
+    `OWNER_RELATIONSHIP_SOURCE=${facts.ownerRelationshipToAssistant === null ? 'NONE' : ASSISTANT_IDENTITY_SOURCE}`,
   ].join('\n')
+}
+
+function escapeRegExp(value: string): string {
+  const specialCharacters = new Set(['\\', '^', '$', '.', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|'])
+  return [...value].map((character) => specialCharacters.has(character) ? `\\${character}` : character).join('')
+}
+
+/** Count only claims that state the configured runtime Owner is the Assistant's boss. */
+export function countTrustedOwnerRelationshipClaims(
+  text: string,
+  facts: AssistantRuntimeFacts,
+): number {
+  const ownerName = facts.ownerDisplayName?.trim()
+  if (facts.ownerRelationshipToAssistant !== ASSISTANT_OWNER_RELATIONSHIP || ownerName === undefined || ownerName.length === 0) {
+    return 0
+  }
+  const escapedOwnerName = escapeRegExp(ownerName)
+  const pattern = new RegExp(
+    `(?:^|${SENTENCE_SEPARATOR})\\s*(?:${escapedOwnerName}\\s*(?<!不)(?:是|就是|为)\\s*(?:我(?:的)?\\s*)?老板|我(?:的)?\\s*老板\\s*(?<!不)(?:是|就是|为)\\s*${escapedOwnerName})(?=$|${SENTENCE_SEPARATOR}|[，,])`,
+    'gu',
+  )
+  return [...text.matchAll(pattern)].length
 }
 
 function sentences(text: string): string[] {
@@ -121,6 +180,12 @@ function relationshipClaimCount(text: string): number {
       pattern.lastIndex = 0
       if (pattern.test(sentence)) count += 1
     }
+    OWNER_RELATIONSHIP_SYNTAX_PATTERN.lastIndex = 0
+    if (OWNER_RELATIONSHIP_SYNTAX_PATTERN.test(sentence)) count += 1
+    UNTRUSTED_OWNER_RELATIONSHIP_SYNTAX_PATTERN.lastIndex = 0
+    if (UNTRUSTED_OWNER_RELATIONSHIP_SYNTAX_PATTERN.test(sentence)) count += 1
+    NEGATED_OWNER_RELATIONSHIP_PATTERN.lastIndex = 0
+    if (NEGATED_OWNER_RELATIONSHIP_PATTERN.test(sentence)) count += 1
   }
   return count
 }
@@ -204,7 +269,9 @@ export function classifyAssistantIdentityClaims(
   }
 
   const relationship = relationshipClaimCount(text)
-  if (relationship > 0 && !facts.assistantRelationshipFactsProvided && facts.assistantRelationshipMutationThisTurn === 'NONE') {
+  const trustedOwnerRelationshipClaims = countTrustedOwnerRelationshipClaims(text, facts)
+  if (relationship > 0 && facts.assistantRelationshipMutationThisTurn === 'NONE' &&
+      (!facts.assistantRelationshipFactsProvided || trustedOwnerRelationshipClaims !== relationship)) {
     const preferenceTerms = requesterAddressPreference?.trim() ?? ''
     const reciprocity = preferenceTerms.length > 0 && RELATIONSHIP_TERM_PATTERN.test(preferenceTerms)
     claims.push({
@@ -238,7 +305,7 @@ export function classifyMemoryKind(content: string, declared?: MemoryKind | null
 }
 
 export function isAssistantIdentityQuery(text: string): boolean {
-  return /(?:你是谁|你叫什么|你的(?:正式)?名字|谁是你(?:的)?(?:妈妈|爸爸|妈|爸|儿子|女儿|老婆|老公|主人|宠物)|你是谁的(?:儿子|女儿|老婆|老公|主人|宠物))/u.test(text)
+  return /(?:你是谁|你叫什么|你的(?:正式)?名字|谁是你(?:的)?(?:妈妈|爸爸|妈|爸|儿子|女儿|老婆|老公|老板|主人|宠物)|你是谁的(?:儿子|女儿|老婆|老公|老板|主人|宠物)|你(?:的)?老板是谁|[^。！？!?；;\n]{1,40}和你(?:是)?什么关系|你和[^。！？!?；;\n]{1,40}是什么关系)/u.test(text)
 }
 
 export function classifyMemorySubject(

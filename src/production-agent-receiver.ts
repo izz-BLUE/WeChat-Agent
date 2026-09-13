@@ -26,7 +26,7 @@ import {
 } from './outbound-delivery.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { MemoryExtractor } from './memory-extractor.js'
-import { MemoryService } from './memory-service.js'
+import { GROUP_SCOPE_KEYWORDS, isExplicitMemoryCommand, MemoryService } from './memory-service.js'
 import { MemoryStore } from './memory-store.js'
 import { SpeakerLabelRegistry } from './speaker-labels.js'
 import {
@@ -69,6 +69,7 @@ import { isGroupConversationId, isVerifiedOwnerDirect } from './message-contract
 import { isRequestDeadlineExceeded, RequestDeadline, withRequestDeadline } from './request-deadline.js'
 import { identityToken } from './identity-observer.js'
 import { createTrustedAssistantRuntimeFacts } from './assistant-identity.js'
+import { renderOwnerEscalationHint } from './owner-escalation.js'
 import {
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
@@ -77,6 +78,37 @@ import {
 
 function finalizeYeyeReply(answer: string): string {
   return sanitizeFinalAnswer(decorateYeyeReplySignature(answer)).text
+}
+
+export const MIN_SEARCH_FALLBACK_BUDGET_MS = 3_000
+
+export interface SearchProviderFallbackBudget {
+  remainingMs: number
+  reservedFinalAnswerMs: number
+  availableFallbackBudgetMs: number
+  minimumFallbackBudgetMs: number
+  effectiveFallbackTimeoutMs: number
+  result: 'RUN' | 'SKIP'
+}
+
+export function calculateSearchProviderFallbackBudget(
+  remainingMs: number,
+  webSearchTimeoutMs: number,
+): SearchProviderFallbackBudget {
+  const safeRemainingMs = Math.max(0, remainingMs)
+  const availableFallbackBudgetMs = Math.max(0, safeRemainingMs - MIN_FINAL_ANSWER_BUDGET_MS)
+  const effectiveFallbackTimeoutMs = Math.min(
+    Math.max(0, webSearchTimeoutMs),
+    availableFallbackBudgetMs,
+  )
+  return {
+    remainingMs: safeRemainingMs,
+    reservedFinalAnswerMs: MIN_FINAL_ANSWER_BUDGET_MS,
+    availableFallbackBudgetMs,
+    minimumFallbackBudgetMs: MIN_SEARCH_FALLBACK_BUDGET_MS,
+    effectiveFallbackTimeoutMs,
+    result: availableFallbackBudgetMs >= MIN_SEARCH_FALLBACK_BUDGET_MS ? 'RUN' : 'SKIP',
+  }
 }
 
 /**
@@ -419,6 +451,11 @@ export class ProductionChatAgent implements AgentExecutor {
 
     // One immutable snapshot is shared by the Planner and final-answer prompt.
     const runtimeTime = createRuntimeTimeFacts(this.runtimeClock, this.runtimeTimeZone)
+    const assistantRuntime = createTrustedAssistantRuntimeFacts(
+      config.botDisplayName,
+      request.ownerConfigured,
+      request.ownerDisplayName,
+    )
     const label = this.speakerLabels.labelFor({
       conversationType: request.conversationType,
       conversationId: request.conversationId,
@@ -586,6 +623,18 @@ export class ProductionChatAgent implements AgentExecutor {
       }
     }
 
+    // The existing explicit-memory grammar already identifies a deterministic
+    // GROUP-scoped mutation request. A non-owner cannot perform it, so this
+    // clear Owner-only branch may explain the authorization boundary without an
+    // extra model call. Other-member mutations do not satisfy the GROUP scope
+    // contract here and continue through the normal safety/identity path.
+    if (this.memory === null &&
+        request.requesterRole !== 'OWNER' &&
+        isExplicitMemoryCommand(question.text) &&
+        GROUP_SCOPE_KEYWORDS.some((keyword) => question.text.includes(keyword))) {
+      return renderOwnerEscalationHint('OWNER_ONLY_ACTION', assistantRuntime)
+    }
+
     if (await this.tryOwnerDispatch(request, question.text, deadline, msgIdToken)) {
       return ''
     }
@@ -644,7 +693,7 @@ export class ProductionChatAgent implements AgentExecutor {
       question,
       {
         botDisplayName: config.botDisplayName,
-        assistantRuntime: createTrustedAssistantRuntimeFacts(config.botDisplayName),
+        assistantRuntime,
         mention: mentionFact(request),
         requesterRole: request.requesterRole,
         ownerConfigured: request.ownerConfigured,
@@ -954,6 +1003,7 @@ export class ProductionChatAgent implements AgentExecutor {
     }
 
     let attempt = 0
+    let fallbackTimeoutMs: number | null = null
     for (const [providerIndex, provider] of providers.entries()) {
       const providerWindows = mode === 'NEWS_RECENT' && provider === this.tavilyWebSearchProvider
         ? windows
@@ -967,7 +1017,9 @@ export class ProductionChatAgent implements AgentExecutor {
           const response = await withRequestDeadline(deadline, (signal) => provider.search({
             query: decision.query!,
             maxResults: this.webSearchMaxResults,
-            timeoutMs: Math.min(this.webSearchTimeoutMs, Math.max(1, deadline.remainingMs())),
+            timeoutMs: providerIndex > 0
+              ? Math.max(1, fallbackTimeoutMs ?? 0)
+              : Math.min(this.webSearchTimeoutMs, Math.max(1, deadline.remainingMs())),
             mode,
             signal,
             ...(days === undefined ? {} : {
@@ -985,7 +1037,8 @@ export class ProductionChatAgent implements AgentExecutor {
               continue
             }
             if (providerIndex + 1 < providers.length) {
-              if (!this.allowSearchProviderFallback(deadline, msgIdToken)) {
+              fallbackTimeoutMs = this.allowSearchProviderFallback(deadline, msgIdToken)
+              if (fallbackTimeoutMs === null) {
                 return failed(window)
               }
               break
@@ -999,7 +1052,8 @@ export class ProductionChatAgent implements AgentExecutor {
           this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
           if (bounded.results.length === 0) {
             if (providerIndex + 1 < providers.length) {
-              if (!this.allowSearchProviderFallback(deadline, msgIdToken)) {
+              fallbackTimeoutMs = this.allowSearchProviderFallback(deadline, msgIdToken)
+              if (fallbackTimeoutMs === null) {
                 return failed(window)
               }
               break
@@ -1023,7 +1077,8 @@ export class ProductionChatAgent implements AgentExecutor {
           this.logWebSearch('FAIL', 0, reason, msgIdToken)
           this.logWebSearchContext(0, 0, false, msgIdToken)
           if (providerIndex + 1 < providers.length) {
-            if (!this.allowSearchProviderFallback(deadline, msgIdToken)) {
+            fallbackTimeoutMs = this.allowSearchProviderFallback(deadline, msgIdToken)
+            if (fallbackTimeoutMs === null) {
               return failed(window)
             }
             break
@@ -1036,27 +1091,24 @@ export class ProductionChatAgent implements AgentExecutor {
     return failed(windows[windows.length - 1] ?? primaryWindow)
   }
 
-  private allowSearchProviderFallback(deadline: RequestDeadline, msgIdToken: string): boolean {
-    const remainingMs = deadline.remainingMs()
-    const requiredMs = MIN_FINAL_ANSWER_BUDGET_MS + this.webSearchTimeoutMs
-    if (remainingMs >= requiredMs) {
-      return true
-    }
-
+  private allowSearchProviderFallback(deadline: RequestDeadline, msgIdToken: string): number | null {
+    const budget = calculateSearchProviderFallbackBudget(deadline.remainingMs(), this.webSearchTimeoutMs)
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
       'OPTIONAL_STAGE_BUDGET',
       {
         stage: 'SEARCH_PROVIDER_FALLBACK',
-        remainingMs,
-        requiredMs,
-        reservedFinalAnswerMs: MIN_FINAL_ANSWER_BUDGET_MS,
-        result: 'SKIP',
+        remainingMs: budget.remainingMs,
+        reservedFinalAnswerMs: budget.reservedFinalAnswerMs,
+        availableFallbackBudgetMs: budget.availableFallbackBudgetMs,
+        minimumFallbackBudgetMs: budget.minimumFallbackBudgetMs,
+        effectiveFallbackTimeoutMs: budget.effectiveFallbackTimeoutMs,
+        result: budget.result,
         msgIdToken,
       },
     )
-    return false
+    return budget.result === 'RUN' ? budget.effectiveFallbackTimeoutMs : null
   }
 
   private logWebSearchExecution(
