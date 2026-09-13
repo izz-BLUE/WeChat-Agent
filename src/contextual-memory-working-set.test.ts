@@ -32,7 +32,7 @@ import { GroupAmbientContext } from './group-ambient-context.js'
 import { MemoryExtractor } from './memory-extractor.js'
 import type { MemoryContextItem, MemoryOrigin, MemoryScopeType, MemoryVisibility } from './memory-models.js'
 import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
-import { MemoryService } from './memory-service.js'
+import { isExplicitMemoryCommand, MemoryService } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
@@ -102,8 +102,8 @@ interface Harness {
   calls: ProviderCall[]
   /**
    * Mutation-parser completions. Only an OWNER message carrying a WRITE command
-   * (记住 / 记一下 / 忘掉 / 忘记 / 删掉这条记忆 / 改成 / 修改记忆) triggers one; a recall
-   * question such as "你记得不？" must not.
+   * (记住 / 记一下 / 带明确记忆对象的忘掉或忘记 / 删掉这条记忆 / 改成 / 修改记忆)
+   * triggers one; a recall question such as "你记得不？" must not.
    */
   mutateCalls: number
   /** Extraction completions. Zero because no case fills the pending buffer. */
@@ -125,7 +125,10 @@ interface Harness {
  * not the single final-answer completion. The extractor and the removed
  * semantic selector therefore cannot run unnoticed.
  */
-function createHarness(now: () => number = () => FIXED_NOW): Harness {
+function createHarness(
+  now: () => number = () => FIXED_NOW,
+  mutationResponse = '{"operation":"NONE","target":null,"content":null,"scope":null}',
+): Harness {
   const calls: ProviderCall[] = []
   const logs: string[] = []
   let mutateCalls = 0
@@ -149,7 +152,7 @@ function createHarness(now: () => number = () => FIXED_NOW): Harness {
 
     if (system.includes('记忆变更解析器')) {
       mutateCalls += 1
-      return completion(JSON.stringify({ operation: 'NONE', target: null, content: null, scope: null }))
+      return completion(mutationResponse)
     }
     if (system.includes('长期记忆提取器')) {
       extractorCalls += 1
@@ -175,7 +178,7 @@ function createHarness(now: () => number = () => FIXED_NOW): Harness {
       if (system.includes('记忆变更解析器')) {
         mutateCalls += 1
       }
-      return '{"operation":"NONE"}'
+      return mutationResponse
     },
     log: (message) => logs.push(message),
   })
@@ -1059,8 +1062,18 @@ async function testWriteCommandsStillEnterTheMutationPath(): Promise<void> {
     '记住我不吃香菜',
     '记一下我叫辞老师',
     '帮我记住我叫辞老师',
-    '忘记我不吃香菜',
+    '忘记我的代号是辞老师',
     '忘掉我之前说的代号',
+    '忘掉这条记忆',
+    '忘记这条记忆',
+    '忘掉刚才记的那条',
+    '删除之前记的那条',
+    '忘记上次保存的内容',
+    '忘记之前记住的内容',
+    '删除上次记的那条',
+    '删掉以前保存的那条',
+    '删掉我之前让你记住的那条',
+    '删除我之前说过要记住的代号',
     '删掉这条记忆',
     '删除这条记忆',
     '把我的代号改成辞老师',
@@ -1091,6 +1104,9 @@ async function testWriteCommandsStillEnterTheMutationPath(): Promise<void> {
       assert(reply === `这条记忆没有保存成功。${YEYE_REPLY_SIGNATURE}`, `an unresolvable write command lost its fail-closed reply: ${reply}`)
       assert(providerCallCount(harness) === 0, 'a short-circuited write command still reached the chat model')
       assert(harness.store.liveRecordCount === 1, 'the NONE mutation wrote memory')
+      const admission = harness.logs.filter((line) => line.includes('[MEMORY_ADMISSION]')).pop() ?? ''
+      assert(admission.includes('explicitCommand=true') && admission.includes('blocker=NONE') && admission.includes('result=ADMITTED'),
+        `the write command admission was not recorded as admitted: ${admission}`)
     } finally {
       harness.restore()
     }
@@ -1124,6 +1140,19 @@ async function testWriteCommandsStillEnterTheMutationPath(): Promise<void> {
  */
 async function testNormalChatNeverEntersTheMutationPath(): Promise<void> {
   const normalChat = [
+    '忘掉一个人需要多久',
+    '忘记一个人难吗',
+    '忘记过去需要多久',
+    '忘掉前任要多久',
+    '删除文件怎么恢复',
+    '删掉照片以后还能找回来吗',
+    '删除数据库记录有什么风险',
+    '忘记密码怎么办',
+    '我想忘掉一个人',
+    '怎么才能忘掉一个人',
+    '人真的能忘记某个人吗',
+    '删除好友后还能加回来吗',
+    '忘掉一个人是不是很难',
     '我忘记带钥匙了',
     '我忘记密码了',
     '他忘掉带文件了',
@@ -1164,6 +1193,88 @@ async function testNormalChatNeverEntersTheMutationPath(): Promise<void> {
     } finally {
       harness.restore()
     }
+  }
+}
+
+/**
+ * The DELETE object alternation is subordinate to the DELETE verb. Each object
+ * shape is also a valid ordinary-language prefix, so this public detector seam
+ * must reject it when the verb is absent and the production turn must continue
+ * to Final Chat.
+ */
+async function testDeleteObjectAlternationCannotEscapeDeleteVerb(): Promise<void> {
+  const ordinaryObjectForms = [
+    '我的代号是啥，本群活动时间是几点',
+    '这条记忆是什么意思',
+    '之前记的内容在哪里',
+    '上次保存的内容是什么',
+    '我的昵称是什么',
+    '本群活动时间是几点',
+  ]
+
+  for (const [index, question] of ordinaryObjectForms.entries()) {
+    const harness = createHarness()
+    try {
+      assert(!isExplicitMemoryCommand(question), `an object branch escaped the DELETE verb: ${question}`)
+      assert(
+        !harness.service.isExplicitMemoryIntent('OWNER', question),
+        `an object branch entered the memory write entry: ${question}`,
+      )
+
+      const reply = await ask(harness, {
+        text: question,
+        messageId: `delete-object-precedence-${index}`,
+        requesterId: OWNER_ID,
+        requesterRole: 'OWNER',
+        ownerConfigured: true,
+        botMention: true,
+      })
+      assert(reply === `收到。${YEYE_REPLY_SIGNATURE}`, `ordinary object text was swallowed: ${question} -> ${reply}`)
+      assert(harness.mutateCalls === 0, `object branch invoked mutation ${harness.mutateCalls} times: ${question}`)
+      assert(providerCallCount(harness) === 1, `object branch did not reach exactly one Final Chat call: ${question}`)
+    } finally {
+      harness.restore()
+    }
+  }
+}
+
+/**
+ * P1 regression: an ordinary forget question must not be able to consume a
+ * DELETE mutation response, even when an existing record is present.
+ */
+async function testOrdinaryForgetQuestionCannotDeleteExistingMemory(): Promise<void> {
+  const harness = createHarness(
+    () => FIXED_NOW,
+    JSON.stringify({ operation: 'DELETE', target: 'M1', content: null, scope: 'OWNER' }),
+  )
+  try {
+    seed(harness.store, { memoryId: 'name-fact', scopeType: 'OWNER', scopeId: OWNER_ID, content: NAME_MEMORY })
+    const before = harness.store.retrieve([{ scopeType: 'OWNER', scopeId: OWNER_ID, visibility: 'SHARED' }], 10)
+    assert(before.length === 1 && before[0]?.isDeleted === false, 'the delete-side-effect fixture was not live')
+
+    const reply = await ask(harness, {
+      text: '忘掉一个人需要多久',
+      messageId: 'ordinary-forget-no-delete',
+      requesterId: OWNER_ID,
+      requesterRole: 'OWNER',
+      ownerConfigured: true,
+      botMention: true,
+    })
+
+    assert(reply === `收到。${YEYE_REPLY_SIGNATURE}`, `the ordinary question was swallowed: ${reply}`)
+    assert(harness.mutateCalls === 0, `ordinary forget question invoked mutation ${harness.mutateCalls} times`)
+    assert(providerCallCount(harness) === 1, `ordinary forget question made ${providerCallCount(harness)} final calls`)
+    assert(harness.store.liveRecordCount === 1, 'ordinary forget question changed the live record count')
+
+    const after = harness.store.retrieve([{ scopeType: 'OWNER', scopeId: OWNER_ID, visibility: 'SHARED' }], 10)
+    assert(after.length === 1 && after[0]?.memoryId === 'name-fact' && after[0]?.isDeleted === false,
+      'ordinary forget question deleted or replaced the existing memory')
+
+    const admission = harness.logs.filter((line) => line.includes('[MEMORY_ADMISSION]')).pop() ?? ''
+    assert(admission.includes('explicitCommand=false') && admission.includes('blocker=GRAMMAR_MISS') && admission.includes('result=CHAT'),
+      `ordinary forget question admission was not a grammar miss: ${admission}`)
+  } finally {
+    harness.restore()
   }
 }
 
@@ -1603,6 +1714,8 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ['case17-recall-never-enters-write-entry', testRecallNeverEntersTheWriteEntry],
   ['case18-write-commands-still-enter-mutation-path', testWriteCommandsStillEnterTheMutationPath],
   ['case19-normal-chat-never-enters-mutation-path', testNormalChatNeverEntersTheMutationPath],
+  ['case29-delete-object-alternation-precedence', testDeleteObjectAlternationCannotEscapeDeleteVerb],
+  ['case28-ordinary-forget-cannot-delete-existing-memory', testOrdinaryForgetQuestionCannotDeleteExistingMemory],
   ['case25-previous-active-event-rendered-once', testPreviousActiveEventIsRenderedOnce],
   ['case26-passive-ambient-survives-dedup', testPassiveAmbientSurvivesDeduplication],
   ['case27-same-text-different-event-preserved', testSameTextDifferentEventIsPreserved],

@@ -145,7 +145,7 @@ export type MemoryAdmissionBlocker =
  * The asymmetry is deliberate: a missed command becomes a normal chat turn,
  * while a false admission swallows a normal chat turn into a memory write that
  * then fails closed ("这条记忆没有保存成功。"). So the gate requires a verb in
- * COMMAND POSITION and, for updates, an explicit memory object.
+ * COMMAND POSITION and, for DELETE / FORGET / UPDATE, an explicit memory object.
  *
  * What each pattern rejects, and why it matters:
  *  - `我忘记带钥匙了` / `我忘记密码了` / `他忘掉带文件了`: the verb is not in command
@@ -184,12 +184,26 @@ const NOT_STATEMENT_OR_QUESTION = '(?!了|吗|没|不|吧|呢|？|\\?|$)'
  */
 const MEMORY_ATTRIBUTE_OBJECT = '(?:记忆|代号|名字|称呼|昵称|姓名|资料)'
 const UPDATE_VERB = '(?:改成|改为|换成|更新成|更新为)'
+/**
+ * Closed DELETE / FORGET object grammar. A free target is allowed only after a
+ * phrase that already names something previously stored; a bare delete verb
+ * never admits whatever arbitrary text happens to follow it.
+ */
+const MEMORY_DELETE_OBJECT = [
+  '(?:记忆|这条记忆|那条记忆)',
+  `我的${MEMORY_ATTRIBUTE_OBJECT}(?:是|叫|为)[^，,。！!？?\\s]{1,32}`,
+  `我(?:之前|上次|以前)(?:让你记住|说过要记住)的(?:那条|内容|记忆|[^，,。！!？?\\s]{1,32})`,
+  `我(?:之前|上次|以前)说的${MEMORY_ATTRIBUTE_OBJECT}`,
+  `(?:刚才|之前|上次|以前)(?:记|记住|保存)的(?:那条|内容|记忆|[^，,。！!？?\\s]{1,32})`,
+].join('|')
+const MEMORY_DELETE_OBJECT_PATTERN = `(?:${MEMORY_DELETE_OBJECT})`
+const MEMORY_DELETE_OBJECT_BOUNDARY = '(?=$|[，,。！!\\s])'
 
 const EXPLICIT_MEMORY_COMMAND_PATTERNS: readonly RegExp[] = [
   // ADD: the imperative verb opens the sentence.
   new RegExp(`^${POLITE_PREFIX}?(?:记住|记一下|记下来|记着)${NOT_STATEMENT_OR_QUESTION}`, 'u'),
-  // DELETE / FORGET: same shape, so the object is whatever follows the verb.
-  new RegExp(`^${POLITE_PREFIX}?(?:忘记|忘掉|删掉|删除)${NOT_STATEMENT_OR_QUESTION}`, 'u'),
+  // DELETE / FORGET: the verb must be followed by a closed memory object.
+  new RegExp(`^${POLITE_PREFIX}?(?:忘记|忘掉|删掉|删除)\\s*${MEMORY_DELETE_OBJECT_PATTERN}${MEMORY_DELETE_OBJECT_BOUNDARY}`, 'u'),
   // UPDATE of the memory itself.
   new RegExp(`^${POLITE_PREFIX}?(?:修改|更新|改一下)(?:一下)?记忆`, 'u'),
   // UPDATE of a first-person attribute, in the 把-construction.
@@ -851,7 +865,7 @@ export class MemoryService {
       // resolved: the fail-closed reply is the historical behaviour and it stays.
       //
       // There is deliberately no parse-time "was this really a command?" test
-      // here. Admission (`EXPLICIT_MEMORY_KEYWORDS`) is the boundary, and a
+      // here. Admission (`EXPLICIT_MEMORY_COMMAND_PATTERNS`) is the boundary, and a
       // second pattern would be an untestable duplicate of the same list that can
       // only drift away from it — that is how "你记得不？" ended up paying for a
       // mutation call in the first place.
