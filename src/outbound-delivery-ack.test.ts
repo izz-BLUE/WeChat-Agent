@@ -5,6 +5,7 @@ import { applyMentionPolicy, runRawPassiveContextPipeline, toAgentRequest, toOut
 import { ChatService } from './chat.js'
 import { GroupAmbientContext } from './group-ambient-context.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import type { InboundMessage, RawHookMessage } from './message-contract.js'
 import type { MemoryService } from './memory-service.js'
@@ -149,7 +150,7 @@ async function testStoreCapacityAndAckOutcomes(): Promise<void> {
 async function testGeneratedTextCommitsOnlyAfterSent(): Promise<void> {
   const { agent, ambient } = createAgent('delivery body')
   const answer = await agent.complete(BASE_REQUEST)
-  assert.equal(answer, 'delivery body')
+  assert.equal(answer, `delivery body${YEYE_REPLY_SIGNATURE}`)
   assertNoAssistant(ambient)
   const identity = agent.takeOutboundIdentity(BASE_REQUEST, answer)
   assert(identity)
@@ -333,7 +334,7 @@ async function testExplicitMemoryReplyIsNotDeliveryEligible(): Promise<void> {
     ambientContext: new GroupAmbientContext({ now: () => BASE_REQUEST.timestamp }),
   })
   const answer = await agent.complete(BASE_REQUEST)
-  assert.equal(answer, '已记住')
+  assert.equal(answer, `已记住${YEYE_REPLY_SIGNATURE}`)
   assert.equal(agent.takeOutboundIdentity(BASE_REQUEST, answer), null)
 }
 

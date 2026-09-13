@@ -4,6 +4,7 @@ import { WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInp
 import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
 import { type RuntimeTimeFacts } from './runtime-time.js'
@@ -389,7 +390,7 @@ async function main(): Promise<void> {
         rawText: text,
         userContentSpan: { trust: 'VALID', span: { start: 0, length: text.length } },
       }))
-      check(answer === '噗噗是群内称呼', 'receiver did not complete the Memory-backed direct answer')
+      check(answer === `噗噗是群内称呼${YEYE_REPLY_SIGNATURE}`, 'receiver did not complete the Memory-backed direct answer')
       check(plannerUser.includes('噗噗是群里薛老师的别称'), 'receiver did not pass authorized Memory to Planner')
     } finally {
       final.restore()
@@ -490,7 +491,7 @@ async function main(): Promise<void> {
     const answer = await agent.complete(request())
     check(plannerAttempts === 1, `expected one planner attempt, got ${plannerAttempts}`)
     check(fake.calls === 0, `provider-control planner failure invoked Search Provider ${fake.calls} times`)
-    check(answer === '根据[S1]回答' && !answer.includes('tool_call'), 'planner failure did not retain the safe direct path')
+    check(answer === `根据[S1]回答${YEYE_REPLY_SIGNATURE}` && !answer.includes('tool_call'), 'planner failure did not retain the safe direct path')
     final.restore()
   })
 
@@ -510,7 +511,7 @@ async function main(): Promise<void> {
     })
     const answer = await agent.complete(request())
     check(plannerAttempts === 1 && fake.calls === 0, 'invalid protocol was retried or reached Search Provider')
-    check(answer === '根据[S1]回答', 'invalid protocol did not retain the safe direct path')
+    check(answer === `根据[S1]回答${YEYE_REPLY_SIGNATURE}`, 'invalid protocol did not retain the safe direct path')
     final.restore()
   })
 
@@ -530,7 +531,7 @@ async function main(): Promise<void> {
     })
     const answer = await agent.complete(request())
     check(plannerAttempts === 1 && fake.calls === 0, 'planner provider exception was retried or reached Search Provider')
-    check(answer === '普通回答', 'planner provider exception did not fail closed')
+    check(answer === `普通回答${YEYE_REPLY_SIGNATURE}`, 'planner provider exception did not fail closed')
     final.restore()
   })
 
@@ -556,7 +557,7 @@ async function main(): Promise<void> {
       const decisionLog = logs.find((line) => line.includes('[WEB_SEARCH_DECISION]')) ?? ''
       check(fake.calls === 0, 'explicit search planner failure invoked Search Provider')
       check(decisionLog.includes('action=DIRECT') && decisionLog.includes('result=FAIL') && decisionLog.includes('plannerAttempts=1'), 'explicit search planner failure was not logged as one-attempt fail-closed')
-      check(!decisionLog.includes('searchUsed=true') && answer === '普通回答', 'explicit search planner failure reported fake search success')
+      check(!decisionLog.includes('searchUsed=true') && answer === `普通回答${YEYE_REPLY_SIGNATURE}`, 'explicit search planner failure reported fake search success')
     } finally {
       console.log = originalLog
       final.restore()
@@ -813,7 +814,7 @@ async function main(): Promise<void> {
         userContentSpan: { trust: 'VALID', span: { start: 0, length: text.length } },
       }))
       check(provider.requests.length === 2, 'NEWS_RECENT exhaustion performed an unbounded search')
-      check(answer === '当前没有查到足够近期信息，无法可靠确认最新情况。', 'NEWS_RECENT exhaustion retained stale filler')
+      check(answer === `当前没有查到足够近期信息，无法可靠确认最新情况。${YEYE_REPLY_SIGNATURE}`, 'NEWS_RECENT exhaustion retained stale filler')
     } finally {
       final.restore()
     }
@@ -919,7 +920,7 @@ async function main(): Promise<void> {
       webSearchProvider: fake.provider,
     })
     const answer = await agent.complete(request())
-    check(answer === '普通回答', 'direct answer changed')
+    check(answer === `普通回答${YEYE_REPLY_SIGNATURE}`, 'direct answer changed')
     check(fake.calls === 0 && final.calls.length === 1, 'DIRECT did not preserve zero-search chat')
     final.restore()
   })
@@ -1069,7 +1070,7 @@ async function main(): Promise<void> {
       const answer = await agent.complete(request())
       const body = answer.split('\n\n来源：')[0] ?? answer
       check(fake.calls === 1 && final.calls.length === 2, 'zero-citation answer did not receive exactly one repair')
-      check(body === '可靠结论' && !/\[S\d+\]/u.test(body), 'repaired answer exposed an internal source marker')
+      check(body === `可靠结论${YEYE_REPLY_SIGNATURE}` && !/\[S\d+\]/u.test(body), 'repaired answer exposed an internal source marker')
       check(!answer.includes('https://evil.example/fabricated'), 'repair raw URL survived final grounding')
       check(answer.includes('来源：\n1. 来源二 https://example.com/s2') && !answer.includes('来源一'), 'repair grounded the wrong source')
       check(final.calls[1]?.system.includes('Web Search Grounding Repair'), 'grounding repair contract was not used')
@@ -1241,7 +1242,7 @@ async function main(): Promise<void> {
     })
     try {
       const answer = await agent.complete(request())
-      check(answer === '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。', 'zero-citation repair did not fail closed')
+      check(answer === `我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。${YEYE_REPLY_SIGNATURE}`, 'zero-citation repair did not fail closed')
       check(!answer.includes('原始搜索事实') && fake.calls === 1 && final.calls.length === 2, 'ungrounded answer was resent or search was retried')
     } finally {
       final.restore()
@@ -1257,7 +1258,7 @@ async function main(): Promise<void> {
     })
     try {
       const answer = await agent.complete(request())
-      check(answer === '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。', 'repair provider failure did not fail closed')
+      check(answer === `我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。${YEYE_REPLY_SIGNATURE}`, 'repair provider failure did not fail closed')
       check(fake.calls === 1 && final.calls.length === 2, 'repair provider failure triggered an unbounded retry')
     } finally {
       final.restore()
@@ -1274,7 +1275,7 @@ async function main(): Promise<void> {
       })
       try {
         const answer = await agent.complete(request())
-        check(answer === '我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。', 'unsafe grounding repair was not fail closed')
+        check(answer === `我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。${YEYE_REPLY_SIGNATURE}`, 'unsafe grounding repair was not fail closed')
         check(fake.calls === 1 && final.calls.length === 2, 'unsafe grounding repair retried unexpectedly')
       } finally {
         final.restore()
@@ -1404,7 +1405,7 @@ async function main(): Promise<void> {
     } as never
     const agent = new ProductionChatAgent(final.chat, { memory, webSearchPlanner: planner, webSearchProvider: fake.provider })
     const answer = await agent.complete(request())
-    check(answer === '已处理记忆' && plannerCalls === 0 && fake.calls === 0, 'explicit memory reached web search')
+    check(answer === `已处理记忆${YEYE_REPLY_SIGNATURE}` && plannerCalls === 0 && fake.calls === 0, 'explicit memory reached web search')
     final.restore()
   })
 

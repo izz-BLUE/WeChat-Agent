@@ -23,6 +23,7 @@ import type { MemoryRecord, MemoryScopeType } from './memory-models.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { normalizeRawHookMessage, type RawHookMessage } from './message-contract.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { guardFinalAnswer } from './answer-guard.js'
 import { isInternalSpeakerLabel } from './speaker-labels.js'
 
@@ -298,7 +299,7 @@ async function testOwnerMemoryWinsOverAuthorizationRole(): Promise<void> {
   })))
   const call = chat.calls[0]
   assert(call !== undefined, 'owner identity query did not reach the answer service')
-  assert(reply === `我叫${FACT}`, 'owner identity answer was not based on personal memory')
+  assert(reply === `我叫${FACT}${YEYE_REPLY_SIGNATURE}`, 'owner identity answer was not based on personal memory')
   assert(!reply.includes('主人') && !reply.includes('群主') && !reply.includes('管理员'), 'owner role became a natural-language identity')
   assert(!call.prompt.includes('CurrentRequesterRole=OWNER'), 'raw authorization role reached the final-answer prompt')
   assert(!call.prompt.includes('OwnerConfigured=true'), 'owner configuration flag reached the final-answer prompt')

@@ -30,6 +30,7 @@ import {
 import { MemoryStore, isReleaseArtifactPath, memoryFileIn } from './memory-store.js'
 import { MemoryText, type MemoryInputMessage, type MemoryOrigin, type MemoryScopeType, type MemoryVisibility } from './memory-models.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { SpeakerLabelRegistry, isPseudonymousMemberLabel } from './speaker-labels.js'
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -973,7 +974,7 @@ async function testGroupRegressions(): Promise<void> {
   assert(mentioned.status === 'AGENT_RESULT', 'a mentioned group message did not reach the agent')
   assert(mentioned.outboundCommand?.conversationType === 'GROUP', 'the group recipient type changed')
   assert(mentioned.outboundCommand?.conversationId === 'room-z@chatroom', 'the group recipient id changed')
-  assert(mentioned.outboundCommand?.text === 'synthetic reply', 'the reply text changed')
+  assert(mentioned.outboundCommand?.text === `synthetic reply${YEYE_REPLY_SIGNATURE}`, 'the reply text changed')
 
   const scripted = new ProductionChatAgent(
     { reply: async () => '<think>推理</think>群回复' } as never,
@@ -981,7 +982,7 @@ async function testGroupRegressions(): Promise<void> {
   )
   const finalAnswer = await runRawAgentPipeline(groupRaw({ msgId: 'regression-2' }), scripted)
   assert(finalAnswer.status === 'AGENT_RESULT', 'the final-answer case did not reach the agent')
-  assert(finalAnswer.outboundCommand?.text === '群回复', 'the FINAL_ANSWER boundary regressed')
+  assert(finalAnswer.outboundCommand?.text === `群回复${YEYE_REPLY_SIGNATURE}`, 'the FINAL_ANSWER boundary regressed')
 
   const notMentioned = await runRawAgentPipeline(groupRaw({ isMentioned: false, msgId: 'regression-3' }), agent)
   assert(notMentioned.status === 'IGNORED', 'the no-mention gate regressed')

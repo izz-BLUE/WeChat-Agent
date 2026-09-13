@@ -15,6 +15,7 @@ import { MemoryExtractor } from './memory-extractor.js'
 import { MemoryService } from './memory-service.js'
 import { MemoryStore } from './memory-store.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import {
   parseSelfAddressPreference,
   SELF_ADDRESS_PREFERENCE_REJECT_REPLY,
@@ -367,7 +368,7 @@ async function testRestartAndProductionFastPath(): Promise<void> {
         },
         metadata: { rawMessageType: 1 },
       } satisfies AgentRequest)
-      assert.equal(result, '好，以后叫你公主。')
+      assert.equal(result, `好，以后叫你公主。${YEYE_REPLY_SIGNATURE}`)
       check(productionHarness.mutateCalls === 0, 'production fast path invoked the explicit mutation LLM')
       check(productionHarness.extractorCalls === 0, 'production fast path invoked the automatic extractor')
       check(readPersonal(productionHarness.store, 'MEMBER', MEMBER_A).length === 1, 'production fast path did not persist')

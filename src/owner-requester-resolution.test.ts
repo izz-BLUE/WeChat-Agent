@@ -26,6 +26,7 @@ import { buildSystemPrompt, buildUserPrompt, requesterDisplayLabel, type ChatReq
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { isPseudonymousMemberLabel } from './speaker-labels.js'
 import type { GroupMessage } from './context.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -121,7 +122,7 @@ async function runProductionAgent(
   const agent = new ProductionChatAgent(chat as never)
   const result = await agent.complete(toAgentRequest(validMessage(raw)))
   assert(chat.calls.length === 1, 'the production agent did not call the chat service exactly once')
-  assert(result === response, 'the production agent did not return the chat reply')
+  assert(result === `${response}${YEYE_REPLY_SIGNATURE}`, 'the production agent did not return the chat reply')
   return { chat, agent, result }
 }
 

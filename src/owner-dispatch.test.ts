@@ -8,6 +8,7 @@ import { OwnerDispatchPlanner, parseOwnerDispatchProtocol, type OwnerDispatchPla
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { ProactiveGroupQueue } from './proactive-group-queue.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 
 const ROOM = 'owner-dispatch@chatroom'
 const OWNER = 'owner-secret'
@@ -206,7 +207,7 @@ async function main(): Promise<void> {
   const memberAgent = new ProductionChatAgent(chat('member normal', memberCalls), {
     ownerDispatchPlanner: { plan: async () => { memberPlannerCalls += 1; return (await dispatchPlanner()).plan('x') } },
   })
-  assert.equal(await memberAgent.complete(request({ requesterRole: 'MEMBER', ownerConfigured: false })), 'member normal')
+  assert.equal(await memberAgent.complete(request({ requesterRole: 'MEMBER', ownerConfigured: false })), `member normal${YEYE_REPLY_SIGNATURE}`)
   assert.equal(memberCalls.count, 1)
   assert.equal(memberPlannerCalls, 0)
   assert.equal(memberAgent.pollProactiveOutbound(), null)
@@ -221,7 +222,7 @@ async function main(): Promise<void> {
       }),
     },
   })
-  assert.equal(await normalOwnerAgent.complete(request({ messageId: 'owner-normal' })), 'owner normal')
+  assert.equal(await normalOwnerAgent.complete(request({ messageId: 'owner-normal' })), `owner normal${YEYE_REPLY_SIGNATURE}`)
   assert.equal(normalOwnerCalls.count, 1)
   assert.equal(normalOwnerAgent.pollProactiveOutbound(), null)
 
@@ -236,7 +237,7 @@ async function main(): Promise<void> {
     ownerDispatchPlanner: { plan: async () => { explicitPlannerCalls += 1; return (await dispatchPlanner()).plan('x') } },
     memory: { tryHandleExplicit: async () => ({ handled: true, reply: '已处理记忆' }) } as never,
   })
-  assert.equal(await explicitAgent.complete(request()), '已处理记忆')
+  assert.equal(await explicitAgent.complete(request()), `已处理记忆${YEYE_REPLY_SIGNATURE}`)
   assert.equal(explicitPlannerCalls, 0)
   assert.equal(explicitAgent.pollProactiveOutbound(), null)
 

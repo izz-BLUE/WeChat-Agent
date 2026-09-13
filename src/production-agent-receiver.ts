@@ -7,6 +7,7 @@ import {
   type MemoryPromptItem,
 } from './chat.js'
 import { sanitizeFinalAnswer } from './final-answer.js'
+import { decorateYeyeReplySignature } from './chat-renderer.js'
 import {
   ABSENT_BOT_MENTION_SPANS,
   ABSENT_USER_CONTENT_SPAN,
@@ -73,6 +74,10 @@ import {
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
   ProactiveGroupQueue,
 } from './proactive-group-queue.js'
+
+function finalizeYeyeReply(answer: string): string {
+  return sanitizeFinalAnswer(decorateYeyeReplySignature(answer)).text
+}
 
 /**
  * The mention fact handed to the model. A group message only reaches the Agent
@@ -371,14 +376,15 @@ export class ProductionChatAgent implements AgentExecutor {
     try {
       const answer = await this.completeWithinDeadline(request, deadline, msgIdToken)
       deadline.throwIfExpired()
-      return answer
+      return finalizeYeyeReply(answer)
     } catch (error) {
       if (!isRequestDeadlineExceeded(error)) {
         throw error
       }
       result = 'DEADLINE_FALLBACK'
-      this.stageOutbound(request, REQUEST_DEADLINE_FALLBACK_REPLY, msgIdToken)
-      return REQUEST_DEADLINE_FALLBACK_REPLY
+      const fallback = finalizeYeyeReply(REQUEST_DEADLINE_FALLBACK_REPLY)
+      this.stageOutbound(request, fallback, msgIdToken)
+      return fallback
     } finally {
       const elapsedMs = Date.now() - deadline.startedAt
       emitDiagnostic(
@@ -677,7 +683,7 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   private stageOutbound(request: AgentRequest, answer: string, msgIdToken: string): void {
-    const outboundText = sanitizeFinalAnswer(answer).text
+    const outboundText = finalizeYeyeReply(answer)
     if (!outboundText) return
     const identity = this.pendingOutbound.stage({
       requestMessageId: request.messageId,

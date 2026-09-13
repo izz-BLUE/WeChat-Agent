@@ -35,6 +35,7 @@ import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import { MemoryService } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import type { AgentPassiveContext, AgentRequest } from './agent-adapter.js'
 import {
   buildAuthorizedMemoryWorkingSet,
@@ -489,7 +490,7 @@ async function testContextualIdentityRecallWithoutDetector(): Promise<void> {
     assert(!isCurrentSelfIdentityQuery(query), 'the identity fixture is a deterministic detector hit, so the case proves nothing')
 
     const reply = await ask(harness, { text: query, messageId: 'identity-1' })
-    assert(reply === '收到。', `the stubbed final answer was altered: ${reply}`)
+    assert(reply === `收到。${YEYE_REPLY_SIGNATURE}`, `the stubbed final answer was altered: ${reply}`)
 
     const prompt = finalPrompt(harness)
     assert(prompt.user.includes(NAME_MEMORY), 'the identity memory did not reach the final prompt')
@@ -1013,7 +1014,7 @@ async function testRecallNeverEntersTheWriteEntry(): Promise<void> {
         requesterRole: 'OWNER',
         ownerConfigured: true,
       })
-      assert(reply === '收到。', `the recall question was short-circuited: ${reply}`)
+      assert(reply === `收到。${YEYE_REPLY_SIGNATURE}`, `the recall question was short-circuited: ${reply}`)
       assert(harness.mutateCalls === 0, `mutation provider calls=${harness.mutateCalls} for a recall question: ${question}`)
       assert(harness.extractorCalls === 0, `the extractor ran for a recall question: ${question}`)
       assert(providerCallCount(harness) === 1, `final provider calls=${providerCallCount(harness)} for: ${question}`)
@@ -1087,7 +1088,7 @@ async function testWriteCommandsStillEnterTheMutationPath(): Promise<void> {
         botMention: true,
       })
       assert(harness.mutateCalls === 1, `mutation provider calls=${harness.mutateCalls} for a write command: ${question}`)
-      assert(reply === '这条记忆没有保存成功。', `an unresolvable write command lost its fail-closed reply: ${reply}`)
+      assert(reply === `这条记忆没有保存成功。${YEYE_REPLY_SIGNATURE}`, `an unresolvable write command lost its fail-closed reply: ${reply}`)
       assert(providerCallCount(harness) === 0, 'a short-circuited write command still reached the chat model')
       assert(harness.store.liveRecordCount === 1, 'the NONE mutation wrote memory')
     } finally {
@@ -1153,7 +1154,7 @@ async function testNormalChatNeverEntersTheMutationPath(): Promise<void> {
         ownerConfigured: true,
         botMention: true,
       })
-      assert(reply === '收到。', `the turn was swallowed instead of answered: ${question} -> ${reply}`)
+      assert(reply === `收到。${YEYE_REPLY_SIGNATURE}`, `the turn was swallowed instead of answered: ${question} -> ${reply}`)
       assert(harness.mutateCalls === 0, `mutation provider calls=${harness.mutateCalls} for ordinary chat: ${question}`)
       assert(providerCallCount(harness) === 1, `final provider calls=${providerCallCount(harness)} for: ${question}`)
 
@@ -1462,8 +1463,8 @@ async function testPreviousActiveEventIsRenderedOnce(): Promise<void> {
     // The assistant half of that interaction is history too, and it must survive
     // the de-duplication of the user half.
     assert(
-      countOccurrences(prompt.user, 'ASSISTANT：收到。') === 1,
-      `the assistant reply was rendered ${countOccurrences(prompt.user, 'ASSISTANT：收到。')} times`,
+      countOccurrences(prompt.user, `ASSISTANT：收到。${YEYE_REPLY_SIGNATURE}`) === 1,
+      `the assistant reply was rendered ${countOccurrences(prompt.user, `ASSISTANT：收到。${YEYE_REPLY_SIGNATURE}`)} times`,
     )
 
     // The active request of THIS turn is still rendered exactly once.

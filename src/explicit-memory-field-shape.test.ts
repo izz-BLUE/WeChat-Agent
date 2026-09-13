@@ -40,6 +40,7 @@ import { isExplicitMemoryCommand, MemoryService } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { normalizeRawHookMessage, type RawHookMessage } from './message-contract.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -408,7 +409,7 @@ async function testFieldShapeNormalChatStaysChat(): Promise<void> {
       assert(admission.includes('explicitCommand=false'), `${name}: the gate admitted ordinary chat: ${admission}`)
       assert(mutationCallCount(harness) === 0, `${name}: mutation provider calls=${mutationCallCount(harness)}`)
       assert(finalCallCount(harness) === 1, `${name}: final provider calls=${finalCallCount(harness)}`)
-      assert(reply === '收到。', `${name}: the turn was swallowed: ${reply}`)
+      assert(reply === `收到。${YEYE_REPLY_SIGNATURE}`, `${name}: the turn was swallowed: ${reply}`)
 
       const prompt = harness.finalCalls[0] as ProviderCall
       const canonical = canonicalUserText(content, resolveBotMentionSpans(content, botSpansFor(content)))
@@ -450,7 +451,7 @@ async function testFieldShapeExplicitAddPersists(): Promise<void> {
   })
   try {
     const reply = await ask(harness, { content: `${BOT_TOKEN}记住我不吃香菜`, msgId: 'field-add-1' })
-    assert(reply === '记住了。', `the explicit add did not report success: ${reply}`)
+    assert(reply === `记住了。${YEYE_REPLY_SIGNATURE}`, `the explicit add did not report success: ${reply}`)
 
     const durable = harness.logs.join('\n')
     assert(
@@ -468,7 +469,7 @@ async function testFieldShapeExplicitAddPersists(): Promise<void> {
     assert(!(stored[0]?.content ?? '').includes(MENTION_SEPARATOR), 'framing was persisted as memory content')
 
     const followUp = await ask(harness, { content: `${BOT_TOKEN}我有什么忌口来着？`, msgId: 'field-add-2' })
-    assert(followUp === '收到。', `the follow-up turn was swallowed: ${followUp}`)
+    assert(followUp === `收到。${YEYE_REPLY_SIGNATURE}`, `the follow-up turn was swallowed: ${followUp}`)
     assert(finalCallCount(harness) === 1, `follow-up final provider calls=${finalCallCount(harness)}`)
     const prompt = harness.finalCalls[0] as ProviderCall
     assert(
@@ -489,7 +490,7 @@ async function testFieldShapePersistedMemorySurvivesRestart(): Promise<void> {
   })
   try {
     const reply = await ask(harness, { content: `${BOT_TOKEN}记住我不吃香菜`, msgId: 'field-restart-1' })
-    assert(reply === '记住了。', `the restart fixture write failed: ${reply}`)
+    assert(reply === `记住了。${YEYE_REPLY_SIGNATURE}`, `the restart fixture write failed: ${reply}`)
   } finally {
     harness.restore()
   }

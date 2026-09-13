@@ -28,6 +28,7 @@ import { MemoryService } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { normalizeRawHookMessage, type InboundMessage, type RawHookMessage } from './message-contract.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { isInternalSpeakerLabel } from './speaker-labels.js'
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -356,7 +357,7 @@ async function testAnotherMemberIsNeverTheCurrentSpeaker(): Promise<void> {
     assert(conflated.regenerable, 'a label conflation must stay regenerable')
 
     assert(fixture.provider.calls.length === 3, `the draft was not re-generated exactly once: ${fixture.provider.calls.length}`)
-    assert(reply === '你是正在和我说话的那位，名字是你刚才给我取的。', `the safe rewrite was not sent: ${reply}`)
+    assert(reply === `你是正在和我说话的那位，名字是你刚才给我取的。${YEYE_REPLY_SIGNATURE}`, `the safe rewrite was not sent: ${reply}`)
     assert(!reply.includes(otherLabel), 'the reply carries another member label')
   } finally {
     fixture.restore()
@@ -407,7 +408,7 @@ async function testRetrievedCodenameIsAnswerable(): Promise<void> {
       call.user.includes('[Authorized Personal Memory]\n- 用户代号是 AlphaTest'),
       'the retrieved codename did not reach the personal memory section',
     )
-    assert(reply === '你的代号是 AlphaTest。', `a grounded codename answer was altered: ${reply}`)
+    assert(reply === `你的代号是 AlphaTest。${YEYE_REPLY_SIGNATURE}`, `a grounded codename answer was altered: ${reply}`)
   } finally {
     fixture.restore()
   }
@@ -536,7 +537,7 @@ async function testFinalAnswerBoundaryUnchanged(): Promise<void> {
   const inline = createFixture({ answers: [{ content: '<think>内部推理：他在问我是谁。</think>你好，我是椰椰。' }] })
   try {
     const reply = await inline.ask({ msgId: 'boundary-1', text: '@椰椰 你好' })
-    assert(reply === '你好，我是椰椰。', `the FINAL_ANSWER boundary regressed: ${reply}`)
+    assert(reply === `你好，我是椰椰。${YEYE_REPLY_SIGNATURE}`, `the FINAL_ANSWER boundary regressed: ${reply}`)
     assert(!reply.includes('推理'), 'reasoning leaked into the reply')
   } finally {
     inline.restore()
@@ -570,7 +571,7 @@ async function testFinalAnswerBoundaryUnchanged(): Promise<void> {
     assert(result.status === 'AGENT_RESULT', 'the mentioned group message did not reach the agent')
     assert(result.outboundCommand?.conversationType === 'GROUP', 'the group recipient type changed')
     assert(result.outboundCommand?.conversationId === 'room-z@chatroom', 'the group recipient id changed')
-    assert(result.outboundCommand?.text === '群回复', 'the reply text changed')
+    assert(result.outboundCommand?.text === `群回复${YEYE_REPLY_SIGNATURE}`, 'the reply text changed')
   } finally {
     recipient.restore()
   }
@@ -666,7 +667,7 @@ async function testOrdinaryAnswerIsUntouched(): Promise<void> {
   const fixture = createFixture({ answers: [{ content: '今天天气不错，你那边呢？' }] })
   const { result: reply, logs } = await withCapturedLogs(() => fixture.ask({ msgId: 'plain-1', text: '@椰椰 你好' }))
   try {
-    assert(reply === '今天天气不错，你那边呢？', `an ordinary answer was altered: ${reply}`)
+    assert(reply === `今天天气不错，你那边呢？${YEYE_REPLY_SIGNATURE}`, `an ordinary answer was altered: ${reply}`)
     assert(
       logs.some((line) => line.includes('[AGENT_ANSWER_GUARD]') && line.includes('outcome=CLEAN')),
       'an ordinary answer was not reported as CLEAN',

@@ -12,6 +12,7 @@ import {
 } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { RequestDeadline } from './request-deadline.js'
 
 const ROOM = 'memory-background-room@chatroom'
@@ -218,7 +219,7 @@ async function testForegroundReplySurvivesBackgroundCompletion(): Promise<void> 
   })
 
   const result = await agent.complete(foregroundRequest('foreground-2'))
-  assert.equal(result, '前台回复', 'background extraction changed a successful foreground reply')
+  assert.equal(result, `前台回复${YEYE_REPLY_SIGNATURE}`, 'background extraction changed a successful foreground reply')
   await delay(25)
   await harness.service.flushAll()
   assert.match(harness.logs.join('\n'), /trigger=AUTO_CHAT_THRESHOLD.*result=PASS/u)

@@ -1,7 +1,11 @@
 import { strict as assert } from 'node:assert'
 import { buildUserPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import { appendGroundedSources, type WebSearchResult } from './web-search.js'
-import { renderHumanChat } from './chat-renderer.js'
+import { decorateYeyeReplySignature, renderHumanChat, YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
+import type { AgentRequest } from './agent-adapter.js'
+import { ProductionChatAgent } from './production-agent-receiver.js'
+import { GroupAmbientContext } from './group-ambient-context.js'
+import { RequestDeadlineExceededError } from './request-deadline.js'
 
 function check(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -43,6 +47,34 @@ const REQUEST: ChatRequestContext = {
   ownerConfigured: false,
 }
 
+const SIGNATURE_REQUEST: AgentRequest = {
+  conversationKey: 'group:renderer-signature@chatroom',
+  messageId: 'renderer-signature-request',
+  conversationType: 'GROUP',
+  conversationId: 'renderer-signature@chatroom',
+  senderId: 'renderer-sender',
+  requesterId: 'renderer-sender',
+  requesterSource: 'TEST',
+  requesterRole: 'MEMBER',
+  ownerConfigured: false,
+  ownerDisplayName: null,
+  publicDisplayName: '测试成员',
+  senderName: '测试成员',
+  text: '你好',
+  rawText: '你好',
+  timestamp: 1,
+  mentionState: 'MENTIONED',
+  botMentionSpans: { trust: 'VALID', spans: [] },
+  userContentSpan: { trust: 'VALID', span: { start: 0, length: 2 } },
+  metadata: { rawMessageType: 1 },
+}
+
+function chatReturning(answer: string): ChatService {
+  const chat = new ChatService('https://provider.invalid/v1', 'key', 'model')
+  chat.reply = async () => answer
+  return chat
+}
+
 async function runCase(name: string, body: () => Promise<void> | void): Promise<void> {
   try {
     await body()
@@ -56,6 +88,104 @@ async function runCase(name: string, body: () => Promise<void> | void): Promise<
 await runCase('simple-chat-is-unchanged', () => {
   const answer = '嗯，这个可以。'
   assert.equal(renderHumanChat(answer), answer)
+})
+
+await runCase('signature-is-sentence-level-and-deterministic', () => {
+  assert.equal(
+    decorateYeyeReplySignature('你好。今天继续测试！准备好了吗？\nThat works! Really?'),
+    `你好。${YEYE_REPLY_SIGNATURE}今天继续测试！${YEYE_REPLY_SIGNATURE}准备好了吗？${YEYE_REPLY_SIGNATURE}\nThat works!${YEYE_REPLY_SIGNATURE} Really?${YEYE_REPLY_SIGNATURE}`,
+  )
+  assert.equal(decorateYeyeReplySignature('知道了'), `知道了${YEYE_REPLY_SIGNATURE}`)
+})
+
+await runCase('signature-is-idempotent-and-empty-safe', () => {
+  const answer = `知道啦。${YEYE_REPLY_SIGNATURE}`
+  assert.equal(decorateYeyeReplySignature(answer), answer)
+  assert.equal(decorateYeyeReplySignature(decorateYeyeReplySignature(answer)), answer)
+  assert.equal(decorateYeyeReplySignature(''), '')
+  assert.equal(decorateYeyeReplySignature('   '), '')
+})
+
+await runCase('signature-preserves-protected-content', () => {
+  const code = '```js\nconst x = 1;\n```'
+  const sourceList = '来源：\n1. 真实来源 https://example.com'
+  assert.equal(decorateYeyeReplySignature(code), code)
+  assert.equal(decorateYeyeReplySignature('请运行 `const x = 1;`。'), `请运行 \`const x = 1;\`。${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(decorateYeyeReplySignature('https://example.com'), 'https://example.com')
+  assert.equal(decorateYeyeReplySignature('结论成立。[S1]'), `结论成立。${YEYE_REPLY_SIGNATURE} [S1]`)
+  assert.equal(decorateYeyeReplySignature('- 第一条说明。\n1. 第二条说明？'), `- 第一条说明。${YEYE_REPLY_SIGNATURE}\n1. 第二条说明？${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(decorateYeyeReplySignature(sourceList), sourceList)
+  assert.equal(decorateYeyeReplySignature('const x = 1;'), 'const x = 1;')
+  assert.equal(decorateYeyeReplySignature('{"answer":"hello"}'), '{"answer":"hello"}')
+  assert.equal(decorateYeyeReplySignature('$ npm run build'), '$ npm run build')
+  assert.equal(decorateYeyeReplySignature('Error: request failed'), 'Error: request failed')
+})
+
+await runCase('production-final-and-staged-outbound-use-one-signed-text', async () => {
+  const ambient = new GroupAmbientContext({ now: () => 1 })
+  const agent = new ProductionChatAgent(chatReturning('你好。'), { ambientContext: ambient })
+  const answer = await agent.complete(SIGNATURE_REQUEST)
+  assert.equal(answer, `你好。${YEYE_REPLY_SIGNATURE}`)
+  const identity = agent.takeOutboundIdentity(SIGNATURE_REQUEST, answer)
+  check(identity !== null, 'signed answer was not staged')
+  const ack = agent.observeOutboundDelivery({
+    ...identity,
+    status: 'SENT',
+    errorCode: '',
+  })
+  assert.equal(ack.accepted, true)
+  assert.equal(ambient.entries(SIGNATURE_REQUEST.conversationId).find((line) => line.speakerType === 'ASSISTANT')?.text, answer)
+})
+
+await runCase('production-decorates-deadline-fallback-and-keeps-owner-empty', async () => {
+  const failingChat = chatReturning('never sent')
+  failingChat.reply = async () => { throw new RequestDeadlineExceededError('FINAL_ANSWER') }
+  const agent = new ProductionChatAgent(failingChat, { requestDeadlineMs: 500 })
+  const fallback = await agent.complete({ ...SIGNATURE_REQUEST, messageId: 'renderer-deadline-request' })
+  assert.equal(fallback, `这次处理有点超时了，稍后再问我一次。${YEYE_REPLY_SIGNATURE}`)
+
+  const ownerEmpty = await new ProductionChatAgent(chatReturning('must not chat')).complete({
+    ...SIGNATURE_REQUEST,
+    messageId: 'renderer-owner-request',
+    conversationType: 'DIRECT',
+    conversationKey: 'direct:owner',
+    conversationId: 'owner-account@chatroom',
+    senderId: 'owner-account',
+    requesterId: 'owner-account',
+    requesterSource: 'DIRECT_OWNER_FIELD_VERIFIED',
+    requesterRole: 'OWNER',
+    ownerConfigured: true,
+    mentionState: 'NOT_MENTIONED',
+    botMentionSpans: undefined,
+    userContentSpan: undefined,
+  })
+  assert.equal(ownerEmpty, '')
+})
+
+await runCase('production-decorates-memory-and-grounding-safe-replies', async () => {
+  const selfAddressAgent = new ProductionChatAgent(chatReturning('must not reach final chat'), {
+    memory: {
+      tryHandleSelfAddressPreference: () => ({ handled: true, reply: '好，以后叫你公主。' }),
+      tryHandleExplicit: async () => ({ handled: false, reply: '' }),
+    } as never,
+  })
+  assert.equal(await selfAddressAgent.complete(SIGNATURE_REQUEST), `好，以后叫你公主。${YEYE_REPLY_SIGNATURE}`)
+
+  const explicitMemoryAgent = new ProductionChatAgent(chatReturning('must not reach final chat'), {
+    memory: {
+      tryHandleSelfAddressPreference: () => ({ handled: false, reply: '' }),
+      tryHandleExplicit: async () => ({ handled: true, reply: '已处理记忆。' }),
+    } as never,
+  })
+  assert.equal(await explicitMemoryAgent.complete({ ...SIGNATURE_REQUEST, messageId: 'renderer-explicit-memory-request' }), `已处理记忆。${YEYE_REPLY_SIGNATURE}`)
+
+  const groundingFailureAgent = new ProductionChatAgent(
+    chatReturning('我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。'),
+  )
+  assert.equal(
+    await groundingFailureAgent.complete({ ...SIGNATURE_REQUEST, messageId: 'renderer-grounding-failure-request' }),
+    `我查到了些资料，但这次没法可靠对应到具体来源，先不乱下结论。${YEYE_REPLY_SIGNATURE}`,
+  )
 })
 
 await runCase('decorative-markdown-is-normalized', () => {

@@ -20,6 +20,7 @@ import {
 import type { AmbientLine } from './group-ambient-context.js'
 import type { AgentRequest } from './agent-adapter.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import type { WebSearchRequest } from './web-search.js'
 
 let cases = 0
@@ -270,7 +271,7 @@ await test('case-10-production-search-carrier-and-no-extra-llm-call', async () =
 
   const second = request('turn-2', '那和 DeepSeek 比呢？')
   const secondAnswer = await agent.complete(second)
-  check(secondAnswer === '回复2', 'second follow-up did not complete')
+  check(secondAnswer === `回复2${YEYE_REPLY_SIGNATURE}`, 'second follow-up did not complete')
   check(plannerPrompts.length === 2, `expected one existing Planner call per turn, got ${plannerPrompts.length}`)
   check(plannerPrompts[1]?.includes('speaker=MEMBER_1: Gemini 新模型怎么样？'), 'production Search Planner missed active antecedent')
   check(plannerPrompts[1]?.includes('ASSISTANT_REPLY_TARGET=CURRENT_REQUESTER'), 'production Search Planner missed assistant ownership')

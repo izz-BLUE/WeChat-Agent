@@ -10,6 +10,7 @@ import type { AgentRequest } from './agent-adapter.js'
 import type { GroupMessage } from './context.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { RequestDeadline } from './request-deadline.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import type { WebSearchProvider } from './web-search.js'
 
 const FALLBACK = '这次处理有点超时了，稍后再问我一次。'
@@ -146,7 +147,7 @@ async function testDirectSufficient(): Promise<void> {
       botMentionSpans: undefined,
       userContentSpan: undefined,
     })
-    assert.equal(result, '正常回复')
+    assert.equal(result, `正常回复${YEYE_REPLY_SIGNATURE}`)
     assert.equal(calls, 1)
     assert.notEqual(agent.takeOutboundIdentity({ ...REQUEST, conversationType: 'DIRECT', conversationId: 'direct-sufficient' }, result), null)
   })
@@ -341,7 +342,7 @@ async function run(): Promise<void> {
       }),
     ])
 
-    assert.equal(result, FALLBACK)
+    assert.equal(result, `${FALLBACK}${YEYE_REPLY_SIGNATURE}`)
     assert.equal(fetchCalls, 1)
     assert.equal(aborted, true)
     assert.notEqual(agent.takeOutboundIdentity(REQUEST, result), null)
