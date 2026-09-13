@@ -4,7 +4,12 @@ import { ChatService } from './chat.js'
 import type { AgentRequest } from './agent-adapter.js'
 import { sha256Utf8 } from './outbound-delivery.js'
 import { GroupAmbientContext } from './group-ambient-context.js'
-import { OwnerDispatchPlanner, parseOwnerDispatchProtocol, type OwnerDispatchPlannerLike } from './owner-dispatch-planner.js'
+import {
+  isOwnerDispatchCandidate,
+  OwnerDispatchPlanner,
+  parseOwnerDispatchProtocol,
+  type OwnerDispatchPlannerLike,
+} from './owner-dispatch-planner.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { ProactiveGroupQueue } from './proactive-group-queue.js'
@@ -31,11 +36,22 @@ function request(overrides: Partial<AgentRequest> = {}): AgentRequest {
     rawText,
     timestamp: 1_757_000_000_000,
     mentionState: 'MENTIONED',
-    botMentionSpans: { trust: 'VALID', spans: [{ start: 0, length: 5 }] },
+    botMentionSpans: { trust: 'VALID', spans: [{ start: 0, length: 4 }] },
     userContentSpan: { trust: 'VALID', span: { start: 0, length: rawText.length } },
     metadata: { rawMessageType: 1 },
     ...overrides,
   }
+}
+
+function ownerRequest(content: string, overrides: Partial<AgentRequest> = {}): AgentRequest {
+  const rawText = `@椰椰\u2005${content}`
+  return request({
+    ...overrides,
+    text: content,
+    rawText,
+    botMentionSpans: { trust: 'VALID', spans: [{ start: 0, length: 4 }] },
+    userContentSpan: { trust: 'VALID', span: { start: 0, length: rawText.length } },
+  })
 }
 
 function chat(answer: string, calls: { count: number }): ChatService {
@@ -47,13 +63,16 @@ function chat(answer: string, calls: { count: number }): ChatService {
   } as unknown as ChatService
 }
 
-function dispatchPlanner(message = '大家今晚十点开会，别迟到哈'): OwnerDispatchPlannerLike {
+function dispatchPlanner(message = '大家今晚十点开会，别迟到哈', calls?: { count: number }): OwnerDispatchPlannerLike {
   return {
-    plan: async () => ({
-      result: 'PASS' as const,
-      decision: { action: 'DISPATCH_NOW' as const, message },
-      attempts: 1,
-    }),
+    plan: async () => {
+      if (calls !== undefined) calls.count += 1
+      return {
+        result: 'PASS' as const,
+        decision: { action: 'DISPATCH_NOW' as const, message },
+        attempts: 1,
+      }
+    },
   }
 }
 
@@ -67,6 +86,32 @@ const ownerPlannerFixtures: readonly [question: string, action: 'CHAT' | 'DISPAT
   ['替我通知大家部署完成了', 'DISPATCH_NOW'],
   ['帮我问一下大家今晚谁有空', 'DISPATCH_NOW'],
 ]
+
+const ownerDispatchGateFixtures: readonly [question: string, candidate: boolean][] = [
+  ['你好', false],
+  ['你怎么看这个方案', false],
+  ['你觉得虚拟线程怎么样', false],
+  ['帮我分析一下这个报错', false],
+  ['帮我查一下 OpenAI 最近有什么新闻', false],
+  ['搜一下今天有什么有意思的新闻', false],
+  ['我想要更亲密的剧情', false],
+  ['帮我写一段开会通知', false],
+  ['详细讲讲 Java 虚拟线程', false],
+  ['大家觉得这个怎么样', false],
+  ['这个群最近挺热闹', false],
+  ['帮我跟大家说一下今晚十点开会，别迟到', true],
+  ['替我通知大家部署完成了', true],
+  ['替我通知群里明天不用来公司', true],
+  ['帮我问一下大家今晚谁有空', true],
+  ['跟大家说部署已经完成了', true],
+  ['写一段通知并发给大家', true],
+]
+
+function assertOwnerDispatchGateFixtures(): void {
+  for (const [question, candidate] of ownerDispatchGateFixtures) {
+    assert.equal(isOwnerDispatchCandidate(question), candidate, question)
+  }
+}
 
 async function assertOwnerPlannerFixtures(): Promise<void> {
   const expected = new Map(ownerPlannerFixtures)
@@ -134,6 +179,7 @@ async function readLine(socket: ReturnType<typeof createConnection>, state: { bu
 
 async function main(): Promise<void> {
   await assertOwnerPlannerFixtures()
+  assertOwnerDispatchGateFixtures()
 
   assert.deepEqual(parseOwnerDispatchProtocol('ACTION=CHAT\nMESSAGE='), {
     valid: true,
@@ -147,21 +193,29 @@ async function main(): Promise<void> {
   let plannerCalls = 0
   const planner = new OwnerDispatchPlanner(async () => {
     plannerCalls += 1
-    return plannerCalls === 1 ? 'bad' : 'ACTION=DISPATCH_NOW\nMESSAGE=提醒大家开会'
+    return 'bad'
   })
   const planned = await planner.plan('提醒大家开会', [OWNER, ROOM])
-  assert.equal(planned.result, 'PASS')
-  assert.equal(planned.attempts, 2)
-  assert.equal(planned.decision.message, '提醒大家开会')
+  assert.equal(planned.result, 'FAIL')
+  assert.equal(planned.attempts, 1)
+  assert.equal(plannerCalls, 1)
+
+  const validPlanner = new OwnerDispatchPlanner(async () => 'ACTION=DISPATCH_NOW\nMESSAGE=提醒大家开会')
+  const validPlan = await validPlanner.plan('提醒大家开会', [OWNER, ROOM])
+  assert.equal(validPlan.result, 'PASS')
+  assert.equal(validPlan.attempts, 1)
+  assert.equal(validPlan.decision.message, '提醒大家开会')
 
   const calls = { count: 0 }
   const ambient = new GroupAmbientContext({ now: () => Date.now() })
+  const dispatchPlannerCalls = { count: 0 }
   const agent = new ProductionChatAgent(chat('normal answer', calls), {
-    ownerDispatchPlanner: dispatchPlanner(),
+    ownerDispatchPlanner: dispatchPlanner(undefined, dispatchPlannerCalls),
     ambientContext: ambient,
   })
-  assert.equal(await agent.complete(request()), '')
+  assert.equal(await agent.complete(ownerRequest('帮我跟大家说一下今晚十点开会，别迟到')), '')
   assert.equal(calls.count, 0)
+  assert.equal(dispatchPlannerCalls.count, 1)
   const command = agent.pollProactiveOutbound()
   assert(command)
   assert.equal(command.conversationType, 'GROUP')
@@ -213,18 +267,102 @@ async function main(): Promise<void> {
   assert.equal(memberAgent.pollProactiveOutbound(), null)
 
   const normalOwnerCalls = { count: 0 }
+  const normalOwnerPlannerCalls = { count: 0 }
   const normalOwnerAgent = new ProductionChatAgent(chat('owner normal', normalOwnerCalls), {
     ownerDispatchPlanner: {
-      plan: async () => ({
+      plan: async () => {
+        normalOwnerPlannerCalls.count += 1
+        return {
         result: 'PASS' as const,
         decision: { action: 'CHAT' as const, message: null },
         attempts: 1,
-      }),
+        }
+      },
     },
   })
-  assert.equal(await normalOwnerAgent.complete(request({ messageId: 'owner-normal' })), `owner normal${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(await normalOwnerAgent.complete(ownerRequest('你好', { messageId: 'owner-normal' })), `owner normal${YEYE_REPLY_SIGNATURE}`)
   assert.equal(normalOwnerCalls.count, 1)
+  assert.equal(normalOwnerPlannerCalls.count, 0)
   assert.equal(normalOwnerAgent.pollProactiveOutbound(), null)
+
+  let ordinarySearchOwnerPlannerCalls = 0
+  let webSearchPlannerCalls = 0
+  let webSearchProviderCalls = 0
+  const ordinarySearchAgent = new ProductionChatAgent(chat('search answer', { count: 0 }), {
+    ownerDispatchPlanner: {
+      plan: async () => {
+        ordinarySearchOwnerPlannerCalls += 1
+        return dispatchPlanner().plan('unexpected')
+      },
+    },
+    webSearchPlanner: {
+      plan: async () => {
+        webSearchPlannerCalls += 1
+        return {
+          result: 'PASS' as const,
+          decision: {
+            action: 'SEARCH' as const,
+            query: '今天新闻',
+            alternateQuery: null,
+            reasonCode: 'EXPLICIT_SEARCH_REQUEST' as const,
+            mode: 'GENERAL' as const,
+            recencyWindow: 'NONE' as const,
+          },
+          attempts: 1,
+        }
+      },
+    },
+    webSearchProvider: {
+      search: async () => {
+        webSearchProviderCalls += 1
+        return { results: [{ sourceId: 'S1', title: '新闻', url: 'https://example.com/news', snippet: '公开新闻' }] }
+      },
+    },
+  })
+  assert.equal(await ordinarySearchAgent.complete(ownerRequest('搜一下今天有什么新闻', { messageId: 'owner-search' })), `search answer${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(ordinarySearchOwnerPlannerCalls, 0)
+  assert.equal(webSearchPlannerCalls, 1)
+  assert.equal(webSearchProviderCalls, 1)
+  assert.equal(ordinarySearchAgent.pollProactiveOutbound(), null)
+
+  const plannerChatCalls = { count: 0 }
+  const plannerChatAgent = new ProductionChatAgent(chat('planner chat', { count: 0 }), {
+    ownerDispatchPlanner: {
+      plan: async () => {
+        plannerChatCalls.count += 1
+        return {
+          result: 'PASS' as const,
+          decision: { action: 'CHAT' as const, message: null },
+          attempts: 1,
+        }
+      },
+    },
+  })
+  assert.equal(await plannerChatAgent.complete(ownerRequest('跟大家说部署已经完成了', { messageId: 'owner-planner-chat' })), `planner chat${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(plannerChatCalls.count, 1)
+  assert.equal(plannerChatAgent.pollProactiveOutbound(), null)
+
+  let invalidProtocolCalls = 0
+  const invalidProtocolAgent = new ProductionChatAgent(chat('invalid protocol fallback', { count: 0 }), {
+    ownerDispatchPlanner: new OwnerDispatchPlanner(async () => {
+      invalidProtocolCalls += 1
+      return 'bad'
+    }),
+  })
+  assert.equal(await invalidProtocolAgent.complete(ownerRequest('帮我问一下大家今晚谁有空', { messageId: 'owner-invalid-protocol' })), `invalid protocol fallback${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(invalidProtocolCalls, 1)
+  assert.equal(invalidProtocolAgent.pollProactiveOutbound(), null)
+
+  let providerExceptionCalls = 0
+  const providerExceptionAgent = new ProductionChatAgent(chat('provider exception fallback', { count: 0 }), {
+    ownerDispatchPlanner: new OwnerDispatchPlanner(async () => {
+      providerExceptionCalls += 1
+      throw new Error('provider unavailable')
+    }),
+  })
+  assert.equal(await providerExceptionAgent.complete(ownerRequest('替我通知大家部署完成了', { messageId: 'owner-provider-exception' })), `provider exception fallback${YEYE_REPLY_SIGNATURE}`)
+  assert.equal(providerExceptionCalls, 1)
+  assert.equal(providerExceptionAgent.pollProactiveOutbound(), null)
 
   const invalidAgent = new ProductionChatAgent(chat('invalid normal', { count: 0 }), {
     ownerDispatchPlanner: dispatchPlanner(),

@@ -63,7 +63,11 @@ import { createRuntimeTimeFacts, type RuntimeClock, type RuntimeTimeFacts } from
 import { observeGroupStyle } from './group-style.js'
 import { deriveGroupReplyPressure, observeConversationDynamics } from './conversation-dynamics.js'
 import { deriveMemberInteractionProfile } from './member-interaction-profile.js'
-import { type OwnerDispatchPlannerLike, OwnerDispatchPlanner } from './owner-dispatch-planner.js'
+import {
+  isOwnerDispatchCandidate,
+  type OwnerDispatchPlannerLike,
+  OwnerDispatchPlanner,
+} from './owner-dispatch-planner.js'
 import {
   OwnerPrivateDispatchPlanner,
   formatOwnerPrivateDispatchProtocol,
@@ -309,6 +313,10 @@ export interface ProductionChatAgentOptions {
   proactiveQueueTtlMs?: number
 }
 
+interface RequestDeadlineDiagnostics {
+  preFinalRemainingMs?: number
+}
+
 export class ProductionChatAgent implements AgentExecutor {
   private readonly context: GroupContext
   private readonly ambient: GroupAmbientContext
@@ -492,9 +500,10 @@ export class ProductionChatAgent implements AgentExecutor {
   public async complete(request: AgentRequest): Promise<string> {
     const deadline = new RequestDeadline(this.requestDeadlineMs)
     const msgIdToken = this.persistentLog?.shortIdFor(request.messageId) ?? identityToken(request.messageId).slice(0, 6)
+    const deadlineDiagnostics: RequestDeadlineDiagnostics = {}
     let result: 'COMPLETED' | 'DEADLINE_FALLBACK' = 'COMPLETED'
     try {
-      const answer = await this.completeWithinDeadline(request, deadline, msgIdToken)
+      const answer = await this.completeWithinDeadline(request, deadline, msgIdToken, deadlineDiagnostics)
       deadline.throwIfExpired()
       return finalizeYeyeReply(
         answer,
@@ -522,12 +531,14 @@ export class ProductionChatAgent implements AgentExecutor {
         {
           budgetMs: this.requestDeadlineMs,
           elapsedMs,
+          ownerDispatchLatencyMs: deadline.phaseLatencyMs('OWNER_DISPATCH_PLANNER'),
           plannerLatencyMs: deadline.phaseLatencyMs('WEB_SEARCH_PLANNER'),
           searchLatencyMs: deadline.phaseLatencyMs('WEB_SEARCH'),
           finalAnswerLatencyMs: deadline.phaseLatencyMs('FINAL_ANSWER'),
           groundingRepairLatencyMs: deadline.phaseLatencyMs('GROUNDING_REPAIR'),
           totalRequestLatencyMs: elapsedMs,
           remainingMs: deadline.remainingMs(),
+          preFinalRemainingMs: deadlineDiagnostics.preFinalRemainingMs,
           result,
           phase: deadline.phase,
           msgIdToken,
@@ -540,6 +551,7 @@ export class ProductionChatAgent implements AgentExecutor {
     request: AgentRequest,
     deadline: RequestDeadline,
     msgIdToken: string,
+    deadlineDiagnostics: RequestDeadlineDiagnostics,
   ): Promise<string> {
     if (isVerifiedOwnerDirect(request)) {
       return this.tryOwnerPrivateDispatch(request, deadline, msgIdToken)
@@ -783,6 +795,7 @@ export class ProductionChatAgent implements AgentExecutor {
       msgIdToken,
     )
 
+    deadlineDiagnostics.preFinalRemainingMs = deadline.remainingMs()
     const answer = await this.chatService.reply(
       window.messages,
       question,
@@ -860,8 +873,16 @@ export class ProductionChatAgent implements AgentExecutor {
       request.botMentionSpans?.trust === 'VALID' &&
       request.botMentionSpans.spans.length > 0 &&
       request.userContentSpan?.trust === 'VALID'
-    if (!authorized || this.ownerDispatchPlanner === null) {
-      this.logOwnerDispatch('CHAT', 'FAIL', authorized ? 'PLANNER_UNAVAILABLE' : 'AUTHORIZATION')
+    if (!authorized) {
+      this.logOwnerDispatch('CHAT', 'FAIL', 'AUTHORIZATION', false)
+      return false
+    }
+    if (!isOwnerDispatchCandidate(question)) {
+      this.logOwnerDispatch('CHAT', 'PASS', 'FAST_PATH_CHAT', false)
+      return false
+    }
+    if (this.ownerDispatchPlanner === null) {
+      this.logOwnerDispatch('CHAT', 'FAIL', 'PLANNER_UNAVAILABLE', false)
       return false
     }
 
@@ -872,11 +893,11 @@ export class ProductionChatAgent implements AgentExecutor {
       deadline.throwIfExpired()
     } catch (error) {
       if (isRequestDeadlineExceeded(error)) throw error
-      this.logOwnerDispatch('CHAT', 'FAIL', 'PLANNER_EXCEPTION')
+      this.logOwnerDispatch('CHAT', 'FAIL', 'PLANNER_EXCEPTION', true)
       return false
     }
     if (plan.result !== 'PASS' || plan.decision.action !== 'DISPATCH_NOW' || !plan.decision.message) {
-      this.logOwnerDispatch('CHAT', plan.result === 'PASS' ? 'PASS' : 'FAIL', plan.failureReason ?? 'PLANNER_CHAT')
+      this.logOwnerDispatch('CHAT', plan.result === 'PASS' ? 'PASS' : 'FAIL', plan.failureReason ?? 'PLANNER_CHAT', true)
       return false
     }
 
@@ -886,13 +907,13 @@ export class ProductionChatAgent implements AgentExecutor {
       text: plan.decision.message,
     })
     if (!queued.accepted) {
-      this.logOwnerDispatch('DISPATCH_NOW', 'FAIL', queued.reason)
+      this.logOwnerDispatch('DISPATCH_NOW', 'FAIL', queued.reason, true)
       this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size)
       // A dispatch decision is still a handled command. Do not turn a full or
       // invalid queue into a second normal bot reply in the same inbound turn.
       return true
     }
-    this.logOwnerDispatch('DISPATCH_NOW', 'PASS', 'ENQUEUED')
+    this.logOwnerDispatch('DISPATCH_NOW', 'PASS', 'ENQUEUED', true)
     this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
     return true
   }
@@ -972,12 +993,17 @@ export class ProductionChatAgent implements AgentExecutor {
     )
   }
 
-  private logOwnerDispatch(action: 'CHAT' | 'DISPATCH_NOW', result: 'PASS' | 'FAIL', reason: string): void {
+  private logOwnerDispatch(
+    action: 'CHAT' | 'DISPATCH_NOW',
+    result: 'PASS' | 'FAIL',
+    reason: string,
+    plannerInvoked: boolean,
+  ): void {
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
       'OWNER_DISPATCH',
-      { action, result, reason },
+      { action, result, reason, plannerInvoked },
     )
   }
 

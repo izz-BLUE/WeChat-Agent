@@ -72,9 +72,19 @@ DISPATCH_NOW：
 ACTION=...
 MESSAGE=...`
 
-const PLANNER_REPAIR_SYSTEM_PROMPT = `${PLANNER_SYSTEM_PROMPT}
+const OWNER_DISPATCH_TARGET = '(?:大家|群里|这个群|群友|大伙|所有人|全体)'
 
-上一轮输出格式错误。不要回答问题，不要调用工具，不要解释原因。严格只输出两行 ACTION=... 和 MESSAGE=...。`
+/**
+ * Cheap admission only: these are explicit current-group public-action shapes,
+ * not a general natural-language classifier. A miss is deliberately safe and
+ * keeps the request on the normal chat path.
+ */
+const OWNER_DISPATCH_CANDIDATE_PATTERNS: readonly RegExp[] = [
+  new RegExp(`(?:跟|向|给)\\s*${OWNER_DISPATCH_TARGET}\\s*(?:说|告诉|通知|转告|转达|提醒|问|发|发送)`, 'u'),
+  new RegExp(`(?:通知|告诉|转告|转达|提醒)\\s*${OWNER_DISPATCH_TARGET}`, 'u'),
+  new RegExp(`(?:帮我\\s*)?问(?:一下)?\\s*${OWNER_DISPATCH_TARGET}`, 'u'),
+  new RegExp(`(?:发|发送)\\s*(?:给|到)\\s*${OWNER_DISPATCH_TARGET}`, 'u'),
+]
 
 function chatDecision(): OwnerDispatchDecision {
   return { action: 'CHAT', message: null }
@@ -157,6 +167,15 @@ export function buildOwnerDispatchPlannerUserPrompt(question: string): string {
   return `[Canonical Owner Request]\n${question}`
 }
 
+/**
+ * Deterministic side-effect admission gate. It only recognizes a small closed
+ * set of explicit public-action/current-group combinations; it never sends or
+ * decides the final CHAT versus DISPATCH_NOW action.
+ */
+export function isOwnerDispatchCandidate(question: string): boolean {
+  return OWNER_DISPATCH_CANDIDATE_PATTERNS.some((pattern) => pattern.test(question))
+}
+
 export class OwnerDispatchPlanner implements OwnerDispatchPlannerLike {
   public constructor(private readonly completeStructured: StructuredOwnerDispatchCompletion) {}
 
@@ -167,40 +186,30 @@ export class OwnerDispatchPlanner implements OwnerDispatchPlannerLike {
     msgIdToken?: string,
   ): Promise<OwnerDispatchPlannerResult> {
     const userPrompt = buildOwnerDispatchPlannerUserPrompt(question)
-    let failureReason: OwnerDispatchPlannerFailure = 'COMPLETION_ERROR'
-
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      let raw: string
-      try {
-        deadline?.throwIfExpired()
-        raw = await this.completeStructured(
-          attempt === 1 ? PLANNER_SYSTEM_PROMPT : PLANNER_REPAIR_SYSTEM_PROMPT,
-          userPrompt,
-          deadline,
-          msgIdToken,
-        )
-        deadline?.throwIfExpired()
-      } catch (error) {
-        if (isRequestDeadlineExceeded(error)) {
-          throw error
-        }
-        failureReason = error instanceof ProviderControlMarkupError
-          ? 'PROVIDER_CONTROL_MARKUP'
-          : 'COMPLETION_ERROR'
-        if (attempt === 1) continue
-        return { result: 'FAIL', decision: chatDecision(), failureReason, attempts: attempt }
+    let raw: string
+    try {
+      deadline?.throwIfExpired()
+      raw = await this.completeStructured(
+        PLANNER_SYSTEM_PROMPT,
+        userPrompt,
+        deadline,
+        msgIdToken,
+      )
+      deadline?.throwIfExpired()
+    } catch (error) {
+      if (isRequestDeadlineExceeded(error)) {
+        throw error
       }
-
-      const parsed = parseOwnerDispatchProtocol(raw, forbiddenValues)
-      if (parsed.valid) {
-        return { result: 'PASS', decision: parsed.decision, attempts: attempt }
-      }
-      failureReason = parsed.failureReason
-      if (attempt === 2) {
-        return { result: 'FAIL', decision: parsed.decision, failureReason, attempts: attempt }
-      }
+      const failureReason: OwnerDispatchPlannerFailure = error instanceof ProviderControlMarkupError
+        ? 'PROVIDER_CONTROL_MARKUP'
+        : 'COMPLETION_ERROR'
+      return { result: 'FAIL', decision: chatDecision(), failureReason, attempts: 1 }
     }
 
-    return { result: 'FAIL', decision: chatDecision(), failureReason, attempts: 2 }
+    const parsed = parseOwnerDispatchProtocol(raw, forbiddenValues)
+    if (parsed.valid) {
+      return { result: 'PASS', decision: parsed.decision, attempts: 1 }
+    }
+    return { result: 'FAIL', decision: parsed.decision, failureReason: parsed.failureReason, attempts: 1 }
   }
 }

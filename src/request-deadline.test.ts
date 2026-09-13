@@ -314,6 +314,33 @@ async function testTavilyTimeoutIsNotExpanded(): Promise<void> {
   assert.equal(capturedTimeout, 8_000)
 }
 
+function testOwnerFastPathDeadlineRegression(): void {
+  let oldNow = 0
+  const oldChain = new RequestDeadline(120, () => oldNow, 0)
+  oldChain.mark('OWNER_DISPATCH_PLANNER')
+  oldNow = 35
+  oldChain.mark('WEB_SEARCH_PLANNER')
+  oldNow = 55
+  oldChain.mark('FINAL_ANSWER')
+  oldNow = 125
+  assert.equal(oldChain.phaseLatencyMs('OWNER_DISPATCH_PLANNER'), 35)
+  assert.equal(oldChain.phaseLatencyMs('WEB_SEARCH_PLANNER'), 20)
+  assert.equal(oldChain.phaseLatencyMs('FINAL_ANSWER'), 70)
+  assert.equal(oldChain.expired(), true)
+
+  let fastNow = 0
+  const fastChain = new RequestDeadline(120, () => fastNow, 0)
+  fastChain.mark('WEB_SEARCH_PLANNER')
+  fastNow = 20
+  fastChain.mark('FINAL_ANSWER')
+  fastNow = 90
+  assert.equal(fastChain.phaseLatencyMs('WEB_SEARCH_PLANNER'), 20)
+  assert.equal(fastChain.phaseLatencyMs('FINAL_ANSWER'), 70)
+  assert.equal(fastChain.remainingMs(), 30)
+  assert.equal(fastChain.expired(), false)
+  console.log('OWNER_FAST_PATH_DEADLINE_REGRESSION=PASS')
+}
+
 async function run(): Promise<void> {
   const originalFetch = globalThis.fetch
   let fetchCalls = 0
@@ -358,7 +385,8 @@ async function run(): Promise<void> {
   await testGroundingRepairAllowed()
   await testGroundingRepairBudgetGate()
   await testTavilyTimeoutIsNotExpanded()
-  console.log('[REQUEST_DEADLINE_CASE] cases=1,2,3,4,5,6,7 result=PASS')
+  testOwnerFastPathDeadlineRegression()
+  console.log('[REQUEST_DEADLINE_CASE] cases=1,2,3,4,5,6,7,8 result=PASS')
 }
 
 await run()
