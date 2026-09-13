@@ -71,7 +71,10 @@ import {
 import { MemoryExtractor, type StructuredCompletion } from './memory-extractor.js'
 import type { MemoryStore } from './memory-store.js'
 import type { ConversationType, RequesterRole } from './message-contract.js'
-import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
+import {
+  isRequestDeadlineExceeded,
+  RequestDeadline,
+} from './request-deadline.js'
 import {
   emitDiagnostic,
   type DiagnosticFields,
@@ -85,6 +88,7 @@ export const MEMORY_FINAL_LIMIT = 4
 export const MEMORY_MAX_PENDING_MESSAGES = 32
 export const MEMORY_TIMER_INTERVAL_MS = 5 * 60 * 1000
 export const MEMORY_SEEN_MESSAGE_LIMIT = 512
+export const MEMORY_BACKGROUND_TIMEOUT_MS = 8_000
 
 /**
  * Admission diagnostic. It is the one line that answers "did this message enter
@@ -312,6 +316,8 @@ export interface MemoryServiceOptions {
   /** The historical 5-minute timer. Tests disable it and drive flushes directly. */
   enableTimer?: boolean
   timerIntervalMs?: number
+  /** Independent timeout for AUTO_CHAT_THRESHOLD, AUTO_BATCH and AUTO_TIMER flushes. */
+  backgroundTimeoutMs?: number
 }
 
 type MemoryFlushTrigger = 'AUTO_BATCH' | 'AUTO_CHAT_THRESHOLD' | 'AUTO_TIMER'
@@ -372,6 +378,7 @@ export class MemoryService {
   private readonly idFactory: () => string
   private readonly log: (message: string) => void
   private readonly sink: PersistentRuntimeLogSink | undefined
+  private readonly backgroundTimeoutMs: number
   private readonly slots = new Map<string, PendingSlot>()
   private readonly pendingFlushes = new Set<Promise<void>>()
   private readonly seenMessageIds: string[] = []
@@ -386,6 +393,10 @@ export class MemoryService {
     this.idFactory = options.idFactory ?? (() => randomUUID().replaceAll('-', ''))
     this.log = options.log ?? ((message: string) => console.log(message))
     this.sink = options.sink
+    this.backgroundTimeoutMs = options.backgroundTimeoutMs ?? MEMORY_BACKGROUND_TIMEOUT_MS
+    if (!Number.isSafeInteger(this.backgroundTimeoutMs) || this.backgroundTimeoutMs <= 0) {
+      throw new Error('Memory background timeout must be a positive integer')
+    }
 
     if (options.enableTimer === true) {
       this.timer = setInterval(() => this.flushPendingBuffers(), options.timerIntervalMs ?? MEMORY_TIMER_INTERVAL_MS)
@@ -518,7 +529,7 @@ export class MemoryService {
   /** Admission + buffering. Never writes memory by itself. */
   public observeHumanMessage(
     observation: MemoryObservation,
-    requestDeadline?: RequestDeadline,
+    _requestDeadline?: RequestDeadline,
     msgIdToken?: string,
   ): void {
     if (!this.store.isEnabled) {
@@ -577,7 +588,7 @@ export class MemoryService {
 
     const trigger: MemoryFlushTrigger =
       count >= MEMORY_AUTO_FLUSH_BATCH_SIZE ? 'AUTO_BATCH' : 'AUTO_CHAT_THRESHOLD'
-    this.scheduleFlush(slot, batch, trigger, requestDeadline, msgIdToken)
+    this.scheduleFlush(slot, batch, trigger, msgIdToken)
   }
 
   /** Diagnostic-only fail-closed path for an untrusted GROUP body claim. */
@@ -860,10 +871,9 @@ export class MemoryService {
     slot: PendingSlot,
     batch: readonly BufferedEntry[],
     trigger: MemoryFlushTrigger,
-    requestDeadline?: RequestDeadline,
     msgIdToken?: string,
   ): void {
-    const task: Promise<void> = this.flushAsync(slot, batch, trigger, requestDeadline, msgIdToken)
+    const task: Promise<void> = this.flushAsync(slot, batch, trigger, msgIdToken)
     this.pendingFlushes.add(task)
     void task.finally(() => {
       this.pendingFlushes.delete(task)
@@ -874,18 +884,17 @@ export class MemoryService {
     slot: PendingSlot,
     batch: readonly BufferedEntry[],
     trigger: MemoryFlushTrigger,
-    requestDeadline?: RequestDeadline,
     msgIdToken?: string,
   ): Promise<void> {
+    const backgroundDeadline = new RequestDeadline(this.backgroundTimeoutMs)
     try {
-      requestDeadline?.throwIfExpired()
       const candidates = await this.extractor.extract(
         'GROUP',
         batch.map((entry) => entry.message),
-        requestDeadline,
+        backgroundDeadline,
         msgIdToken,
       )
-      requestDeadline?.throwIfExpired()
+      backgroundDeadline.throwIfExpired()
       let written = 0
       let skipped = 0
       for (const candidate of candidates) {
@@ -920,8 +929,23 @@ export class MemoryService {
         written,
         skipped,
       })
-    } catch {
+    } catch (error) {
       slot.buffer.complete(batch, false)
+      if (isRequestDeadlineExceeded(error) || backgroundDeadline.expired()) {
+        emitDiagnostic(
+          this.log,
+          this.sink,
+          'MEMORY_BACKGROUND_TIMEOUT',
+          {
+            trigger,
+            role: slot.requesterRole,
+            result: 'TIMEOUT',
+            timeoutMs: this.backgroundTimeoutMs,
+            errorCode: 'MEMORY_BACKGROUND_TIMEOUT',
+            msgIdToken,
+          },
+        )
+      }
       this.emit('MEMORY_TRIGGER', { trigger, role: slot.requesterRole, result: 'FAIL', reason: 'EXTRACTOR_FAILED' })
     }
   }

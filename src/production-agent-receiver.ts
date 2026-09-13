@@ -1167,6 +1167,7 @@ export function createMemoryService(
     store,
     extractor: new MemoryExtractor((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken)),
     mutate: (system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken),
+    backgroundTimeoutMs: config.memoryBackgroundTimeoutMs,
     enableTimer: true,
     sink,
   })

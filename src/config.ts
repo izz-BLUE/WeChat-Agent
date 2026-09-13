@@ -86,6 +86,7 @@ export const config = {
   webSearchMaxResults: positiveInteger('WEB_SEARCH_MAX_RESULTS', 5),
   webSearchTimeoutMs: positiveInteger('WEB_SEARCH_TIMEOUT_MS', 8_000),
   webSearchMaxContextChars: positiveInteger('WEB_SEARCH_MAX_CONTEXT_CHARS', 6_000),
+  memoryBackgroundTimeoutMs: positiveInteger('MEMORY_BACKGROUND_TIMEOUT_MS', 8_000),
   agentRequestDeadlineMs: strictPositiveInteger('AGENT_REQUEST_DEADLINE_MS', 50_000),
   agentTimeZone: process.env.AGENT_TIME_ZONE?.trim() || undefined,
 }
