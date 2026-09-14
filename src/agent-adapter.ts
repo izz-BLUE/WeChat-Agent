@@ -1,12 +1,6 @@
 import { sanitizeFinalAnswer } from './final-answer.js'
 import { randomUUID } from 'node:crypto'
-import {
-  canonicalUserText,
-  ABSENT_BOT_MENTION_SPANS,
-  ABSENT_USER_CONTENT_SPAN,
-  type BotMentionSpanFacts,
-  type UserContentSpanFacts,
-} from './canonical-user-text.js'
+import type { BotMentionSpanFacts, UserContentSpanFacts } from './canonical-user-text.js'
 import {
   normalizePassiveContextMessage,
   normalizeRawHookMessage,
@@ -20,11 +14,10 @@ import {
   type RequesterRole,
 } from './message-contract.js'
 import { sha256Utf8, type OutboundDeliveryAck, type OutboundIdentity, type DeliveryAckResult } from './outbound-delivery.js'
-import { detectOwnerAliasWake, type OwnerAliasClass, type OwnerAliasWakeMatch } from './owner-alias-wake.js'
+import type { OwnerAliasClass } from './owner-alias-wake.js'
 
 /** Runtime-decided mention fact; the Agent must never re-derive it from text. */
 export type MentionState = 'MENTIONED' | 'NOT_MENTIONED' | 'UNKNOWN'
-export type WakeReason = 'MENTION' | 'OWNER_ALIAS' | 'NONE'
 
 export interface AgentRequest {
   conversationKey: string
@@ -53,10 +46,6 @@ export interface AgentRequest {
   rawText?: string
   timestamp: number
   mentionState: MentionState
-  /** Why this request was admitted. Alias wake is conversational only. */
-  wakeReason?: WakeReason
-  /** Deterministic alias class, present only for OWNER_ALIAS wake. */
-  matchedAliasClass?: OwnerAliasClass
   /**
    * The runtime's bot mention span claim for this message, already validated
    * against the raw body. Absent means an older runtime that makes no claim.
@@ -105,6 +94,15 @@ export interface AgentPassiveContext {
   timestamp: number
 }
 
+/**
+ * A passive context that was promoted after capture by the deterministic alias
+ * matcher. The only additional fact is the enum-like alias class; no authority
+ * fields are introduced by this contract.
+ */
+export interface OwnerAliasWakeContext extends AgentPassiveContext {
+  matchedAliasClass: OwnerAliasClass
+}
+
 export interface AgentExecutor {
   complete(request: AgentRequest): Promise<string | null | undefined>
 
@@ -131,6 +129,9 @@ export interface AgentExecutor {
    * the return value is deliberately `void` so none can be smuggled out.
    */
   observePassiveContext?(context: AgentPassiveContext): Promise<void> | void
+
+  /** Generate one group-level proactive reply after passive capture. */
+  handleOwnerAliasWake?(context: OwnerAliasWakeContext): Promise<void> | void
 }
 
 export type AgentPipelineResult =
@@ -171,9 +172,8 @@ export function toPassiveContext(message: PassiveContextMessage): AgentPassiveCo
 }
 
 /**
- * The single admission decision. GROUP + a runtime-confirmed mention, the
- * deterministic GROUP alias wake, and the additive verified owner DIRECT
- * contract are the only admitted forms.
+ * The single active admission decision. GROUP + a runtime-confirmed mention and
+ * the additive verified owner DIRECT contract are the only admitted forms.
  *
  * Ordinary DIRECT remains refused. Its conversation, requester and self contracts
  * are unverified; only the explicit DIRECT_OWNER_FIELD_VERIFIED wire source can
@@ -191,26 +191,7 @@ export function applyMentionPolicy(message: InboundMessage): MentionPolicyResult
     return { status: 'PROCESS' }
   }
 
-  if (ownerAliasWakeMatch(message) !== null) {
-    return { status: 'PROCESS' }
-  }
-
   return { status: 'IGNORED', reason: 'GROUP_MENTION_REQUIRED' }
-}
-
-/** Alias detection consumes only the one canonical user-text projection. */
-export function ownerAliasWakeMatch(message: Pick<InboundMessage,
-  'conversationType' | 'isMentioned' | 'rawText' | 'text' | 'botMentionSpans' | 'userContentSpan'>,
-): OwnerAliasWakeMatch | null {
-  if (message.conversationType !== 'GROUP' || message.isMentioned !== false) {
-    return null
-  }
-  const canonicalText = canonicalUserText(
-    message.rawText ?? message.text,
-    message.botMentionSpans ?? ABSENT_BOT_MENTION_SPANS,
-    message.userContentSpan ?? ABSENT_USER_CONTENT_SPAN,
-  )
-  return detectOwnerAliasWake(canonicalText)
 }
 
 export function toMentionState(message: Pick<InboundMessage, 'isMentioned'>): MentionState {
@@ -221,7 +202,6 @@ export function toMentionState(message: Pick<InboundMessage, 'isMentioned'>): Me
 }
 
 export function toAgentRequest(message: InboundMessage): AgentRequest {
-  const aliasMatch = ownerAliasWakeMatch(message)
   return {
     conversationKey: conversationKey(message),
     messageId: message.messageId,
@@ -242,10 +222,6 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     rawText: message.rawText,
     timestamp: message.timestamp,
     mentionState: toMentionState(message),
-    wakeReason: message.isMentioned === true
-      ? 'MENTION'
-      : aliasMatch === null ? 'NONE' : 'OWNER_ALIAS',
-    ...(aliasMatch === null ? {} : { matchedAliasClass: aliasMatch.matchedAliasClass }),
     botMentionSpans: message.botMentionSpans,
     userContentSpan: message.userContentSpan,
     metadata: {

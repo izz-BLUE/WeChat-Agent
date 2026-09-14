@@ -28,7 +28,13 @@ import {
   type TopicCapsuleStructuredCompletion,
 } from './group-topic-capsule.js'
 import { config, validateChatConfig } from './config.js'
-import type { AgentExecutor, AgentPassiveContext, AgentRequest, OutboundCommand } from './agent-adapter.js'
+import type {
+  AgentExecutor,
+  AgentPassiveContext,
+  AgentRequest,
+  OwnerAliasWakeContext,
+  OutboundCommand,
+} from './agent-adapter.js'
 import {
   PendingOutboundReplyStore,
   type OutboundDeliveryAck,
@@ -85,7 +91,7 @@ import {
   parseOwnerPrivateDispatchProtocol,
   type OwnerPrivateDispatchPlannerLike,
 } from './owner-private-dispatch-planner.js'
-import { isGroupConversationId, isVerifiedOwnerDirect } from './message-contract.js'
+import { isGroupConversationId, isVerifiedOwnerDirect, SUPPORTED_TEXT_MESSAGE_TYPE } from './message-contract.js'
 import { isRequestDeadlineExceeded, RequestDeadline, withRequestDeadline } from './request-deadline.js'
 import { identityToken } from './identity-observer.js'
 import { createTrustedAssistantRuntimeFacts } from './assistant-identity.js'
@@ -120,6 +126,38 @@ function finalizeYeyeReply(
     )
   }
   return sanitizeFinalAnswer(decorated.text).text
+}
+
+/**
+ * Safe presentation adapter for the shared conversational pipeline. These
+ * values are constants because a passive wire event carries no authority facts.
+ */
+function toOwnerAliasPresentationRequest(context: OwnerAliasWakeContext): AgentRequest {
+  return {
+    conversationKey: `group:${context.conversationId}`,
+    messageId: context.messageId,
+    conversationType: 'GROUP',
+    conversationId: context.conversationId,
+    senderId: context.senderId,
+    requesterId: context.requesterId,
+    requesterSource: 'PASSIVE_CONTEXT_ONLY',
+    requesterRole: 'MEMBER',
+    ownerConfigured: false,
+    ownerDisplayName: null,
+    publicDisplayName: context.publicDisplayName ?? null,
+    privateDispatchTargetConversationId: null,
+    senderName: null,
+    text: context.text,
+    rawText: context.text,
+    timestamp: context.timestamp,
+    mentionState: 'NOT_MENTIONED',
+    botMentionSpans: ABSENT_BOT_MENTION_SPANS,
+    userContentSpan: {
+      trust: 'VALID',
+      span: { start: 0, length: context.text.length },
+    },
+    metadata: { rawMessageType: SUPPORTED_TEXT_MESSAGE_TYPE },
+  }
 }
 
 export const MIN_SEARCH_FALLBACK_BUDGET_MS = 3_000
@@ -368,6 +406,7 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly ownerPrivateDispatchPlanner: OwnerPrivateDispatchPlannerLike | null
   private readonly proactiveQueue: ProactiveGroupQueue
   private readonly ownerAliasWakeGate: OwnerAliasWakeGate
+  private readonly ownerAliasWakeInFlight = new Set<string>()
 
   public constructor(
     private readonly chatService: ChatService,
@@ -511,6 +550,87 @@ export class ProductionChatAgent implements AgentExecutor {
     })
   }
 
+  /**
+   * Generate one group-level proactive answer after passive capture. The
+   * normalized passive context is the only wire input; the request-shaped values
+   * used by the shared chat path below are safe presentation constants, not
+   * authority facts recovered from the passive payload.
+   */
+  public async handleOwnerAliasWake(context: OwnerAliasWakeContext): Promise<void> {
+    const wake = this.ownerAliasWakeGate.admit(context.conversationId, context.messageId)
+    if (!wake.allowed) {
+      this.logOwnerAliasWake(context, wake.reason, false, false, 'SKIP')
+      return
+    }
+    if (this.ownerAliasWakeInFlight.has(context.conversationId)) {
+      this.logOwnerAliasWake(context, 'SINGLE_FLIGHT', false, true, 'SKIP')
+      return
+    }
+
+    this.ownerAliasWakeInFlight.add(context.conversationId)
+    this.logOwnerAliasWake(context, 'DETECTED', true, false, 'PASS')
+    const request = toOwnerAliasPresentationRequest(context)
+    const deadline = new RequestDeadline(this.requestDeadlineMs)
+    const msgIdToken = identityToken(context.messageId).slice(0, 6)
+    const deadlineDiagnostics: RequestDeadlineDiagnostics = {}
+    let result: 'COMPLETED' | 'GENERATION_FAILED' = 'COMPLETED'
+    try {
+      const answer = await this.completeWithinDeadline(
+        request,
+        deadline,
+        msgIdToken,
+        deadlineDiagnostics,
+        true,
+      )
+      deadline.throwIfExpired()
+      const finalAnswer = finalizeYeyeReply(
+        answer,
+        true,
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      )
+      if (!finalAnswer) {
+        result = 'GENERATION_FAILED'
+        this.logOwnerAliasWake(context, 'GENERATION_FAILED', true, true, 'FAIL')
+        return
+      }
+      this.logOwnerAliasWake(context, 'GENERATED', true, true, 'PASS')
+      const queued = this.proactiveQueue.enqueue({
+        conversationType: 'GROUP',
+        conversationId: context.conversationId,
+        text: finalAnswer,
+      })
+      if (!queued.accepted) {
+        result = 'GENERATION_FAILED'
+        this.logOwnerAliasWake(context, 'QUEUE_FULL', true, true, 'FAIL')
+        this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size)
+        return
+      }
+      this.logOwnerAliasWake(context, 'QUEUED', true, true, 'PASS')
+      this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
+    } catch {
+      result = 'GENERATION_FAILED'
+      this.logOwnerAliasWake(context, 'GENERATION_FAILED', true, true, 'FAIL')
+    } finally {
+      this.ownerAliasWakeInFlight.delete(context.conversationId)
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+        'AGENT_REQUEST_DEADLINE',
+        {
+          budgetMs: this.requestDeadlineMs,
+          elapsedMs: Date.now() - deadline.startedAt,
+          finalAnswerLatencyMs: deadline.phaseLatencyMs('FINAL_ANSWER'),
+          totalRequestLatencyMs: Date.now() - deadline.startedAt,
+          remainingMs: deadline.remainingMs(),
+          preFinalRemainingMs: deadlineDiagnostics.preFinalRemainingMs,
+          result,
+          phase: deadline.phase,
+          msgIdToken,
+        },
+      )
+    }
+  }
+
   /** Returns the opaque identity staged for the exact generated answer. */
   public takeOutboundIdentity(request: AgentRequest, text: string): OutboundIdentity | null {
     return this.pendingOutbound.getIdentityFor(request.messageId, text)
@@ -602,14 +722,6 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   public async complete(request: AgentRequest): Promise<string> {
-    const isOwnerAliasWake = request.wakeReason === 'OWNER_ALIAS'
-    if (request.wakeReason === 'OWNER_ALIAS') {
-      const wake = this.ownerAliasWakeGate.admit(request.conversationId, request.messageId)
-      if (!wake.allowed) {
-        this.logOwnerAliasWake(request, false, wake.reason, false, 'SKIP')
-        return ''
-      }
-    }
     const deadline = new RequestDeadline(this.requestDeadlineMs)
     const msgIdToken = this.persistentLog?.shortIdFor(request.messageId) ?? identityToken(request.messageId).slice(0, 6)
     const deadlineDiagnostics: RequestDeadlineDiagnostics = {}
@@ -636,15 +748,6 @@ export class ProductionChatAgent implements AgentExecutor {
       return fallback
     } finally {
       const elapsedMs = Date.now() - deadline.startedAt
-      if (isOwnerAliasWake) {
-        this.logOwnerAliasWake(
-          request,
-          true,
-          'OWNER_ALIAS',
-          true,
-          result === 'COMPLETED' ? 'PASS' : 'FAIL',
-        )
-      }
       emitDiagnostic(
         (line: string) => console.log(line),
         this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
@@ -673,6 +776,7 @@ export class ProductionChatAgent implements AgentExecutor {
     deadline: RequestDeadline,
     msgIdToken: string,
     deadlineDiagnostics: RequestDeadlineDiagnostics,
+    aliasWake = false,
   ): Promise<string> {
     if (isVerifiedOwnerDirect(request)) {
       return this.tryOwnerPrivateDispatch(request, deadline, msgIdToken)
@@ -718,7 +822,7 @@ export class ProductionChatAgent implements AgentExecutor {
       timestamp: request.timestamp,
       messageId: request.messageId,
     }
-    if (request.conversationType === 'GROUP' && request.wakeReason !== 'OWNER_ALIAS') {
+    if (request.conversationType === 'GROUP' && !aliasWake) {
       // Retain the inbound turn for the next request. The assembler excludes
       // this event id so it is rendered only as CURRENT_REQUEST this turn.
       this.requesterLocal.append(request.conversationId, request.requesterId, question)
@@ -824,7 +928,7 @@ export class ProductionChatAgent implements AgentExecutor {
 
     // A real mention is group history too: the next member to ask needs to see
     // that the question was already asked and what was answered.
-    if (request.conversationType === 'GROUP') {
+    if (request.conversationType === 'GROUP' && !aliasWake) {
       this.ambient.append(request.conversationId, {
         messageId: request.messageId,
         speakerId: request.senderId,
@@ -835,9 +939,11 @@ export class ProductionChatAgent implements AgentExecutor {
       })
     }
 
-    this.context.append(request.conversationId, question, request.messageId)
+    if (!aliasWake) {
+      this.context.append(request.conversationId, question, request.messageId)
+    }
 
-    if (this.memory && request.wakeReason !== 'OWNER_ALIAS') {
+    if (this.memory && !aliasWake) {
       deadline.mark('MEMORY_EXPLICIT')
       // Historical order: explicit memory intent short-circuits the chat turn,
       // then the message feeds the automatic extractor, then retrieval. All three
@@ -874,18 +980,18 @@ export class ProductionChatAgent implements AgentExecutor {
     // clear Owner-only branch may explain the authorization boundary without an
     // extra model call. Other-member mutations do not satisfy the GROUP scope
     // contract here and continue through the normal safety/identity path.
-    if (request.wakeReason !== 'OWNER_ALIAS' &&
+    if (!aliasWake &&
         request.requesterRole !== 'OWNER' &&
         isExplicitMemoryCommand(question.text) &&
         GROUP_SCOPE_KEYWORDS.some((keyword) => question.text.includes(keyword))) {
       return renderOwnerEscalationHint('OWNER_ONLY_ACTION', assistantRuntime)
     }
 
-    if (request.wakeReason !== 'OWNER_ALIAS' && await this.tryOwnerDispatch(request, question.text, deadline, msgIdToken)) {
+    if (!aliasWake && await this.tryOwnerDispatch(request, question.text, deadline, msgIdToken)) {
       return ''
     }
 
-    if (this.memory && request.wakeReason !== 'OWNER_ALIAS') {
+    if (this.memory && !aliasWake) {
       if (request.conversationType === 'GROUP' && userContentSpan.trust !== 'VALID') {
         this.memory.reportUntrustedUserContentSpan(request.requesterRole)
       } else {
@@ -903,7 +1009,7 @@ export class ProductionChatAgent implements AgentExecutor {
       }
     }
 
-    const memory = this.memory && request.wakeReason !== 'OWNER_ALIAS'
+    const memory = this.memory && !aliasWake
       ? await this.memory.retrieveForChat({
           conversationType: request.conversationType,
           conversationId: request.conversationId,
@@ -921,7 +1027,7 @@ export class ProductionChatAgent implements AgentExecutor {
         })
       : undefined
 
-    const webSearch = request.wakeReason === 'OWNER_ALIAS'
+    const webSearch = aliasWake
       ? undefined
       : await this.resolveWebSearch(
           question.text,
@@ -951,7 +1057,7 @@ export class ProductionChatAgent implements AgentExecutor {
         assistantRuntime,
         conversationType: request.conversationType,
         mention: mentionFact(request),
-        ownerAliasWake: request.wakeReason === 'OWNER_ALIAS',
+        ownerAliasWake: aliasWake,
         requesterRole: request.requesterRole,
         ownerConfigured: request.ownerConfigured,
         memory,
@@ -988,7 +1094,9 @@ export class ProductionChatAgent implements AgentExecutor {
     )
 
     deadline.throwIfExpired()
-    this.stageOutbound(request, answer, msgIdToken)
+    if (!aliasWake) {
+      this.stageOutbound(request, answer, msgIdToken)
+    }
     return answer
   }
 
@@ -1001,7 +1109,7 @@ export class ProductionChatAgent implements AgentExecutor {
       conversationId: request.conversationId,
       text: outboundText,
       timestamp: request.timestamp,
-      ...(request.conversationType === 'GROUP' && request.wakeReason !== 'OWNER_ALIAS'
+      ...(request.conversationType === 'GROUP'
         ? { replyToSpeakerId: request.requesterId }
         : {}),
     })
@@ -1016,9 +1124,9 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   private logOwnerAliasWake(
-    request: AgentRequest,
+    context: OwnerAliasWakeContext,
+    reason: 'DETECTED' | 'COOLDOWN' | 'DUPLICATE' | 'SINGLE_FLIGHT' | 'GENERATED' | 'QUEUED' | 'GENERATION_FAILED' | 'QUEUE_FULL',
     cooldownAllowed: boolean,
-    reason: 'OWNER_ALIAS' | 'COOLDOWN' | 'DUPLICATE',
     providerInvoked: boolean,
     result: 'PASS' | 'FAIL' | 'SKIP',
   ): void {
@@ -1028,8 +1136,8 @@ export class ProductionChatAgent implements AgentExecutor {
       'GROUP_WAKE',
       {
         reason,
-        matchedAliasClass: request.matchedAliasClass ?? 'NONE',
-        conversationType: request.conversationType,
+        matchedAliasClass: context.matchedAliasClass,
+        conversationType: context.conversationType,
         cooldownAllowed,
         providerInvoked,
         result,

@@ -6,6 +6,7 @@ import {
   runRawPassiveContextPipeline,
   type AgentExecutor,
   type AgentPipelineResult,
+  type OwnerAliasWakeContext,
   type OutboundCommand,
   type PassivePipelineResult,
 } from './agent-adapter.js'
@@ -55,9 +56,10 @@ export interface ProductionTransportSummaryEntry {
  * Two envelope kinds, two authorities.
  *
  * `INBOUND_MESSAGE` is the active request the runtime admitted. The additive
- * `PASSIVE_CONTEXT_ONLY` kind is group ambience: no admission, no request and no
- * reply — an older Agent that does not know the kind rejects it instead of
- * treating group chatter as something it was asked.
+ * `PASSIVE_CONTEXT_ONLY` kind is group ambience: it never enters active
+ * admission or returns a direct reply. A deterministic alias may schedule a
+ * separate group-level proactive wake after capture; an older Agent that does
+ * not know the kind rejects it instead of treating group chatter as requested.
  */
 type InboundEnvelope =
   | { kind: 'INBOUND_MESSAGE'; message: RawHookMessage }
@@ -398,34 +400,25 @@ export class ProductionAgentTransportServer {
     identity: RequesterIdentityFields,
   ): Promise<void> {
     const result = await runRawPassiveContextPipeline(raw, this.options.agent)
-    if (result.status === 'PASSIVE_CONTEXT' && detectOwnerAliasWake(result.context.text) !== null) {
-      // PASSIVE_CONTEXT_ONLY remains the capture envelope. A matched alias is
-      // the only passive event that may be promoted to one conversational wake;
-      // the Agent owns its message-id dedup and per-group cooldown.
-      const wakeResult = await runRawAgentPipeline(raw, this.options.agent)
-      const entry = toSummaryEntry(raw, wakeResult)
-      entry.passiveContext = true
-      this.summary.push(entry)
-
-      const response = toAgentResponse(wakeResult)
-      this.persistentSink?.writeStructured(
-        'INBOUND_DISPATCHED',
-        {
-          result: response.kind,
-          phase: 'alias-wake',
-          conversationType: identity.conversationType,
-          msgIdToken: this.messageIdToken(raw.msgId),
-          conversationToken: identityToken(identity.conversationId),
-          requesterToken: identityToken(identity.requesterId),
-        },
-        `status=${wakeResult.status} passiveContext=true`,
-      )
-      await this.writeResponse(socket, response, this.messageIdToken(raw.msgId))
-      if (this.options.maxMessages !== undefined && this.messageCount >= this.options.maxMessages) {
-        socket.end()
-        await this.stop()
+    if (result.status === 'PASSIVE_CONTEXT') {
+      const match = detectOwnerAliasWake(result.context.text)
+      if (match !== null && this.options.agent.handleOwnerAliasWake !== undefined) {
+        const wakeContext: OwnerAliasWakeContext = {
+          ...result.context,
+          matchedAliasClass: match.matchedAliasClass,
+        }
+        try {
+          // The C# passive response deadline is 30s while the Node request
+          // deadline is 50s, so generation is detached from this
+          // CONTEXT_ACCEPTED response. Attach the catch immediately so a
+          // provider rejection cannot become an unhandled rejection.
+          void Promise.resolve(this.options.agent.handleOwnerAliasWake(wakeContext)).catch(() => {
+            this.logPassiveAliasWakeFailure(match.matchedAliasClass)
+          })
+        } catch {
+          this.logPassiveAliasWakeFailure(match.matchedAliasClass)
+        }
       }
-      return
     }
     const entry: ProductionTransportSummaryEntry = {
       messageId: raw.msgId.toString(),
@@ -453,6 +446,25 @@ export class ProductionAgentTransportServer {
       `status=${result.status} agentInvoked=false outbound=false`,
     )
     await this.writeResponse(socket, response, this.messageIdToken(raw.msgId))
+  }
+
+  private logPassiveAliasWakeFailure(matchedAliasClass: OwnerAliasWakeContext['matchedAliasClass']): void {
+    this.persistentSink?.writeStructured(
+      'GROUP_WAKE',
+      {
+        reason: 'GENERATION_FAILED',
+        matchedAliasClass,
+        conversationType: 'GROUP',
+        cooldownAllowed: true,
+        providerInvoked: true,
+        result: 'FAIL',
+      },
+      'phase=background-scheduling',
+    )
+    console.log(
+      `[GROUP_WAKE] reason=GENERATION_FAILED matchedAliasClass=${matchedAliasClass} ` +
+      'conversationType=GROUP cooldownAllowed=true providerInvoked=true result=FAIL',
+    )
   }
 
   private async writeSummary(): Promise<void> {

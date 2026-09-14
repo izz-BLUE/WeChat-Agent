@@ -8,14 +8,16 @@
 import assert from 'node:assert/strict'
 import { createConnection } from 'node:net'
 import { detectOwnerAliasWake, OwnerAliasWakeGate } from './owner-alias-wake.js'
-import { runRawAgentPipeline, runRawPassiveContextPipeline } from './agent-adapter.js'
+import { applyMentionPolicy, runRawAgentPipeline, runRawPassiveContextPipeline, type AgentRequest } from './agent-adapter.js'
 import { ChatService } from './chat.js'
 import type { MemoryService } from './memory-service.js'
-import type { RawHookMessage } from './message-contract.js'
+import { normalizeRawHookMessage, type RawHookMessage } from './message-contract.js'
 import { GroupAmbientContext } from './group-ambient-context.js'
 import { RequesterLocalContext } from './requester-local-context.js'
+import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
+import { ProactiveGroupQueue } from './proactive-group-queue.js'
 
 const GROUP = 'owner-alias@chatroom'
 const MEMBER = 'member-owner-alias'
@@ -40,7 +42,7 @@ interface ProviderStub {
   restore(): void
 }
 
-function stubProvider(answer = '接上了，确实挺像他的。'): ProviderStub {
+function stubProvider(answer = '接上了，确实挺像他的。', failure?: Error, delayMs = 0): ProviderStub {
   const calls: Array<{ system: string; user: string }> = []
   const original = globalThis.fetch
   globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
@@ -49,6 +51,8 @@ function stubProvider(answer = '接上了，确实挺像他的。'): ProviderStu
     }
     const messages = body.messages ?? []
     calls.push({ system: messages[0]?.content ?? '', user: messages[1]?.content ?? '' })
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+    if (failure !== undefined) throw failure
     return {
       ok: true,
       status: 200,
@@ -92,6 +96,35 @@ function raw(
   }
 }
 
+/** Exact C# PASSIVE_CONTEXT_ONLY payload: no active authority fields. */
+function realPassiveWire(
+  content: string,
+  overrides: Partial<RawHookMessage> = {},
+): RawHookMessage {
+  const messageId = overrides.msgId ?? `real-passive-${content}`
+  const timestamp = overrides.timestamp ?? BASE_TIME
+  const from = overrides.from ?? GROUP
+  const signature = overrides.signature ?? MEMBER
+  return {
+    msgId: messageId,
+    type: 1,
+    timestamp,
+    from,
+    wxid: 'shared-wxid',
+    content,
+    signature,
+    conversationType: 'GROUP',
+    conversationId: from,
+    senderId: signature,
+    requesterId: signature,
+    requesterSource: 'Signature',
+    publicDisplayName: null,
+    isMentioned: false,
+    userContentSpan: { start: 0, length: content.length },
+    ...overrides,
+  }
+}
+
 function makeMemory(counters: { selfAddress: number; explicit: number; observe: number; retrieve: number }): MemoryService {
   return {
     isEnabled: true,
@@ -119,6 +152,9 @@ function makeAgent(options: {
   memory?: MemoryService | null
   searchCalls?: { count: number }
   ownerDispatchCalls?: { count: number }
+  proactiveQueue?: ProactiveGroupQueue
+  requestDeadlineMs?: number
+  ownerAliasWakeCooldownMs?: number
 } = {}): ProductionChatAgent {
   const provider = options.provider ?? stubProvider()
   const searchCalls = options.searchCalls ?? { count: 0 }
@@ -141,6 +177,9 @@ function makeAgent(options: {
         throw new Error('alias wake must not invoke Owner dispatch')
       },
     },
+    proactiveQueue: options.proactiveQueue,
+    requestDeadlineMs: options.requestDeadlineMs,
+    ownerAliasWakeCooldownMs: options.ownerAliasWakeCooldownMs,
   })
 }
 
@@ -148,13 +187,29 @@ async function wake(agent: ProductionChatAgent, message: RawHookMessage): Promis
   return runRawAgentPipeline(message, agent)
 }
 
-async function captureThenWake(
+async function capture(
   agent: ProductionChatAgent,
   message: RawHookMessage,
-): Promise<Awaited<ReturnType<typeof runRawAgentPipeline>>> {
+): Promise<void> {
   const captured = await runRawPassiveContextPipeline(message, agent)
   assert.equal(captured.status, 'PASSIVE_CONTEXT')
-  return wake(agent, message)
+}
+
+async function captureThenAliasWake(agent: ProductionChatAgent, message: RawHookMessage): Promise<void> {
+  const captured = await runRawPassiveContextPipeline(message, agent)
+  assert.equal(captured.status, 'PASSIVE_CONTEXT')
+  const match = detectOwnerAliasWake(captured.context.text)
+  assert(match)
+  assert(agent.handleOwnerAliasWake)
+  await agent.handleOwnerAliasWake({ ...captured.context, matchedAliasClass: match.matchedAliasClass })
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('condition timed out')
+    await new Promise<void>((resolve) => setTimeout(resolve, 5))
+  }
 }
 
 async function readLine(socket: ReturnType<typeof createConnection>): Promise<Record<string, unknown>> {
@@ -177,6 +232,65 @@ async function readLine(socket: ReturnType<typeof createConnection>): Promise<Re
   return JSON.parse(buffer.slice(0, buffer.indexOf('\n'))) as Record<string, unknown>
 }
 
+async function transportAliasRound(
+  agent: ProductionChatAgent,
+  queue: ProactiveGroupQueue,
+  content: string,
+  messageId: string,
+): Promise<{ response: Record<string, unknown>; proactive: Record<string, unknown>; secondPoll: Record<string, unknown> }> {
+  const pipeName = `owner-alias-${process.pid}-${Date.now()}-${messageId}`
+  const server = new ProductionAgentTransportServer({ pipeName, agent })
+  let socket: ReturnType<typeof createConnection> | undefined
+  try {
+    await server.start()
+    socket = createConnection(`\\\\.\\pipe\\${pipeName}`)
+    await new Promise<void>((resolve, reject) => {
+      socket?.once('connect', resolve)
+      socket?.once('error', reject)
+    })
+    socket.write(`${JSON.stringify({ kind: 'PASSIVE_CONTEXT_ONLY', message: realPassiveWire(content, { msgId: messageId }) })}\n`)
+    const response = await readLine(socket)
+    await waitFor(() => queue.size === 1)
+    socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-1"}\n')
+    const proactive = await readLine(socket)
+    socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-2"}\n')
+    const secondPoll = await readLine(socket)
+    assert.equal(server.entries[0]?.passiveContext, true)
+    return { response, proactive, secondPoll }
+  } finally {
+    socket?.destroy()
+    await server.stop()
+  }
+}
+
+async function transportPassiveRound(
+  agent: ProductionChatAgent,
+  content: string,
+  messageId: string,
+  settleDelayMs = 0,
+): Promise<{ response: Record<string, unknown>; poll: Record<string, unknown> }> {
+  const pipeName = `owner-alias-passive-${process.pid}-${Date.now()}-${messageId}`
+  const server = new ProductionAgentTransportServer({ pipeName, agent })
+  let socket: ReturnType<typeof createConnection> | undefined
+  try {
+    await server.start()
+    socket = createConnection(`\\\\.\\pipe\\${pipeName}`)
+    await new Promise<void>((resolve, reject) => {
+      socket?.once('connect', resolve)
+      socket?.once('error', reject)
+    })
+    socket.write(`${JSON.stringify({ kind: 'PASSIVE_CONTEXT_ONLY', message: realPassiveWire(content, { msgId: messageId }) })}\n`)
+    const response = await readLine(socket)
+    if (settleDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, settleDelayMs))
+    socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-1"}\n')
+    const poll = await readLine(socket)
+    return { response, poll }
+  } finally {
+    socket?.destroy()
+    await server.stop()
+  }
+}
+
 async function main(): Promise<void> {
   await check('deterministic-match-and-longest-first', () => {
     assert.deepEqual(detectOwnerAliasWake('辞老师就是辞老'), { matchedAliasClass: 'ALIAS_1', index: 0 })
@@ -186,14 +300,43 @@ async function main(): Promise<void> {
     assert.equal(detectOwnerAliasWake('老师今天没来'), null)
   })
 
+  await check('active-alias-admission-is-removed-and-passive-wire-is-minimal', async () => {
+    const active = normalizeRawHookMessage(raw('辞老师呢', { msgId: 'case-active-admission' }))
+    assert(active.status === 'VALID')
+    assert.deepEqual(applyMentionPolicy(active.message), {
+      status: 'IGNORED',
+      reason: 'GROUP_MENTION_REQUIRED',
+    })
+
+    const passive = realPassiveWire('辞老师呢', { msgId: 'case-real-wire-shape' })
+    for (const field of [
+      'requesterRole',
+      'ownerConfigured',
+      'ownerDisplayName',
+      'privateDispatchTargetConversationId',
+      'botMentionSpans',
+    ]) {
+      assert.equal(Object.hasOwn(passive, field), false, `${field} must not be on PASSIVE_CONTEXT_ONLY`)
+    }
+    const captured = await runRawPassiveContextPipeline(passive, makeAgent())
+    assert.equal(captured.status, 'PASSIVE_CONTEXT')
+  })
+
   await check('group-alias-wake', async () => {
     const provider = stubProvider()
+    const queue = new ProactiveGroupQueue()
     try {
-      const result = await wake(makeAgent({ provider }), raw('辞老师呢', { msgId: 'case-1' }))
-      assert.equal(result.status, 'AGENT_RESULT')
-      assert.equal(result.request.wakeReason, 'OWNER_ALIAS')
-      assert.equal(result.request.matchedAliasClass, 'ALIAS_1')
+      const agent = makeAgent({ provider, proactiveQueue: queue })
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-1' }))
       assert.equal(provider.calls.length, 1)
+      assert.equal(queue.size, 1)
+      assert.equal(
+        agent.takeOutboundIdentity(
+          { messageId: 'case-1' } as AgentRequest,
+          `接上了，确实挺像他的。${YEYE_REPLY_SIGNATURE}`,
+        ),
+        null,
+      )
     } finally {
       provider.restore()
     }
@@ -201,12 +344,14 @@ async function main(): Promise<void> {
 
   await check('all-alias-forms-wake', async () => {
     const provider = stubProvider()
+    const queue = new ProactiveGroupQueue()
     try {
+      const agent = makeAgent({ provider, proactiveQueue: queue, ownerAliasWakeCooldownMs: 0 })
       for (const [index, content] of ['问下辞山时这个怎么看', '辞老今天没来？'].entries()) {
-        const result = await wake(makeAgent({ provider }), raw(content, { msgId: `case-alias-${index}` }))
-        assert.equal(result.status, 'AGENT_RESULT')
+        await captureThenAliasWake(agent, realPassiveWire(content, { msgId: `case-alias-${index}` }))
       }
       assert.equal(provider.calls.length, 2)
+      assert.equal(queue.size, 2)
     } finally {
       provider.restore()
     }
@@ -216,8 +361,9 @@ async function main(): Promise<void> {
     const provider = stubProvider()
     try {
       const agent = makeAgent({ provider })
-      const ordinary = await captureThenWake(agent, raw('老师今天没来', { msgId: 'case-no-alias' }))
+      const ordinary = await runRawAgentPipeline(raw('老师今天没来', { msgId: 'case-no-alias' }), agent)
       assert.equal(ordinary.status, 'IGNORED')
+      await capture(agent, realPassiveWire('老师今天没来', { msgId: 'case-no-alias-passive' }))
       const direct = await wake(agent, raw('辞老师呢', {
         msgId: 'case-direct',
         from: 'direct-peer',
@@ -233,11 +379,12 @@ async function main(): Promise<void> {
 
   await check('multiple-aliases-trigger-one-wake', async () => {
     const provider = stubProvider()
+    const queue = new ProactiveGroupQueue()
     try {
-      const result = await wake(makeAgent({ provider }), raw('辞老师就是辞老', { msgId: 'case-multiple-alias' }))
-      assert.equal(result.status, 'AGENT_RESULT')
-      assert.equal(result.request.matchedAliasClass, 'ALIAS_1')
+      const agent = makeAgent({ provider, proactiveQueue: queue })
+      await captureThenAliasWake(agent, realPassiveWire('辞老师就是辞老', { msgId: 'case-multiple-alias' }))
       assert.equal(provider.calls.length, 1)
+      assert.equal(queue.size, 1)
     } finally {
       provider.restore()
     }
@@ -247,14 +394,14 @@ async function main(): Promise<void> {
     const provider = stubProvider()
     const ambient = new GroupAmbientContext()
     const requesterLocal = new RequesterLocalContext()
+    const queue = new ProactiveGroupQueue()
     try {
-      const agent = makeAgent({ provider, ambient, requesterLocal })
-      const first = await wake(agent, raw('辞老师呢', { msgId: 'case-duplicate' }))
-      const second = await wake(agent, raw('辞老师呢', { msgId: 'case-duplicate' }))
-      assert.equal(first.status, 'AGENT_RESULT')
-      assert.equal(second.status, 'AGENT_RESULT')
+      const agent = makeAgent({ provider, ambient, requesterLocal, proactiveQueue: queue })
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-duplicate' }))
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-duplicate' }))
       assert.equal(provider.calls.length, 1)
       assert.equal(ambient.count(GROUP), 1)
+      assert.equal(queue.size, 1)
     } finally {
       provider.restore()
     }
@@ -263,16 +410,50 @@ async function main(): Promise<void> {
   await check('cooldown-and-recovery', async () => {
     const provider = stubProvider()
     const ambient = new GroupAmbientContext()
+    const queue = new ProactiveGroupQueue()
     let now = BASE_TIME
     try {
-      const agent = makeAgent({ provider, ambient, now: () => now })
-      await wake(agent, raw('辞老师呢', { msgId: 'case-cooldown-1', timestamp: now }))
-      await captureThenWake(agent, raw('问下辞山时这个怎么看', { msgId: 'case-cooldown-2', timestamp: now + 1 }))
+      const agent = makeAgent({ provider, ambient, now: () => now, proactiveQueue: queue })
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-cooldown-1', timestamp: now }))
+      await captureThenAliasWake(agent, realPassiveWire('问下辞山时这个怎么看', { msgId: 'case-cooldown-2', timestamp: now + 1 }))
       assert.equal(provider.calls.length, 1)
       now += 30_001
-      await captureThenWake(agent, raw('辞老又来了', { msgId: 'case-cooldown-3', timestamp: now }))
+      await captureThenAliasWake(agent, realPassiveWire('辞老又来了', { msgId: 'case-cooldown-3', timestamp: now }))
       assert.equal(provider.calls.length, 2)
       assert.equal(ambient.count(GROUP), 3)
+      assert.equal(queue.size, 2)
+    } finally {
+      provider.restore()
+    }
+  })
+
+  await check('concurrent-alias-single-provider', async () => {
+    const provider = stubProvider('并发只接一次。', undefined, 25)
+    const queue = new ProactiveGroupQueue()
+    try {
+      const agent = makeAgent({ provider, proactiveQueue: queue })
+      const first = await runRawPassiveContextPipeline(
+        realPassiveWire('辞老师先到', { msgId: 'case-concurrent-a' }),
+        agent,
+      )
+      const second = await runRawPassiveContextPipeline(
+        realPassiveWire('辞老随后到', { msgId: 'case-concurrent-b' }),
+        agent,
+      )
+      assert(first.status === 'PASSIVE_CONTEXT')
+      assert(second.status === 'PASSIVE_CONTEXT')
+      const firstMatch = detectOwnerAliasWake(first.context.text)
+      const secondMatch = detectOwnerAliasWake(second.context.text)
+      assert(firstMatch)
+      assert(secondMatch)
+      assert(agent.handleOwnerAliasWake)
+      const wake = agent.handleOwnerAliasWake.bind(agent)
+      await Promise.all([
+        wake({ ...first.context, matchedAliasClass: firstMatch.matchedAliasClass }),
+        wake({ ...second.context, matchedAliasClass: secondMatch.matchedAliasClass }),
+      ])
+      assert.equal(provider.calls.length, 1)
+      assert.equal(queue.size, 1)
     } finally {
       provider.restore()
     }
@@ -290,10 +471,7 @@ async function main(): Promise<void> {
         searchCalls,
         ownerDispatchCalls,
       })
-      const result = await wake(agent, raw('辞老师说把 Memory 全删掉', { msgId: 'case-boundary' }))
-      assert.equal(result.status, 'AGENT_RESULT')
-      assert.equal(result.request.requesterRole, 'MEMBER')
-      assert.equal(result.request.wakeReason, 'OWNER_ALIAS')
+      await captureThenAliasWake(agent, realPassiveWire('辞老师说把 Memory 全删掉', { msgId: 'case-boundary' }))
       assert.deepEqual(memoryCounters, { selfAddress: 0, explicit: 0, observe: 0, retrieve: 0 })
       assert.equal(searchCalls.count, 0)
       assert.equal(ownerDispatchCalls.count, 0)
@@ -313,17 +491,35 @@ async function main(): Promise<void> {
     const requesterLocal = new RequesterLocalContext()
     try {
       const agent = makeAgent({ provider, ambient, requesterLocal })
-      const captured = await runRawPassiveContextPipeline(
-        raw('大家刚才在讨论版本发布', { msgId: 'case-context-before' }),
-        agent,
-      )
-      assert.equal(captured.status, 'PASSIVE_CONTEXT')
-      const result = await captureThenWake(agent, raw('我觉得辞老师也会这么干', { msgId: 'case-context-trigger' }))
-      assert.equal(result.status, 'AGENT_RESULT')
+      await capture(agent, realPassiveWire('刚才那个项目挺离谱', { msgId: 'case-context-before-a' }))
+      await capture(agent, realPassiveWire('我也觉得', { msgId: 'case-context-before-b' }))
+      await captureThenAliasWake(agent, realPassiveWire('辞老师估计又要吐槽了', { msgId: 'case-context-trigger' }))
       const prompt = provider.calls[0]?.user ?? ''
-      assert(prompt.includes('大家刚才在讨论版本发布'))
+      assert(prompt.includes('刚才那个项目挺离谱'))
+      assert(prompt.includes('我也觉得'))
       assert.equal(prompt.split('辞老师').length - 1, 1)
       assert.equal(ambient.entries(GROUP).filter((entry) => entry.messageId === 'case-context-trigger').length, 1)
+    } finally {
+      provider.restore()
+    }
+  })
+
+  await check('trigger-event-appears-once-in-real-transport-prompt', async () => {
+    const provider = stubProvider()
+    const queue = new ProactiveGroupQueue()
+    const trigger = '我觉得辞老师也会这么干'
+    try {
+      const result = await transportAliasRound(
+        makeAgent({ provider, proactiveQueue: queue }),
+        queue,
+        trigger,
+        'case-trigger-prompt-once',
+      )
+      assert.equal(result.response.kind, 'CONTEXT_ACCEPTED')
+      assert.equal(result.proactive.kind, 'PROACTIVE_OUTBOUND_COMMAND')
+      assert.equal(result.secondPoll.kind, 'NO_PROACTIVE_OUTBOUND')
+      assert.equal(provider.calls.length, 1)
+      assert.equal((provider.calls[0]?.user ?? '').split(trigger).length - 1, 1)
     } finally {
       provider.restore()
     }
@@ -335,8 +531,7 @@ async function main(): Promise<void> {
     const requesterLocal = new RequesterLocalContext()
     try {
       const agent = makeAgent({ provider, ambient, requesterLocal })
-      const result = await captureThenWake(agent, raw('辞老师呢', { msgId: 'case-local-pollution' }))
-      assert.equal(result.status, 'AGENT_RESULT')
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-local-pollution' }))
       // Passive capture retains the existing one-entry requester-local view;
       // alias promotion must not append a second active turn on top of it.
       assert.equal(requesterLocal.entries(GROUP, MEMBER).length, 1)
@@ -352,15 +547,15 @@ async function main(): Promise<void> {
     const requesterLocal = new RequesterLocalContext()
     try {
       const agent = makeAgent({ provider, ambient, requesterLocal })
-      const result = await wake(agent, raw('辞老师呢', { msgId: 'case-ack' }))
-      assert.equal(result.status, 'AGENT_RESULT')
-      assert(result.outboundCommand !== null)
-      if (result.outboundCommand === null) return
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-ack' }))
+      const outboundCommand = agent.pollProactiveOutbound()
+      assert(outboundCommand !== null)
+      if (outboundCommand === null) return
       const accepted = agent.observeOutboundDelivery({
-        outboundId: result.outboundCommand.outboundId,
-        requestMessageId: result.outboundCommand.requestMessageId,
+        outboundId: outboundCommand.outboundId,
+        requestMessageId: outboundCommand.requestMessageId,
         status: 'SENT',
-        contentSha256: result.outboundCommand.contentSha256,
+        contentSha256: outboundCommand.contentSha256,
         errorCode: '',
       })
       assert.equal(accepted.reason, 'SENT_COMMITTED')
@@ -368,7 +563,31 @@ async function main(): Promise<void> {
       assert.equal(ambientEntries.at(-1)?.speakerType, 'ASSISTANT')
       assert.equal(requesterLocal.entries(GROUP, MEMBER).some((item) => item.senderId === 'ASSISTANT'), false)
       assert.equal(ambientEntries.at(-1)?.replyToSpeakerId, undefined)
-      assert.equal(Object.keys(result.outboundCommand).some((key) => key.toLowerCase().includes('mention')), false)
+      assert.equal(Object.keys(outboundCommand).some((key) => key.toLowerCase().includes('mention')), false)
+
+      const failedAmbient = new GroupAmbientContext()
+      const failedRequesterLocal = new RequesterLocalContext()
+      const failedQueue = new ProactiveGroupQueue()
+      const failedAgent = makeAgent({
+        provider,
+        ambient: failedAmbient,
+        requesterLocal: failedRequesterLocal,
+        proactiveQueue: failedQueue,
+        ownerAliasWakeCooldownMs: 0,
+      })
+      await captureThenAliasWake(failedAgent, realPassiveWire('辞老师失败发送', { msgId: 'case-ack-failed' }))
+      const failedCommand = failedAgent.pollProactiveOutbound()
+      assert(failedCommand !== null)
+      if (failedCommand === null) return
+      const failed = failedAgent.observeOutboundDelivery({
+        outboundId: failedCommand.outboundId,
+        requestMessageId: failedCommand.requestMessageId,
+        status: 'FAILED',
+        contentSha256: failedCommand.contentSha256,
+        errorCode: 'SEND_FAILED',
+      })
+      assert.equal(failed.reason, 'FAILED_DISCARDED')
+      assert.equal(failedAmbient.entries(GROUP).some((entry) => entry.speakerType === 'ASSISTANT'), false)
     } finally {
       provider.restore()
     }
@@ -376,11 +595,11 @@ async function main(): Promise<void> {
 
   await check('passive-transport-promotes-only-alias', async () => {
     const provider = stubProvider()
+    const queue = new ProactiveGroupQueue()
     const pipeName = `owner-alias-${process.pid}-${Date.now()}`
     const server = new ProductionAgentTransportServer({
       pipeName,
-      agent: makeAgent({ provider }),
-      maxMessages: 1,
+      agent: makeAgent({ provider, proactiveQueue: queue }),
     })
     let socket: ReturnType<typeof createConnection> | undefined
     try {
@@ -390,14 +609,130 @@ async function main(): Promise<void> {
         socket?.once('connect', resolve)
         socket?.once('error', reject)
       })
-      socket.write(`${JSON.stringify({ kind: 'PASSIVE_CONTEXT_ONLY', message: raw('辞老师呢', { msgId: 'case-transport' }) })}\n`)
+      socket.write(`${JSON.stringify({ kind: 'PASSIVE_CONTEXT_ONLY', message: realPassiveWire('辞老师呢', { msgId: 'case-transport' }) })}\n`)
       const response = await readLine(socket)
-      assert.equal(response.kind, 'OUTBOUND_COMMAND')
+      assert.equal(response.kind, 'CONTEXT_ACCEPTED')
+      await waitFor(() => queue.size === 1)
+      assert.equal(provider.calls.length, 1)
+      socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-1"}\n')
+      const proactive = await readLine(socket)
+      assert.equal(proactive.kind, 'PROACTIVE_OUTBOUND_COMMAND')
+      assert.equal(proactive.conversationType, 'GROUP')
+      assert.equal(proactive.conversationId, GROUP)
+      assert.equal(proactive.text, `接上了，确实挺像他的。${YEYE_REPLY_SIGNATURE}`)
+      socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-2"}\n')
+      assert.equal((await readLine(socket)).kind, 'NO_PROACTIVE_OUTBOUND')
       assert.equal(provider.calls.length, 1)
       assert.equal(server.entries[0]?.passiveContext, true)
     } finally {
       socket?.destroy()
       await server.stop()
+      provider.restore()
+    }
+  })
+
+  for (const [aliasClass, content] of [
+    ['ALIAS_2', '问问辞山时这个怎么看'],
+    ['ALIAS_3', '辞老今天去哪了'],
+  ] as const) {
+    await check(`${aliasClass.toLowerCase()}-real-transport`, async () => {
+      const provider = stubProvider()
+      const queue = new ProactiveGroupQueue()
+      try {
+        const result = await transportAliasRound(
+          makeAgent({ provider, proactiveQueue: queue }),
+          queue,
+          content,
+          `case-${aliasClass}`,
+        )
+        assert.equal(result.response.kind, 'CONTEXT_ACCEPTED')
+        assert.equal(result.proactive.kind, 'PROACTIVE_OUTBOUND_COMMAND')
+        assert.equal(result.secondPoll.kind, 'NO_PROACTIVE_OUTBOUND')
+        assert.equal(provider.calls.length, 1)
+        assert.equal(detectOwnerAliasWake(content)?.matchedAliasClass, aliasClass)
+      } finally {
+        provider.restore()
+      }
+    })
+  }
+
+  await check('non-alias-real-passive-wire-stays-capture-only', async () => {
+    const provider = stubProvider()
+    const queue = new ProactiveGroupQueue()
+    try {
+      const result = await transportPassiveRound(
+        makeAgent({ provider, proactiveQueue: queue }),
+        '老师今天没来',
+        'case-non-alias-transport',
+      )
+      assert.equal(result.response.kind, 'CONTEXT_ACCEPTED')
+      assert.equal(result.poll.kind, 'NO_PROACTIVE_OUTBOUND')
+      assert.equal(provider.calls.length, 0)
+      assert.equal(queue.size, 0)
+    } finally {
+      provider.restore()
+    }
+  })
+
+  await check('alias-timeout-is-passive-accepted-and-silent', async () => {
+    const provider = stubProvider('late answer', undefined, 100)
+    const queue = new ProactiveGroupQueue()
+    try {
+      const result = await transportPassiveRound(
+        makeAgent({ provider, proactiveQueue: queue, requestDeadlineMs: 20 }),
+        '辞老师超时',
+        'case-alias-timeout',
+        150,
+      )
+      assert.equal(result.response.kind, 'CONTEXT_ACCEPTED')
+      assert.equal(result.poll.kind, 'NO_PROACTIVE_OUTBOUND')
+      assert.equal(provider.calls.length, 1)
+      assert.equal(queue.size, 0)
+    } finally {
+      provider.restore()
+    }
+  })
+
+  await check('alias-queue-full-fails-closed', async () => {
+    const provider = stubProvider()
+    const queue = new ProactiveGroupQueue({ maxEntries: 1 })
+    queue.enqueue({ conversationType: 'GROUP', conversationId: GROUP, text: 'already queued' })
+    try {
+      const agent = makeAgent({ provider, proactiveQueue: queue })
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-queue-full' }))
+      assert.equal(provider.calls.length, 1)
+      assert.equal(queue.size, 1)
+      assert.equal(agent.pollProactiveOutbound()?.text, 'already queued')
+      assert.equal(agent.pollProactiveOutbound(), null)
+    } finally {
+      provider.restore()
+    }
+  })
+
+  await check('alias-provider-failure-is-silent', async () => {
+    const provider = stubProvider('unused', new Error('provider down'))
+    const queue = new ProactiveGroupQueue()
+    try {
+      const agent = makeAgent({ provider, proactiveQueue: queue })
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-provider-failure' }))
+      assert.equal(provider.calls.length, 1)
+      assert.equal(queue.size, 0)
+      assert.equal(agent.pollProactiveOutbound(), null)
+    } finally {
+      provider.restore()
+    }
+  })
+
+  await check('alias-empty-provider-is-silent', async () => {
+    const provider = stubProvider('')
+    const queue = new ProactiveGroupQueue()
+    try {
+      const agent = makeAgent({ provider, proactiveQueue: queue })
+      await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-provider-empty' }))
+      assert.equal(provider.calls.length, 1)
+      assert.equal(queue.size, 0)
+      assert.equal(agent.pollProactiveOutbound(), null)
+    } finally {
       provider.restore()
     }
   })
