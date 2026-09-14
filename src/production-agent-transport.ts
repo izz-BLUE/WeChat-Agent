@@ -17,6 +17,7 @@ import {
   type DeliveryAckRejectReason,
 } from './outbound-delivery.js'
 import { PASSIVE_CONTEXT_KIND, type RawHookMessage } from './message-contract.js'
+import { detectOwnerAliasWake } from './owner-alias-wake.js'
 import {
   identityToken,
   logRequesterIdentity,
@@ -382,13 +383,14 @@ export class ProductionAgentTransportServer {
   }
 
   /**
-   * One passive ambient event.
+ * One passive ambient event. Most remain ambience-only; a deterministic Owner
+ * alias match is promoted after capture into one conversational wake.
    *
    * Structurally separate from the active path: it never consults
-   * `invalidOutboundMessageId`, never reaches `toAgentResponse` and has no
-   * response shape that carries an outbound command. Delivery and model
-   * invocation are therefore separable facts — `CONTEXT_ACCEPTED` means "the
-   * ambience was stored", not "the Agent was asked anything".
+   * `invalidOutboundMessageId`. A non-alias event never reaches
+   * `toAgentResponse` and has no response shape that carries an outbound
+   * command. Alias promotion is explicit and still begins with the ambience
+   * capture, so delivery and model invocation remain separable facts.
    */
   private async processPassiveContext(
     socket: Socket,
@@ -396,6 +398,35 @@ export class ProductionAgentTransportServer {
     identity: RequesterIdentityFields,
   ): Promise<void> {
     const result = await runRawPassiveContextPipeline(raw, this.options.agent)
+    if (result.status === 'PASSIVE_CONTEXT' && detectOwnerAliasWake(result.context.text) !== null) {
+      // PASSIVE_CONTEXT_ONLY remains the capture envelope. A matched alias is
+      // the only passive event that may be promoted to one conversational wake;
+      // the Agent owns its message-id dedup and per-group cooldown.
+      const wakeResult = await runRawAgentPipeline(raw, this.options.agent)
+      const entry = toSummaryEntry(raw, wakeResult)
+      entry.passiveContext = true
+      this.summary.push(entry)
+
+      const response = toAgentResponse(wakeResult)
+      this.persistentSink?.writeStructured(
+        'INBOUND_DISPATCHED',
+        {
+          result: response.kind,
+          phase: 'alias-wake',
+          conversationType: identity.conversationType,
+          msgIdToken: this.messageIdToken(raw.msgId),
+          conversationToken: identityToken(identity.conversationId),
+          requesterToken: identityToken(identity.requesterId),
+        },
+        `status=${wakeResult.status} passiveContext=true`,
+      )
+      await this.writeResponse(socket, response, this.messageIdToken(raw.msgId))
+      if (this.options.maxMessages !== undefined && this.messageCount >= this.options.maxMessages) {
+        socket.end()
+        await this.stop()
+      }
+      return
+    }
     const entry: ProductionTransportSummaryEntry = {
       messageId: raw.msgId.toString(),
       status: result.status,

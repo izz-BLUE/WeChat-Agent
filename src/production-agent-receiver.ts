@@ -91,6 +91,10 @@ import { identityToken } from './identity-observer.js'
 import { createTrustedAssistantRuntimeFacts } from './assistant-identity.js'
 import { renderOwnerEscalationHint } from './owner-escalation.js'
 import {
+  DEFAULT_OWNER_ALIAS_WAKE_COOLDOWN_MS,
+  OwnerAliasWakeGate,
+} from './owner-alias-wake.js'
+import {
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
   ProactiveGroupQueue,
@@ -326,6 +330,7 @@ export interface ProductionChatAgentOptions {
   topicCapsuleStore?: GroupTopicCapsuleStore
   topicCapsuleCompactor?: GroupTopicCapsuleCompactor
   topicCapsuleCompletion?: TopicCapsuleStructuredCompletion
+  ownerAliasWakeCooldownMs?: number
 }
 
 interface RequestDeadlineDiagnostics {
@@ -362,6 +367,7 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly ownerDispatchPlanner: OwnerDispatchPlannerLike | null
   private readonly ownerPrivateDispatchPlanner: OwnerPrivateDispatchPlannerLike | null
   private readonly proactiveQueue: ProactiveGroupQueue
+  private readonly ownerAliasWakeGate: OwnerAliasWakeGate
 
   public constructor(
     private readonly chatService: ChatService,
@@ -387,6 +393,10 @@ export class ProductionChatAgent implements AgentExecutor {
     this.requestDeadlineMs = options.requestDeadlineMs ?? config.agentRequestDeadlineMs
     this.runtimeClock = options.runtimeClock ?? { now: () => new Date() }
     this.runtimeTimeZone = options.runtimeTimeZone ?? config.agentTimeZone
+    this.ownerAliasWakeGate = new OwnerAliasWakeGate(
+      options.ownerAliasWakeCooldownMs ?? DEFAULT_OWNER_ALIAS_WAKE_COOLDOWN_MS,
+      () => this.runtimeClock.now().getTime(),
+    )
     this.pendingOutbound = new PendingOutboundReplyStore({
       maxEntries: options.pendingOutboundMaxEntries,
       ttlMs: options.pendingOutboundTtlMs,
@@ -592,6 +602,14 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   public async complete(request: AgentRequest): Promise<string> {
+    const isOwnerAliasWake = request.wakeReason === 'OWNER_ALIAS'
+    if (request.wakeReason === 'OWNER_ALIAS') {
+      const wake = this.ownerAliasWakeGate.admit(request.conversationId, request.messageId)
+      if (!wake.allowed) {
+        this.logOwnerAliasWake(request, false, wake.reason, false, 'SKIP')
+        return ''
+      }
+    }
     const deadline = new RequestDeadline(this.requestDeadlineMs)
     const msgIdToken = this.persistentLog?.shortIdFor(request.messageId) ?? identityToken(request.messageId).slice(0, 6)
     const deadlineDiagnostics: RequestDeadlineDiagnostics = {}
@@ -618,6 +636,15 @@ export class ProductionChatAgent implements AgentExecutor {
       return fallback
     } finally {
       const elapsedMs = Date.now() - deadline.startedAt
+      if (isOwnerAliasWake) {
+        this.logOwnerAliasWake(
+          request,
+          true,
+          'OWNER_ALIAS',
+          true,
+          result === 'COMPLETED' ? 'PASS' : 'FAIL',
+        )
+      }
       emitDiagnostic(
         (line: string) => console.log(line),
         this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
@@ -691,7 +718,7 @@ export class ProductionChatAgent implements AgentExecutor {
       timestamp: request.timestamp,
       messageId: request.messageId,
     }
-    if (request.conversationType === 'GROUP') {
+    if (request.conversationType === 'GROUP' && request.wakeReason !== 'OWNER_ALIAS') {
       // Retain the inbound turn for the next request. The assembler excludes
       // this event id so it is rendered only as CURRENT_REQUEST this turn.
       this.requesterLocal.append(request.conversationId, request.requesterId, question)
@@ -810,7 +837,7 @@ export class ProductionChatAgent implements AgentExecutor {
 
     this.context.append(request.conversationId, question, request.messageId)
 
-    if (this.memory) {
+    if (this.memory && request.wakeReason !== 'OWNER_ALIAS') {
       deadline.mark('MEMORY_EXPLICIT')
       // Historical order: explicit memory intent short-circuits the chat turn,
       // then the message feeds the automatic extractor, then retrieval. All three
@@ -847,17 +874,18 @@ export class ProductionChatAgent implements AgentExecutor {
     // clear Owner-only branch may explain the authorization boundary without an
     // extra model call. Other-member mutations do not satisfy the GROUP scope
     // contract here and continue through the normal safety/identity path.
-    if (request.requesterRole !== 'OWNER' &&
+    if (request.wakeReason !== 'OWNER_ALIAS' &&
+        request.requesterRole !== 'OWNER' &&
         isExplicitMemoryCommand(question.text) &&
         GROUP_SCOPE_KEYWORDS.some((keyword) => question.text.includes(keyword))) {
       return renderOwnerEscalationHint('OWNER_ONLY_ACTION', assistantRuntime)
     }
 
-    if (await this.tryOwnerDispatch(request, question.text, deadline, msgIdToken)) {
+    if (request.wakeReason !== 'OWNER_ALIAS' && await this.tryOwnerDispatch(request, question.text, deadline, msgIdToken)) {
       return ''
     }
 
-    if (this.memory) {
+    if (this.memory && request.wakeReason !== 'OWNER_ALIAS') {
       if (request.conversationType === 'GROUP' && userContentSpan.trust !== 'VALID') {
         this.memory.reportUntrustedUserContentSpan(request.requesterRole)
       } else {
@@ -875,7 +903,7 @@ export class ProductionChatAgent implements AgentExecutor {
       }
     }
 
-    const memory = this.memory
+    const memory = this.memory && request.wakeReason !== 'OWNER_ALIAS'
       ? await this.memory.retrieveForChat({
           conversationType: request.conversationType,
           conversationId: request.conversationId,
@@ -893,24 +921,26 @@ export class ProductionChatAgent implements AgentExecutor {
         })
       : undefined
 
-    const webSearch = await this.resolveWebSearch(
-      question.text,
-      window.messages,
-      ambient,
-      memory,
-      mixedGroupContext === undefined
-        ? activeContext
-        : {
-            currentRequester: [...mixedGroupContext.requesterLocalContext],
-            otherMembers: [],
-          },
-      conversationDynamics,
-      request,
-      runtimeTime,
-      deadline,
-      msgIdToken,
-      mixedGroupContext,
-    )
+    const webSearch = request.wakeReason === 'OWNER_ALIAS'
+      ? undefined
+      : await this.resolveWebSearch(
+          question.text,
+          window.messages,
+          ambient,
+          memory,
+          mixedGroupContext === undefined
+            ? activeContext
+            : {
+                currentRequester: [...mixedGroupContext.requesterLocalContext],
+                otherMembers: [],
+              },
+          conversationDynamics,
+          request,
+          runtimeTime,
+          deadline,
+          msgIdToken,
+          mixedGroupContext,
+        )
 
     deadlineDiagnostics.preFinalRemainingMs = deadline.remainingMs()
     const answer = await this.chatService.reply(
@@ -921,6 +951,7 @@ export class ProductionChatAgent implements AgentExecutor {
         assistantRuntime,
         conversationType: request.conversationType,
         mention: mentionFact(request),
+        ownerAliasWake: request.wakeReason === 'OWNER_ALIAS',
         requesterRole: request.requesterRole,
         ownerConfigured: request.ownerConfigured,
         memory,
@@ -970,7 +1001,9 @@ export class ProductionChatAgent implements AgentExecutor {
       conversationId: request.conversationId,
       text: outboundText,
       timestamp: request.timestamp,
-      ...(request.conversationType === 'GROUP' ? { replyToSpeakerId: request.requesterId } : {}),
+      ...(request.conversationType === 'GROUP' && request.wakeReason !== 'OWNER_ALIAS'
+        ? { replyToSpeakerId: request.requesterId }
+        : {}),
     })
     if (this.persistentLog) {
       new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver').writeStructured(
@@ -980,6 +1013,28 @@ export class ProductionChatAgent implements AgentExecutor {
       )
     }
 
+  }
+
+  private logOwnerAliasWake(
+    request: AgentRequest,
+    cooldownAllowed: boolean,
+    reason: 'OWNER_ALIAS' | 'COOLDOWN' | 'DUPLICATE',
+    providerInvoked: boolean,
+    result: 'PASS' | 'FAIL' | 'SKIP',
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+      'GROUP_WAKE',
+      {
+        reason,
+        matchedAliasClass: request.matchedAliasClass ?? 'NONE',
+        conversationType: request.conversationType,
+        cooldownAllowed,
+        providerInvoked,
+        result,
+      },
+    )
   }
 
   private async tryOwnerDispatch(
