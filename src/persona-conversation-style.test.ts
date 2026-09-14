@@ -24,6 +24,12 @@ await test('default-direct-answer', () => {
   includes('先直接回答', '不使用客服式开场', '能直接回答就不要先铺垫')
 })
 
+await test('top-level-identity-is-an-ai-group-member', () => {
+  assert(systemPrompt.startsWith('你是微信群里的 AI 成员「椰椰」。'))
+  assert(!systemPrompt.includes('微信群中的 AI 聊天助手'))
+  assert(!systemPrompt.includes('AI 聊天助手'))
+})
+
 await test('no-automatic-understanding-preface', () => {
   includes('不重复用户问题', '不先礼貌确认再回答', '“我理解你的意思”“当然可以”“没问题”不作为自动开场')
 })
@@ -70,6 +76,17 @@ await test('uncertainty-honesty', () => {
 
 await test('stop-after-satisfying-request', () => {
   includes('默认满足当前请求后停止')
+})
+
+await test('response-depth-priority-is-unified', () => {
+  includes(
+    '当前消息明确要求/任务客观需要 > 必要事实完整性与安全 > 当前请求者明确个人偏好 > 当前请求者近期结构 hint > Group Reply Pressure 与群聊 presentation hints > Persona default',
+    '群体风格本身不能把简单问题升级为 DETAILED',
+  )
+})
+
+await test('simple-question-can-stay-compact-under-pressure-contract', () => {
+  includes('简单问题优先 1～3 句', 'GROUP_REPLY_PRESSURE=HIGH')
 })
 
 await test('lists-only-when-useful', () => {

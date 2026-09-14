@@ -332,12 +332,59 @@ async function testFinalLlmSeesSoftPreferenceAndCurrentRequestTogether(): Promis
   }
 }
 
+async function testCurrentRequestOverridesHistoricalDetailedPreference(): Promise<void> {
+  const calls: Array<{ system: string; user: string }> = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: Array<{ content?: string }> }
+    const messages = body.messages ?? []
+    calls.push({ system: messages[0]?.content ?? '', user: messages[1]?.content ?? '' })
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { role: 'assistant', content: '一句话就够了。' } }] }),
+    }
+  }) as unknown as typeof fetch
+
+  const request: ChatRequestContext = {
+    botDisplayName: '椰椰',
+    conversationType: 'GROUP',
+    mention: 'MENTIONED',
+    requesterRole: 'MEMBER',
+    ownerConfigured: false,
+    memory: [{ scope: 'PERSONAL', content: '以后回答我详细一点', kind: 'SOFT_STYLE_PREFERENCE' }],
+    memberInteractionProfile: {
+      responseDepth: 'DETAILED',
+      tone: 'NEUTRAL',
+      emojiTolerance: 'LOW',
+      addressFrequency: 'LOW',
+      familiarity: 'NEW',
+    },
+    memoryMutationThisTurn: 'NONE',
+  }
+  try {
+    const answer = await new ChatService('https://provider.invalid/v1', 'test-key', 'test-model').reply(
+      [],
+      { senderId: 'opaque-a', senderName: 'MEMBER_1', text: '这次请一句话回答', timestamp: 1 },
+      request,
+    )
+    assert(answer === '一句话就够了。', 'current short request was not preserved against historical detailed preference')
+    assert(calls.length === 1, 'current short request caused an unexpected extra provider call')
+    assert(calls[0]?.system.includes('当前消息的明确请求优先于历史偏好'), 'current-request precedence contract is missing')
+    assert(calls[0]?.user.includes('以后回答我详细一点') && calls[0]?.user.includes('这次请一句话回答'), 'historical detailed preference and current short request were not both provided')
+    assert(calls[0]?.user.includes('RESPONSE_DEPTH=DETAILED'), 'historical detailed response-depth hint was not provided')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
 async function main(): Promise<void> {
   await testAutomaticPreferencesNormalizeToRequesterScope()
   await testHistoricalDirtyPreferencesAreNotReadableButGroupMemoryIs()
   await testExplicitPreferenceRoutingKeepsLocalAndGroupPhrasesDistinct()
   testPromptContractGivesCurrentRequestPrecedenceAndNaturalAvoidance()
   await testFinalLlmSeesSoftPreferenceAndCurrentRequestTogether()
+  await testCurrentRequestOverridesHistoricalDetailedPreference()
   console.log('requester-preference-boundary: ok')
 }
 

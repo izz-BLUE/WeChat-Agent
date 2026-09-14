@@ -58,6 +58,10 @@ await test('explicit-detailed-preference-overrides-observation', () => {
       content: '以后叫我老王',
     }],
     recentRequesterActiveContext: [{ text: '好' }, { text: '行' }],
+    groupStyle: observeGroupStyle({
+      recentGroupContext: [member('群里默认写得很长。'.repeat(30))],
+      groupAmbientContext: [],
+    }),
   })
   assert.equal(profile.responseDepth, 'DETAILED')
   assert.equal(profile.tone, 'TECHNICAL')
@@ -137,7 +141,7 @@ await test('fresh-derivation-has-no-restart-persistence', () => {
   assert.equal(afterRestart.responseDepth, 'NORMAL')
 })
 
-await test('requester-hint-lightly-overrides-group-style-fallback', () => {
+await test('group-style-does-not-upgrade-default-depth', () => {
   const groupStyle = observeGroupStyle({
     recentGroupContext: [member('群级默认偏详细。'.repeat(30))],
     groupAmbientContext: [],
@@ -147,8 +151,35 @@ await test('requester-hint-lightly-overrides-group-style-fallback', () => {
     groupStyle,
     recentRequesterActiveContext: [{ text: '好' }, { text: '行' }],
   })
-  assert.equal(fallback.responseDepth, 'DETAILED')
+  assert.equal(fallback.responseDepth, 'NORMAL')
   assert.equal(requesterSpecific.responseDepth, 'SHORT')
+})
+
+await test('explicit-short-preference-overrides-requester-and-group-style', () => {
+  const profile = derive({
+    authorizedPersonalMemory: [{
+      scope: 'PERSONAL',
+      kind: 'SOFT_STYLE_PREFERENCE',
+      content: '以后回答我简短一点',
+    }],
+    recentRequesterActiveContext: [{ text: '请把原因、证据和处理步骤都详细说明。'.repeat(4) }],
+    groupStyle: observeGroupStyle({
+      recentGroupContext: [member('群里默认写得很长。'.repeat(30))],
+      groupAmbientContext: [],
+    }),
+  })
+  assert.equal(profile.responseDepth, 'SHORT')
+})
+
+await test('group-style-keeps-presentation-hints-without-depth-upgrade', () => {
+  const groupStyle = observeGroupStyle({
+    recentGroupContext: [member('😀😀😀')],
+    groupAmbientContext: [],
+  })
+  const profile = derive({ groupStyle })
+  assert.equal(profile.responseDepth, 'NORMAL')
+  assert.equal(profile.tone, 'CASUAL')
+  assert.equal(profile.emojiTolerance, 'NORMAL')
 })
 
 await test('group-preference-is-not-reclassified-as-requester-preference', () => {

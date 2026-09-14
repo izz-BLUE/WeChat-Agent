@@ -31,7 +31,7 @@ export interface MemberInteractionProfileInput {
   authorizedPersonalMemory?: readonly MemoryPromptItem[]
   /** Already split active turns authored by the current requester. */
   recentRequesterActiveContext: readonly Pick<ChatPromptMessage, 'text'>[]
-  /** Group-wide style is only a fallback when requester evidence is absent. */
+  /** Group-wide style may shape presentation hints, but never response depth. */
   groupStyle?: GroupStyleProfile
 }
 
@@ -51,8 +51,8 @@ const LOW_EMOJI_PREFERENCE = /(?:少用|不用|别用|不要|不使用).*?(?:emo
 const NORMAL_EMOJI_PREFERENCE = /(?:可以|适当|多用|带点|加点).*?(?:emoji|表情|颜文字)/iu
 
 /**
- * Derive only presentation hints. Every field has an explicit precedence:
- * personal preference, current requester structure, group style, default.
+ * Derive only presentation hints. Response depth uses requester-scoped
+ * evidence; group style remains available only to the other presentation hints.
  */
 export function deriveMemberInteractionProfile(
   input: MemberInteractionProfileInput,
@@ -74,7 +74,6 @@ export function deriveMemberInteractionProfile(
   const profile: MemberInteractionProfile = {
     responseDepth: personalPreference.responseDepth ??
       responseDepthFromStyle(requesterStyle) ??
-      responseDepthFromStyle(input.groupStyle) ??
       DEFAULT_PROFILE.responseDepth,
     tone: personalPreference.tone ??
       toneFromStyle(requesterStyle) ??
