@@ -280,12 +280,13 @@ async function testRawOwnerIdNeverReachesProvider(): Promise<void> {
 
   const call = chat.calls[0]
   const prompt = buildUserPrompt(call.context, call.question, call.request)
+  const systemPrompt = buildSystemPrompt(call.request.botDisplayName, call.request.assistantRuntime)
   assert(!prompt.includes('owner-sig'), 'the raw owner identity reached the provider prompt')
   assert(call.question.senderName === 'SPEAKER_1', 'the owner did not receive a neutral speaker label')
   assert(call.request.requesterRole === 'OWNER', 'the trusted role was not passed to the chat service')
   assert(call.request.ownerConfigured === true, 'the owner-configured fact was not passed to the chat service')
-  assert(prompt.includes('OWNER_DISPLAY_NAME=Boss'), 'the trusted owner name was not provided to the provider prompt')
-  assert(prompt.includes('OWNER_RELATIONSHIP_TO_ASSISTANT=BOSS'), 'the trusted owner relationship was not provided to the provider prompt')
+  assert(systemPrompt.includes('OWNER_DISPLAY_NAME=Boss'), 'the trusted owner name was not provided to the provider system prompt')
+  assert(systemPrompt.includes('OWNER_RELATIONSHIP_TO_ASSISTANT=BOSS'), 'the trusted owner relationship was not provided to the provider system prompt')
   assert(!JSON.stringify(call.request).includes('owner-sig'), 'the raw owner identity reached the chat context')
 }
 

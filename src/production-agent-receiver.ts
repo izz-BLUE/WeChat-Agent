@@ -355,6 +355,8 @@ export interface ProductionChatAgentOptions {
   webPageFetchImplementation?: WebPageFetchImplementation
   webPageDnsLookup?: WebPageDnsLookup
   requestDeadlineMs?: number
+  /** Narrow test seam for constructing an already-expired or controlled deadline. */
+  requestDeadlineFactory?: (budgetMs: number) => RequestDeadline
   runtimeClock?: RuntimeClock
   runtimeTimeZone?: string
   pendingOutboundMaxEntries?: number
@@ -399,6 +401,7 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly webPageFetchImplementation: WebPageFetchImplementation | undefined
   private readonly webPageDnsLookup: WebPageDnsLookup | undefined
   private readonly requestDeadlineMs: number
+  private readonly requestDeadlineFactory: (budgetMs: number) => RequestDeadline
   private readonly runtimeClock: RuntimeClock
   private readonly runtimeTimeZone: string | undefined
   private readonly pendingOutbound: PendingOutboundReplyStore
@@ -430,6 +433,7 @@ export class ProductionChatAgent implements AgentExecutor {
     this.webPageFetchImplementation = options.webPageFetchImplementation
     this.webPageDnsLookup = options.webPageDnsLookup
     this.requestDeadlineMs = options.requestDeadlineMs ?? config.agentRequestDeadlineMs
+    this.requestDeadlineFactory = options.requestDeadlineFactory ?? ((budgetMs) => new RequestDeadline(budgetMs))
     this.runtimeClock = options.runtimeClock ?? { now: () => new Date() }
     this.runtimeTimeZone = options.runtimeTimeZone ?? config.agentTimeZone
     this.ownerAliasWakeGate = new OwnerAliasWakeGate(
@@ -570,7 +574,7 @@ export class ProductionChatAgent implements AgentExecutor {
     this.ownerAliasWakeInFlight.add(context.conversationId)
     this.logOwnerAliasWake(context, 'DETECTED', true, false, 'PASS')
     const request = toOwnerAliasPresentationRequest(context)
-    const deadline = new RequestDeadline(this.requestDeadlineMs)
+    const deadline = this.requestDeadlineFactory(this.requestDeadlineMs)
     const msgIdToken = identityToken(context.messageId).slice(0, 6)
     const deadlineDiagnostics: RequestDeadlineDiagnostics = {}
     let result: 'COMPLETED' | 'GENERATION_FAILED' = 'COMPLETED'
@@ -722,7 +726,7 @@ export class ProductionChatAgent implements AgentExecutor {
   }
 
   public async complete(request: AgentRequest): Promise<string> {
-    const deadline = new RequestDeadline(this.requestDeadlineMs)
+    const deadline = this.requestDeadlineFactory(this.requestDeadlineMs)
     const msgIdToken = this.persistentLog?.shortIdFor(request.messageId) ?? identityToken(request.messageId).slice(0, 6)
     const deadlineDiagnostics: RequestDeadlineDiagnostics = {}
     let result: 'COMPLETED' | 'DEADLINE_FALLBACK' = 'COMPLETED'
@@ -1847,7 +1851,7 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     : undefined
   const chatService = new ChatService(config.openAiApiBase, config.openAiApiKey, config.openAiModel, chatSink)
   const webSearchPlanner = config.webSearchEnabled
-    ? new WebSearchPlanner((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken))
+    ? new WebSearchPlanner((system, user, deadline, msgIdToken, phase) => chatService.completeStructured(system, user, deadline, msgIdToken, phase))
     : null
   const webSearchProvider = config.webSearchEnabled
     ? new TavilyWebSearchProvider(config.tavilyApiBase, config.tavilyApiKey)
@@ -1871,12 +1875,12 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     webPageFetchMaxTotalChars: config.webPageFetchMaxTotalChars,
     requestDeadlineMs: config.agentRequestDeadlineMs,
     runtimeTimeZone: config.agentTimeZone,
-    ownerDispatchPlanner: new OwnerDispatchPlanner((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken)),
+    ownerDispatchPlanner: new OwnerDispatchPlanner((system, user, deadline, msgIdToken, phase) => chatService.completeStructured(system, user, deadline, msgIdToken, phase)),
     ownerPrivateDispatchPlanner: new OwnerPrivateDispatchPlanner(
-      (system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken),
+      (system, user, deadline, msgIdToken, phase) => chatService.completeStructured(system, user, deadline, msgIdToken, phase),
     ),
-    topicCapsuleCompletion: (system, user, deadline, msgIdToken) =>
-      chatService.completeStructured(system, user, deadline, msgIdToken),
+    topicCapsuleCompletion: (system, user, deadline, msgIdToken, phase) =>
+      chatService.completeStructured(system, user, deadline, msgIdToken, phase),
   })
 }
 
@@ -1922,8 +1926,8 @@ export function createMemoryService(
   })
   return new MemoryService({
     store,
-    extractor: new MemoryExtractor((system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken)),
-    mutate: (system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken),
+    extractor: new MemoryExtractor((system, user, deadline, msgIdToken, phase) => chatService.completeStructured(system, user, deadline, msgIdToken, phase)),
+    mutate: (system, user, deadline, msgIdToken, phase) => chatService.completeStructured(system, user, deadline, msgIdToken, phase),
     backgroundTimeoutMs: config.memoryBackgroundTimeoutMs,
     enableTimer: true,
     sink,

@@ -153,6 +153,7 @@ class CapturingChatService {
     context: GroupMessage[]
     question: GroupMessage
     request: ChatRequestContext
+    systemPrompt: string
     prompt: string
   }> = []
 
@@ -162,7 +163,8 @@ class CapturingChatService {
     request: ChatRequestContext,
   ): Promise<string> {
     const prompt = buildUserPrompt(context, question, request)
-    this.calls.push({ context, question, request, prompt })
+    const systemPrompt = buildSystemPrompt(request.botDisplayName, request.assistantRuntime)
+    this.calls.push({ context, question, request, systemPrompt, prompt })
     return request.memory?.[0]?.content ?? '我还不知道你希望我怎么称呼你。'
   }
 }
@@ -302,8 +304,8 @@ async function testOwnerMemoryWinsOverAuthorizationRole(): Promise<void> {
   assert(reply === `我叫${FACT}${YEYE_REPLY_SIGNATURE}`, 'owner identity answer was not based on personal memory')
   assert(!reply.includes('主人') && !reply.includes('群主') && !reply.includes('管理员'), 'owner role became a natural-language identity')
   assert(!call.prompt.includes('CurrentRequesterRole=OWNER'), 'raw authorization role reached the final-answer prompt')
-  assert(call.prompt.includes('OWNER_CONFIGURED=true'), 'trusted owner configuration fact was not provided to the final-answer prompt')
-  assert(call.prompt.includes('OWNER_DISPLAY_NAME=配置展示名'), 'trusted owner display name was not provided to the final-answer prompt')
+  assert(call.systemPrompt.includes('OWNER_CONFIGURED=true'), 'trusted owner configuration fact was not provided to the final-answer system prompt')
+  assert(call.systemPrompt.includes('OWNER_DISPLAY_NAME=配置展示名'), 'trusted owner display name was not provided to the final-answer system prompt')
   assert(call.question.senderName === 'SPEAKER_1', `owner did not receive a neutral speaker label: ${call.question.senderName}`)
   assert(call.prompt.includes('SELF_IDENTITY_QUERY=true'), 'identity grounding fact was not provided')
   assert(call.prompt.includes('RETRIEVED_MEMORY_COUNT=1'), 'retrieved memory count was not provided')
@@ -322,8 +324,8 @@ async function testOwnerWithoutMemoryIsUnknown(): Promise<void> {
   assert(call !== undefined, 'owner unknown identity query did not reach the answer service')
   assert(reply.includes('不知道'), `missing personal identity memory did not produce UNKNOWN: ${reply}`)
   assert(!reply.includes('主人') && !reply.includes('群主') && !reply.includes('管理员'), 'OWNER fallback leaked as a social identity')
-  assert(call.prompt.includes('OWNER_CONFIGURED=true'), 'trusted owner configuration fact was not provided to the final-answer prompt')
-  assert(call.prompt.includes('OWNER_DISPLAY_NAME=配置展示名'), 'trusted owner display name was not provided to the final-answer prompt')
+  assert(call.systemPrompt.includes('OWNER_CONFIGURED=true'), 'trusted owner configuration fact was not provided to the final-answer system prompt')
+  assert(call.systemPrompt.includes('OWNER_DISPLAY_NAME=配置展示名'), 'trusted owner display name was not provided to the final-answer system prompt')
   assert(call.prompt.includes('SELF_IDENTITY_QUERY=true'), 'unknown identity query was not marked')
   assert(call.prompt.includes('RETRIEVED_MEMORY_COUNT=0'), 'unknown identity prompt did not state memory absence')
 }

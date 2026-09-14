@@ -685,8 +685,9 @@ async function caseSixteenOwnerGroundingIsUnchanged(): Promise<void> {
     )
 
     const prompt = harness.provider.calls[0].user
-    assert(prompt.includes('OWNER_DISPLAY_NAME=老大'), 'trusted owner display name did not reach the prompt')
-    assert(prompt.includes('OWNER_RELATIONSHIP_TO_ASSISTANT=BOSS'), 'trusted owner relationship did not reach the prompt')
+    const systemPrompt = harness.provider.calls[0].system
+    assert(systemPrompt.includes('OWNER_DISPLAY_NAME=老大'), 'trusted owner display name did not reach the system prompt')
+    assert(systemPrompt.includes('OWNER_RELATIONSHIP_TO_ASSISTANT=BOSS'), 'trusted owner relationship did not reach the system prompt')
     assert(!/\bownerDisplayName\b/u.test(prompt), 'an owner metadata field name reached the prompt')
     // The ambient section must not resurrect an OWNER-labelled speaker either.
     assert(!ambientSection(prompt).includes('OWNER'), 'the ambient section carries an OWNER label')

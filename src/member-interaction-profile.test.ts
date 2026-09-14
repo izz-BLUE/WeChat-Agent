@@ -215,7 +215,7 @@ await test('prompt-renders-only-enums-and-keeps-boundary', () => {
   }
   const prompt = buildUserPrompt([], { senderId: 'opaque', senderName: 'MEMBER_1', text: '你好', timestamp: 1 }, request)
   const start = prompt.indexOf('[Member Interaction Profile: RUNTIME_PRESENTATION_HINT]')
-  const end = prompt.indexOf('[Trusted Assistant Runtime Facts]', start)
+  const end = prompt.indexOf('[Runtime Facts]', start)
   const section = start >= 0 && end > start ? prompt.slice(start, end) : ''
   assert(section.includes(formatMemberInteractionProfile(profile)))
   assert(!section.includes(rawText))

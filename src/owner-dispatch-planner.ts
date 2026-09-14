@@ -4,6 +4,7 @@ import {
   sanitizeFinalAnswer,
 } from './final-answer.js'
 import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
+import type { ProviderPhase } from './provider-cache-usage.js'
 
 export type OwnerDispatchAction = 'CHAT' | 'DISPATCH_NOW'
 
@@ -32,7 +33,7 @@ export interface OwnerDispatchPlannerLike {
 }
 
 export interface StructuredOwnerDispatchCompletion {
-  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string): Promise<string>
+  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string, phase?: ProviderPhase): Promise<string>
 }
 
 const PLANNER_SYSTEM_PROMPT = `你是 Owner Dispatch Planner，只负责判断已验证 OWNER 的当前 GROUP @ 请求是否应立即向当前群发送一条消息。
@@ -194,6 +195,7 @@ export class OwnerDispatchPlanner implements OwnerDispatchPlannerLike {
         userPrompt,
         deadline,
         msgIdToken,
+        'OWNER_DISPATCH_PLANNER',
       )
       deadline?.throwIfExpired()
     } catch (error) {

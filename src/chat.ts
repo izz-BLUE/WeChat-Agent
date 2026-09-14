@@ -30,6 +30,7 @@ import { boundGroupReply, renderHumanChat } from './chat-renderer.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
 import { identityToken } from './identity-observer.js'
 import { isRequestDeadlineExceeded, type RequestDeadline, withRequestDeadline } from './request-deadline.js'
+import { parseProviderCacheUsage, type ProviderPhase } from './provider-cache-usage.js'
 import {
   createTrustedAssistantRuntimeFacts,
   formatAssistantRuntimeFacts,
@@ -123,6 +124,30 @@ interface ChatCompletionResponse {
   choices?: Array<{
     message?: unknown
   }>
+  usage?: unknown
+}
+
+function emitProviderCacheUsage(
+  response: ChatCompletionResponse,
+  model: string,
+  phase: ProviderPhase,
+  systemPrompt: string,
+  userContent: string,
+  msgIdToken: string,
+  sink: PersistentRuntimeLogSink | undefined,
+): void {
+  const usage = parseProviderCacheUsage(response)
+  emitDiagnostic((line: string) => console.log(line), sink, 'PROVIDER_CACHE_USAGE', {
+    phase,
+    model,
+    promptTokens: usage.promptTokens,
+    cachedTokens: usage.cachedTokens,
+    cacheMissTokens: usage.cacheMissTokens,
+    cacheHitRate: usage.cacheHitRate,
+    systemChars: systemPrompt.length,
+    userChars: userContent.length,
+    msgIdToken,
+  })
 }
 
 /**
@@ -847,7 +872,6 @@ export function buildUserPrompt(
     conversationDynamicsSection(request.conversationDynamics) +
     groupReplyPressureSection(groupReplyPressure) +
     '\n\n' +
-    `[Trusted Assistant Runtime Facts]\n${formatAssistantRuntimeFacts(assistantRuntime)}\n\n` +
     `[Runtime Facts]\n${runtimeFacts(context, request, selfIdentityQuery)}` +
     `${memoryTruthfulnessSection}\n\n` +
     `${ownerCapabilitySection(request)}\n\n` +
@@ -1382,6 +1406,7 @@ export class ChatService {
     userContent: string,
     deadline?: RequestDeadline,
     msgIdToken = 'NONE',
+    phase: ProviderPhase = 'STRUCTURED_PROVIDER',
   ): Promise<string> {
     const startedAt = Date.now()
     deadline?.mark('STRUCTURED_PROVIDER')
@@ -1413,6 +1438,7 @@ export class ChatService {
       const data = deadline === undefined
         ? await execute()
         : await withRequestDeadline(deadline, (signal) => execute(signal))
+      emitProviderCacheUsage(data, this.model, phase, systemPrompt, userContent, msgIdToken, this.structuredSink)
       const finalAnswer = extractFinalAnswer(data.choices?.[0]?.message)
       if (finalAnswer.providerControlMarkup) {
         throw new ProviderControlMarkupError(finalAnswer.providerControlKinds)
@@ -1461,7 +1487,7 @@ export class ChatService {
     persistentSink?: PersistentRuntimeLogSink,
     messageId?: string,
     deadline?: RequestDeadline,
-    phase = 'FINAL_ANSWER',
+    phase: ProviderPhase = 'FINAL_ANSWER',
   ): Promise<string> {
     const startedAt = Date.now()
     const msgIdToken = identityToken(messageId).slice(0, 6)
@@ -1493,6 +1519,7 @@ export class ChatService {
       const data = deadline === undefined
         ? await execute()
         : await withRequestDeadline(deadline, (signal) => execute(signal))
+      emitProviderCacheUsage(data, this.model, phase, systemPrompt, userContent, msgIdToken, persistentSink)
       const message = data.choices?.[0]?.message
       const finalAnswer = extractFinalAnswer(message)
       if (finalAnswer.providerControlMarkup) {

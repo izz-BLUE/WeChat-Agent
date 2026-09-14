@@ -1318,7 +1318,7 @@ async function testNoRawIdentityOrAuthorizationMetadataInThePrompt(): Promise<vo
     for (const forbidden of ['主人', '群主', '管理员']) {
       assert(!prompt.user.includes(forbidden), `authorization metadata "${forbidden}" was rendered as prompt data`)
     }
-    assert(prompt.user.includes(`OWNER_DISPLAY_NAME=${OWNER_DISPLAY_NAME}`), 'trusted owner display name was not rendered')
+    assert(prompt.system.includes(`OWNER_DISPLAY_NAME=${OWNER_DISPLAY_NAME}`), 'trusted owner display name was not rendered in the system prompt')
     for (const forbidden of [
       'requesterId',
       'RequesterId',
