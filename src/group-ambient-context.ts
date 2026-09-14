@@ -37,6 +37,7 @@
  */
 import { formatDiagnosticLine, type PersistentRuntimeLogSink } from './persistent-runtime-log.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
+import { topicSourceEventId, type GroupTopicCompactionEvent } from './group-topic-capsule.js'
 
 /** Scope token used in every ambient diagnostic. */
 export const AMBIENT_SCOPE = 'GROUP_AMBIENT'
@@ -75,6 +76,11 @@ export interface AmbientEntryInput {
   timestamp: number
 }
 
+interface AmbientStoredEntry extends AmbientEntryInput {
+  /** Process-local arrival time; the wire timestamp remains event ordering data. */
+  storedAt: number
+}
+
 /** One rendered transcript line. Never carries a raw identity. */
 export interface AmbientLine {
   label: string
@@ -108,6 +114,8 @@ export interface AmbientRenderRequest {
    * events with two ids, and only the one already rendered elsewhere is dropped.
    */
   excludeEventIds?: readonly string[]
+  /** Hashed source ids already represented by a Topic Capsule. */
+  excludeCompactedEventIds?: readonly string[]
   /** Optional per-render entry cap; defaults to the store cap. */
   limit?: number
   /** Optional per-render character budget; defaults to the store budget. */
@@ -124,6 +132,19 @@ export interface AmbientSelection {
   expiredDropped: number
   /** Entries dropped because another context view already rendered the event. */
   crossContextDropped: number
+  /** Number of stored entries removed because they are the current turn. */
+  currentEventDropped: number
+  /** Entries omitted because a Topic Capsule already covers them. */
+  compactedDropped: number
+}
+
+export interface AmbientCompactionSelection {
+  events: readonly GroupTopicCompactionEvent[]
+  availableCount: number
+  eligibleChars: number
+  coveredDropped: number
+  recentRawCount: number
+  expiredDropped: number
 }
 
 export type AmbientAppendResult = 'PASS' | 'DUPLICATE' | 'REJECTED'
@@ -158,7 +179,7 @@ export const DEFAULT_AMBIENT_MAX_CHARS = 4000
  * never observe an entry that already outlived its TTL.
  */
 export class GroupAmbientContext {
-  private readonly entriesByGroup = new Map<string, AmbientEntryInput[]>()
+  private readonly entriesByGroup = new Map<string, AmbientStoredEntry[]>()
   private readonly labelsByGroup = new Map<string, Map<string, string>>()
   private readonly maxEntries: number
   private readonly ttlMs: number
@@ -215,6 +236,7 @@ export class GroupAmbientContext {
       ...entry,
       publicDisplayName: sanitizePublicDisplayName(entry.publicDisplayName),
       text: entry.text.trim(),
+      storedAt: now,
     })
     if (entries.length > this.maxEntries) {
       entries.splice(0, entries.length - this.maxEntries)
@@ -246,14 +268,22 @@ export class GroupAmbientContext {
     const entries = this.entriesByGroup.get(groupKey) ?? []
     const renderedElsewhere =
       request.excludeEventIds === undefined ? undefined : new Set(request.excludeEventIds)
+    const compacted = request.excludeCompactedEventIds === undefined
+      ? undefined
+      : new Set(request.excludeCompactedEventIds)
 
     const withoutActive = entries.filter(
       (entry) => request.excludeMessageId === undefined || entry.messageId !== request.excludeMessageId,
     )
-    const eligible = renderedElsewhere === undefined
+    const currentEventDropped = entries.length - withoutActive.length
+    const withoutCompacted = compacted === undefined
       ? withoutActive
-      : withoutActive.filter((entry) => !renderedElsewhere.has(entry.messageId))
-    const crossContextDropped = withoutActive.length - eligible.length
+      : withoutActive.filter((entry) => !compacted.has(topicSourceEventId(groupKey, entry.messageId)))
+    const compactedDropped = withoutActive.length - withoutCompacted.length
+    const eligible = renderedElsewhere === undefined
+      ? withoutCompacted
+      : withoutCompacted.filter((entry) => !renderedElsewhere.has(entry.messageId))
+    const crossContextDropped = withoutCompacted.length - eligible.length
 
     const limit = Math.max(0, Math.min(request.limit ?? this.maxEntries, this.maxEntries))
     const maxChars = Math.max(0, Math.min(request.maxChars ?? this.maxChars, this.maxChars))
@@ -289,6 +319,8 @@ export class GroupAmbientContext {
       selectedCount: lines.length,
       expiredDropped,
       crossContextDropped,
+      currentEventDropped,
+      compactedDropped,
     }
     this.diagnoseRead(selection)
     return selection
@@ -303,7 +335,60 @@ export class GroupAmbientContext {
   /** Stored transcript for one group, oldest first. Test and diagnostic surface. */
   public entries(groupKey: string): readonly AmbientEntryInput[] {
     this.prune(groupKey, this.clock())
-    return [...(this.entriesByGroup.get(groupKey) ?? [])]
+    return (this.entriesByGroup.get(groupKey) ?? []).map(({ storedAt: _storedAt, ...entry }) => ({ ...entry }))
+  }
+
+  /**
+   * Returns old, not-yet-covered public ambient events for one compaction batch.
+   * The returned shape has stable aliases and hashed source ids only.
+   */
+  public selectForCompaction(
+    groupKey: string,
+    request: {
+      coveredSourceEventIds?: readonly string[]
+      recentRawEntries: number
+      recentRawMaxChars: number
+      now?: number
+    },
+  ): AmbientCompactionSelection {
+    const expiredDropped = this.prune(groupKey, request.now ?? this.clock())
+    const entries = this.entriesByGroup.get(groupKey) ?? []
+    const covered = new Set(request.coveredSourceEventIds ?? [])
+    const recent = new Set<string>()
+    let recentChars = 0
+    for (let index = entries.length - 1; index >= 0 && recent.size < request.recentRawEntries; index -= 1) {
+      const entry = entries[index] as AmbientStoredEntry
+      const lineChars = entry.text.length + 3
+      if (recent.size > 0 && recentChars + lineChars > request.recentRawMaxChars) break
+      recent.add(entry.messageId)
+      recentChars += lineChars
+    }
+
+    let coveredDropped = 0
+    const events: GroupTopicCompactionEvent[] = []
+    for (const entry of entries) {
+      if (recent.has(entry.messageId)) continue
+      const sourceEventId = topicSourceEventId(groupKey, entry.messageId)
+      if (covered.has(sourceEventId)) {
+        coveredDropped += 1
+        continue
+      }
+      events.push({
+        sourceEventId,
+        speakerLabel: entry.speakerType === 'ASSISTANT' ? ASSISTANT_LABEL : this.labelFor(groupKey, entry.speakerId),
+        speakerType: entry.speakerType,
+        text: redactCompactionText(entry.text, [groupKey, entry.speakerId, entry.replyToSpeakerId]),
+        timestamp: entry.timestamp,
+      })
+    }
+    return {
+      events,
+      availableCount: events.length,
+      eligibleChars: events.reduce((total, event) => total + event.text.length, 0),
+      coveredDropped,
+      recentRawCount: recent.size,
+      expiredDropped,
+    }
   }
 
   private renderLabel(groupKey: string, entry: AmbientEntryInput, currentRequesterId?: string): string {
@@ -340,7 +425,7 @@ export class GroupAmbientContext {
       return 0
     }
 
-    const kept = entries.filter((entry) => now - entry.timestamp <= this.ttlMs)
+    const kept = entries.filter((entry) => now - entry.storedAt <= this.ttlMs)
     const dropped = entries.length - kept.length
     if (dropped > 0) {
       this.entriesByGroup.set(groupKey, kept)
@@ -365,6 +450,7 @@ export class GroupAmbientContext {
       selectedCount: selection.selectedCount,
       expiredDropped: selection.expiredDropped,
       crossContextDropped: selection.crossContextDropped,
+      compactedDropped: selection.compactedDropped,
       result: 'PASS',
     })
   }
@@ -418,6 +504,20 @@ function resolveReplyTarget(replyToSpeakerId: string | undefined, currentRequest
     return 'CURRENT_REQUESTER'
   }
   return 'OTHER_MEMBER'
+}
+
+function redactCompactionText(text: string, rawValues: readonly (string | undefined)[]): string {
+  let safe = text
+  for (const rawValue of rawValues) {
+    const value = rawValue?.trim() ?? ''
+    if (value.length === 0) continue
+    safe = safe.replace(new RegExp(escapeRegExp(value), 'gu'), '群成员')
+  }
+  return safe
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
 }
 
 /** True when a rendered label is an ambient-transcript pseudonym. */

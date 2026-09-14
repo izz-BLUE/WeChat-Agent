@@ -16,6 +16,17 @@ import {
 } from './canonical-user-text.js'
 import { GroupContext, type GroupMessage } from './context.js'
 import { ASSISTANT_LABEL, GroupAmbientContext, type AmbientLine } from './group-ambient-context.js'
+import {
+  GroupConversationContextAssembler,
+  stabilizeActiveAmbientLabels,
+  type GroupConversationContext,
+} from './group-conversation-context.js'
+import { RequesterLocalContext } from './requester-local-context.js'
+import {
+  GroupTopicCapsuleCompactor,
+  GroupTopicCapsuleStore,
+  type TopicCapsuleStructuredCompletion,
+} from './group-topic-capsule.js'
 import { config, validateChatConfig } from './config.js'
 import type { AgentExecutor, AgentPassiveContext, AgentRequest, OutboundCommand } from './agent-adapter.js'
 import {
@@ -311,6 +322,10 @@ export interface ProductionChatAgentOptions {
   proactiveQueue?: ProactiveGroupQueue
   proactiveQueueMaxEntries?: number
   proactiveQueueTtlMs?: number
+  requesterLocalContext?: RequesterLocalContext
+  topicCapsuleStore?: GroupTopicCapsuleStore
+  topicCapsuleCompactor?: GroupTopicCapsuleCompactor
+  topicCapsuleCompletion?: TopicCapsuleStructuredCompletion
 }
 
 interface RequestDeadlineDiagnostics {
@@ -320,6 +335,10 @@ interface RequestDeadlineDiagnostics {
 export class ProductionChatAgent implements AgentExecutor {
   private readonly context: GroupContext
   private readonly ambient: GroupAmbientContext
+  private readonly requesterLocal: RequesterLocalContext
+  private readonly topicCapsules: GroupTopicCapsuleStore
+  private readonly topicCompactor: GroupTopicCapsuleCompactor | null
+  private readonly groupContextAssembler: GroupConversationContextAssembler
   private readonly speakerLabels: SpeakerLabelRegistry
   private readonly memory: MemoryService | null
   private readonly persistentLog: PersistentRuntimeLog | null
@@ -393,6 +412,51 @@ export class ProductionChatAgent implements AgentExecutor {
         ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver')
         : undefined,
     })
+    this.requesterLocal = options.requesterLocalContext ?? new RequesterLocalContext({
+      maxEntries: config.requesterLocalMaxEntries,
+      ttlMs: config.requesterLocalTtlMs,
+      maxChars: config.requesterLocalMaxChars,
+      sink: this.persistentLog
+        ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver')
+      : undefined,
+    })
+    this.topicCapsules = options.topicCapsuleStore ?? new GroupTopicCapsuleStore({
+      maxCapsulesPerGroup: config.topicCapsuleMaxPerGroup,
+      ttlMs: config.topicCapsuleTtlMs,
+      maxSelected: config.topicCapsuleMaxSelected,
+      maxChars: config.topicCapsuleMaxChars,
+      summaryMaxChars: config.topicCapsuleSummaryMaxChars,
+    })
+    this.topicCompactor = options.topicCapsuleCompactor ?? (
+      config.topicCapsuleEnabled && options.topicCapsuleCompletion !== undefined
+        ? new GroupTopicCapsuleCompactor({
+            ambient: this.ambient,
+            store: this.topicCapsules,
+            complete: options.topicCapsuleCompletion,
+            triggerEventCount: config.topicCapsuleTriggerEventCount,
+            triggerCharCount: config.topicCapsuleTriggerCharCount,
+            recentRawEntries: config.topicCapsuleRecentRawEntries,
+            recentRawMaxChars: config.topicCapsuleRecentRawChars,
+            timeoutMs: config.topicCapsuleCompactionTimeoutMs,
+            sink: this.persistentLog
+              ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-topic')
+              : undefined,
+          })
+        : null
+    )
+    this.groupContextAssembler = new GroupConversationContextAssembler(
+      this.requesterLocal,
+      this.ambient,
+      {
+        requesterLocalMaxEntries: config.requesterLocalMaxEntries,
+        requesterLocalMaxChars: config.requesterLocalMaxChars,
+        groupAmbientMaxEntries: config.ambientMaxEntries,
+        groupAmbientMaxChars: config.ambientMaxChars,
+        topicCapsuleStore: this.topicCapsules,
+        topicCapsuleMaxSelected: config.topicCapsuleMaxSelected,
+        topicCapsuleMaxChars: config.topicCapsuleMaxChars,
+      },
+    )
   }
 
   /**
@@ -402,8 +466,8 @@ export class ProductionChatAgent implements AgentExecutor {
    *  - no provider call (the whole point of the passive path);
    *  - no memory read, no memory write, no extraction and no automatic-threshold
    *    buffer (three ordinary messages must never look like a remember request);
-   *  - no requester context, so ambient chatter cannot be attributed to whoever
-   *    asks next;
+   *  - no persistent memory or provider call; the same trusted sender is retained
+   *    only in its own bounded requester-local session view;
    *  - no outbound: this method cannot return anything.
    *
    * The method is synchronous on purpose. Ambience is best-effort, so there is
@@ -417,6 +481,23 @@ export class ProductionChatAgent implements AgentExecutor {
       publicDisplayName: passive.publicDisplayName,
       text: passive.text,
       timestamp: passive.timestamp,
+    })
+    const label = this.speakerLabels.labelFor({
+      conversationType: 'GROUP',
+      conversationId: passive.conversationId,
+      requesterId: passive.requesterId,
+      requesterRole: 'MEMBER',
+      ownerDisplayName: null,
+      senderName: null,
+      senderId: passive.senderId,
+    })
+    this.requesterLocal.append(passive.conversationId, passive.requesterId, {
+      senderId: passive.senderId,
+      senderName: label,
+      publicDisplayName: passive.publicDisplayName,
+      text: passive.text,
+      timestamp: passive.timestamp,
+      messageId: passive.messageId,
     })
   }
 
@@ -479,6 +560,19 @@ export class ProductionChatAgent implements AgentExecutor {
           timestamp: pending.timestamp,
           ...(pending.replyToSpeakerId === undefined ? {} : { replyToSpeakerId: pending.replyToSpeakerId }),
         })
+        if (pending.replyToSpeakerId !== undefined) {
+          this.requesterLocal.append(pending.conversationId, pending.replyToSpeakerId, {
+            senderId: 'ASSISTANT',
+            senderName: ASSISTANT_LABEL,
+            text: pending.text,
+            timestamp: pending.timestamp,
+            messageId: `assistant:${pending.requestMessageId}`,
+          })
+          // Compaction is scheduled only after a real active GROUP reply is
+          // acknowledged SENT. The scheduler defers the provider call so this
+          // ACK path never waits for or joins the foreground response.
+          this.topicCompactor?.schedule(pending.conversationId)
+        }
       }
     })
     if (this.persistentLog) {
@@ -595,6 +689,12 @@ export class ProductionChatAgent implements AgentExecutor {
       // of another member stays in the sentence as real user text.
       text: questionText,
       timestamp: request.timestamp,
+      messageId: request.messageId,
+    }
+    if (request.conversationType === 'GROUP') {
+      // Retain the inbound turn for the next request. The assembler excludes
+      // this event id so it is rendered only as CURRENT_REQUEST this turn.
+      this.requesterLocal.append(request.conversationId, request.requesterId, question)
     }
     const textShape = describeUserText(wireBody, spanFacts, userContentSpan)
     // The transcript window and the event ids it covers come from ONE selection
@@ -610,21 +710,30 @@ export class ProductionChatAgent implements AgentExecutor {
       ? splitActiveContext(window.messages, request.requesterId, request.senderId, label)
       : { currentRequester: [], otherMembers: [] }
 
-    // Ambient is read before this message is appended, and the message id is
-    // excluded as well: the request being answered right now is the active
-    // request, and it must never be rendered a second time as ambience.
-    //
-    // Earlier @-messages ARE in both stores; they are excluded here by event id so
-    // the ambient section complements the transcript instead of duplicating it.
-    const ambient = request.conversationType === 'GROUP'
-      ? this.ambient.select(request.conversationId, {
-          // The store's own clock decides expiry: TTL is wall-clock time, not a
-          // value the wire can influence.
-          currentRequesterId: request.requesterId,
-          excludeMessageId: request.messageId,
-          excludeEventIds: window.eventIds,
-        }).lines
-      : []
+    const mixedGroupContext: GroupConversationContext | undefined = request.conversationType === 'GROUP'
+      ? stabilizeActiveAmbientLabels(
+          this.groupContextAssembler.assemble({
+            groupConversationId: request.conversationId,
+            requesterIdentity: request.requesterId,
+            currentEventId: request.messageId,
+            activeEventIds: activeContext.currentRequester
+              .map((message) => message.messageId)
+              .filter((messageId): messageId is string => messageId !== undefined),
+            currentTurn: question,
+            currentSpeakerLabel: label,
+          }),
+          window.messages,
+        )
+      : undefined
+    const ambient = mixedGroupContext?.recentGroupAmbient ?? []
+    if (mixedGroupContext !== undefined) {
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
+        'GROUP_CONTEXT_ASSEMBLY',
+        { ...mixedGroupContext.diagnostics },
+      )
+    }
 
     const groupStyle = request.conversationType === 'GROUP'
       ? observeGroupStyle({
@@ -777,7 +886,7 @@ export class ProductionChatAgent implements AgentExecutor {
     const memberInteractionProfile = request.conversationType === 'GROUP'
       ? deriveMemberInteractionProfile({
           authorizedPersonalMemory: memory.filter((item) => item.scope === 'PERSONAL'),
-          recentRequesterActiveContext: activeContext.currentRequester,
+          recentRequesterActiveContext: mixedGroupContext?.requesterLocalContext ?? activeContext.currentRequester,
           groupStyle,
         })
       : undefined
@@ -787,12 +896,18 @@ export class ProductionChatAgent implements AgentExecutor {
       window.messages,
       ambient,
       memory,
-      activeContext,
+      mixedGroupContext === undefined
+        ? activeContext
+        : {
+            currentRequester: [...mixedGroupContext.requesterLocalContext],
+            otherMembers: [],
+          },
       conversationDynamics,
       request,
       runtimeTime,
       deadline,
       msgIdToken,
+      mixedGroupContext,
     )
 
     deadlineDiagnostics.preFinalRemainingMs = deadline.remainingMs()
@@ -821,12 +936,16 @@ export class ProductionChatAgent implements AgentExecutor {
         memberInteractionProfile,
         conversationDynamics,
         groupReplyPressure,
+        // Preserve the existing structural split for Planner/diagnostic callers.
+        // The final GROUP prompt uses the explicit mixed context below, so these
+        // legacy views are not rendered as an additional prompt section.
         currentRequesterActiveContext: request.conversationType === 'GROUP'
           ? activeContext.currentRequester
           : undefined,
         otherMemberActiveContext: request.conversationType === 'GROUP'
           ? activeContext.otherMembers
           : undefined,
+        groupConversationContext: mixedGroupContext,
         webSearch,
       },
       guardValues(request),
@@ -1027,6 +1146,7 @@ export class ProductionChatAgent implements AgentExecutor {
     runtimeTime: RuntimeTimeFacts,
     deadline: RequestDeadline,
     msgIdToken: string,
+    mixedGroupContext?: GroupConversationContext,
   ): Promise<{
     used: boolean
     status: 'PASS' | 'FAILED'
@@ -1053,6 +1173,7 @@ export class ProductionChatAgent implements AgentExecutor {
         otherMemberActiveContext: request.conversationType === 'GROUP'
           ? activeContext.otherMembers
           : undefined,
+        groupConversationContext: mixedGroupContext,
         conversationDynamics,
       },
       guardValues(request),
@@ -1589,6 +1710,8 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
     ownerPrivateDispatchPlanner: new OwnerPrivateDispatchPlanner(
       (system, user, deadline, msgIdToken) => chatService.completeStructured(system, user, deadline, msgIdToken),
     ),
+    topicCapsuleCompletion: (system, user, deadline, msgIdToken) =>
+      chatService.completeStructured(system, user, deadline, msgIdToken),
   })
 }
 
