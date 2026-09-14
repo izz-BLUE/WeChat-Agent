@@ -34,6 +34,15 @@ export interface GroupConversationContextDiagnostics {
   topicCapsuleSelected: number
   topicCapsuleExpiredDropped: number
   topicBudgetTruncated: boolean
+  ambientHighSelected: number
+  ambientNormalSelected: number
+  ambientLowSelected: number
+  ambientAdjacencyAdded: number
+  ambientDuplicateDropped: number
+  topicSelectedByLexical: number
+  topicSelectedByRecency: number
+  topicStalePenaltyApplied: number
+  answerContextSources: string
   currentEventDroppedFromAmbient: boolean
   crossRequesterLocalDropped: number
   crossGroupDropped: number
@@ -85,6 +94,7 @@ export class GroupConversationContextAssembler {
       {
         maxSelected: this.options.topicCapsuleMaxSelected,
         maxChars: this.options.topicCapsuleMaxChars,
+        recentAmbient: this.groupAmbient.recentEvents(input.groupConversationId),
       },
     ) ?? {
       capsules: [] as readonly TopicContextItem[],
@@ -92,6 +102,9 @@ export class GroupConversationContextAssembler {
       selectedCount: 0,
       expiredDropped: 0,
       budgetTruncated: false,
+      selectedByLexical: 0,
+      selectedByRecency: 0,
+      stalePenaltyApplied: 0,
     }
     const compactedSourceEventIds = this.options.topicCapsuleStore?.coveredSourceEventIds(input.groupConversationId)
     const ambient = this.groupAmbient.select(input.groupConversationId, {
@@ -130,6 +143,15 @@ export class GroupConversationContextAssembler {
         topicCapsuleSelected: topic.selectedCount,
         topicCapsuleExpiredDropped: topic.expiredDropped,
         topicBudgetTruncated: topic.budgetTruncated,
+        ambientHighSelected: ambient.highSelected,
+        ambientNormalSelected: ambient.normalSelected,
+        ambientLowSelected: ambient.lowSelected,
+        ambientAdjacencyAdded: ambient.adjacencyAdded,
+        ambientDuplicateDropped: ambient.duplicateDropped,
+        topicSelectedByLexical: topic.selectedByLexical,
+        topicSelectedByRecency: topic.selectedByRecency,
+        topicStalePenaltyApplied: topic.stalePenaltyApplied,
+        answerContextSources: contextSourceSummary(local.selectedCount, ambient.selectedCount, topic.selectedCount),
         currentEventDroppedFromAmbient: ambient.currentEventDropped > 0,
         crossRequesterLocalDropped: local.crossRequesterLocalDropped,
         crossGroupDropped: local.crossGroupDropped,
@@ -138,6 +160,15 @@ export class GroupConversationContextAssembler {
       },
     }
   }
+}
+
+function contextSourceSummary(localCount: number, ambientCount: number, topicCount: number): string {
+  return [
+    'CURRENT',
+    ...(localCount > 0 ? ['LOCAL'] : []),
+    ...(ambientCount > 0 ? ['AMBIENT'] : []),
+    ...(topicCount > 0 ? ['TOPIC'] : []),
+  ].join('+')
 }
 
 function providerSafeMessage(message: GroupMessage): GroupConversationPromptMessage {

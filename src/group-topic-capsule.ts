@@ -21,6 +21,8 @@ export interface GroupTopicCapsulePromptItem {
   summary: string
   keywords: readonly string[]
   speakerTypes: readonly GroupTopicSpeakerType[]
+  /** Derived at selection time; the stored Capsule is never modified. */
+  potentiallyStale?: boolean
 }
 
 export interface GroupTopicCapsule {
@@ -63,6 +65,9 @@ export interface GroupTopicCapsuleSelection {
   selectedCount: number
   expiredDropped: number
   budgetTruncated: boolean
+  selectedByLexical: number
+  selectedByRecency: number
+  stalePenaltyApplied: number
 }
 
 export interface GroupTopicCapsuleStoreWriteResult {
@@ -165,21 +170,37 @@ export class GroupTopicCapsuleStore {
     }
   }
 
-  public select(groupConversationId: string, query: string, options: { maxSelected?: number; maxChars?: number; now?: number } = {}): GroupTopicCapsuleSelection {
+  public select(
+    groupConversationId: string,
+    query: string,
+    options: {
+      maxSelected?: number
+      maxChars?: number
+      now?: number
+      recentAmbient?: readonly { text: string; timestamp: number }[]
+    } = {},
+  ): GroupTopicCapsuleSelection {
     const now = options.now ?? this.clock()
     const expiredDropped = this.prune(groupConversationId, now)
     const entries = this.capsulesByGroup.get(groupConversationId) ?? []
     const maxSelected = Math.max(0, Math.min(options.maxSelected ?? this.maxSelected, this.maxSelected))
     const maxChars = Math.max(0, Math.min(options.maxChars ?? this.maxChars, this.maxChars))
     const queryTokens = lexicalTokens(query)
-    const ranked = entries.map((capsule) => ({ capsule, score: relevanceScore(capsule, queryTokens) }))
-    const relevance = ranked.filter((item) => item.score > 0).sort((left, right) => this.compareRanked(left, right))
-    const recency = [...ranked].sort((left, right) => this.compareRecency(left, right))
+    const ranked = entries.map((capsule) => ({
+      capsule,
+      score: relevanceScore(capsule, queryTokens),
+      stalePenalty: isPotentiallyStale(capsule, options.recentAmbient ?? []),
+    }))
+    const relevance = ranked.filter((item) => item.score > 0)
+    const recency = ranked.filter((item) => item.score === 0)
     const ordered = [
-      ...relevance,
-      ...recency.filter((item) => !relevance.some((selected) => selected.capsule.capsuleId === item.capsule.capsuleId)),
+      ...relevance.filter((item) => !item.stalePenalty).sort((left, right) => this.compareRanked(left, right)),
+      ...relevance.filter((item) => item.stalePenalty).sort((left, right) => this.compareRanked(left, right)),
+      ...recency.filter((item) => !item.stalePenalty).sort((left, right) => this.compareRecency(left, right)),
+      ...recency.filter((item) => item.stalePenalty).sort((left, right) => this.compareRecency(left, right)),
     ]
     const selected: GroupTopicCapsule[] = []
+    const selectedItems: typeof ranked = []
     let chars = 0
     let budgetTruncated = false
     for (const item of ordered) {
@@ -193,16 +214,20 @@ export class GroupTopicCapsuleStore {
         break
       }
       selected.push(item.capsule)
+      selectedItems.push(item)
       chars += capsuleChars
       item.capsule.lastReferencedAt = now
     }
     if (selected.length < entries.length && selected.length >= maxSelected) budgetTruncated = true
     return {
-      capsules: selected.map(toPromptItem),
+      capsules: selectedItems.map((item) => toPromptItem(item.capsule, item.stalePenalty)),
       availableCount: entries.length,
       selectedCount: selected.length,
       expiredDropped,
       budgetTruncated,
+      selectedByLexical: selectedItems.filter((item) => item.score > 0).length,
+      selectedByRecency: selectedItems.filter((item) => item.score === 0).length,
+      stalePenaltyApplied: selectedItems.filter((item) => item.stalePenalty).length,
     }
   }
 
@@ -485,8 +510,14 @@ function normalizeDraft(draft: GroupTopicCapsuleDraft, summaryMaxChars: number):
   return { topic, summary, keywords, sourceEventIds, sourceStartAt: draft.sourceStartAt, sourceEndAt: draft.sourceEndAt, speakerTypes }
 }
 
-function toPromptItem(capsule: GroupTopicCapsule): GroupTopicCapsulePromptItem {
-  return { topic: capsule.topic, summary: capsule.summary, keywords: [...capsule.keywords], speakerTypes: [...capsule.speakerTypes] }
+function toPromptItem(capsule: GroupTopicCapsule, potentiallyStale = false): GroupTopicCapsulePromptItem {
+  return {
+    topic: capsule.topic,
+    summary: capsule.summary,
+    keywords: [...capsule.keywords],
+    speakerTypes: [...capsule.speakerTypes],
+    potentiallyStale,
+  }
 }
 
 function relevanceScore(capsule: GroupTopicCapsule, queryTokens: ReadonlySet<string>): number {
@@ -501,6 +532,40 @@ function relevanceScore(capsule: GroupTopicCapsule, queryTokens: ReadonlySet<str
     if (summaryTokens.has(token)) score += 2
   }
   return score
+}
+
+/**
+ * A stale penalty is deliberately weak evidence: a newer raw line shares a
+ * topic/key term with the Capsule. It never deletes or rewrites the Capsule.
+ */
+function isPotentiallyStale(
+  capsule: GroupTopicCapsule,
+  recentAmbient: readonly { text: string; timestamp: number }[],
+): boolean {
+  const capsuleKeywords = capsule.keywords
+    .map(normalizeComparableText)
+    .filter((keyword) => keyword.length >= 2)
+  const capsuleTopic = normalizeComparableText(capsule.topic)
+  const capsuleTokens = lexicalTokens([capsule.topic, ...capsule.keywords].join(' '))
+  return recentAmbient.some((recent) => {
+    if (!Number.isFinite(recent.timestamp) || recent.timestamp <= capsule.sourceEndAt) return false
+    const recentText = normalizeComparableText(recent.text)
+    if (recentText.length === 0) return false
+    if ((capsuleTopic.length >= 2 && recentText.includes(capsuleTopic)) ||
+        capsuleKeywords.some((keyword) => recentText.includes(keyword))) {
+      return true
+    }
+    const recentTokens = lexicalTokens(recent.text)
+    let overlap = 0
+    for (const token of capsuleTokens) {
+      if (token.length >= 2 && recentTokens.has(token)) overlap += 1
+    }
+    return overlap >= 2
+  })
+}
+
+function normalizeComparableText(text: string): string {
+  return text.replace(/\s+/gu, '').trim().toLocaleLowerCase()
 }
 
 function capsulePromptChars(capsule: GroupTopicCapsule): number {

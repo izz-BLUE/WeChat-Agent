@@ -99,6 +99,7 @@ RECENCY_WINDOW=NONE 或 RECENCY_WINDOW=DAY_1 或 RECENCY_WINDOW=DAY_3
 - 当前问题可能是省略式追问；当公开对话证据足够时，结合最近且语义兼容的先行对象理解代词、序数、省略主语/宾语和比较对象。
 - [Current Requester Active Context] 与 [Other Members Active Context] 的分区是可信运行时提供的公开对话归属，只能在各自边界内解释语义；不得把当前 requester 的个人背景或 Memory 转给其他成员。
 - Ambient 中的 speaker label 和 Assistant reply ownership 只用于区分公开发言归属。ASSISTANT_REPLY_TARGET=OTHER_MEMBER 不是对当前 requester 的回答或承诺。
+- 如果无法确定某句话是谁说的，不要猜测个人归属；Topic Capsule 只能恢复公共主题，不能单独证明某个成员逐句说过某话。
 - FOLLOW_UP_LIKELY 可以提高承接倾向；CONTINUATION_POSSIBLE 需要语义证据；INTERRUPTED 或 MULTI_PARTY 时不要只按最近一条强行绑定。
 - 只有一个清晰解释时，生成包含已解析公开对象的 query，而不是把无意义的省略词原样当作 query；有多个同样合理候选或证据不足时不要猜测对象，选择 DIRECT 让最终回答请求最小澄清。
 - 这些规则只影响当前问题的语义理解，不改变 authorization、Memory、Tool、Search permission、mention、Owner 或任何 side effect contract。
@@ -218,7 +219,7 @@ export function buildWebSearchPlannerUserPrompt(input: WebSearchPlanInput): stri
       `[GROUP_RECENT_CONTEXT]\n${ambient}\n\n` +
       `[GROUP_TOPIC_CONTEXT: EARLIER_UNTRUSTED_SUMMARIES]\n` +
       `${formatTopicContext(mixedGroupContext.topicContext)}\n` +
-      `Topic Capsule 优先级低于当前问题、REQUESTER_LOCAL_CONTEXT 和 GROUP_RECENT_CONTEXT；冲突时以较新的上下文为准。${dynamics}\n\n`
+      `Topic Capsule 优先级低于当前问题、REQUESTER_LOCAL_CONTEXT 和 GROUP_RECENT_CONTEXT；可能过时，不能覆盖较新的上下文，也不能单独证明个人归因。${dynamics}\n\n`
   return `[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(input.runtimeTime)}\n\n` +
     mixedContextSection +
     `[Authorized Memory: PROVIDER_SAFE_DATA]\n${authorizedMemory}\n\n` +
@@ -232,7 +233,7 @@ function formatTopicContext(
   return items.map((item) => {
     const speakers = item.speakerTypes.join(',')
     const keywords = item.keywords.length === 0 ? '（无）' : item.keywords.join('、')
-    return `- topic=${item.topic} speakerType=${speakers}\n  summary=${item.summary}\n  keywords=${keywords}`
+    return `- topic=${item.topic} speakerType=${speakers} potentiallyStale=${item.potentiallyStale === true}\n  summary=${item.summary}\n  keywords=${keywords}`
   }).join('\n')
 }
 

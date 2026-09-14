@@ -742,10 +742,12 @@ export class ProductionChatAgent implements AgentExecutor {
             speakerType: 'MEMBER' as const,
             eventId: message.messageId,
           })),
-          groupAmbientContext: ambient.map((line) => ({
-            text: line.text,
-            speakerType: line.label === ASSISTANT_LABEL ? 'ASSISTANT' as const : 'MEMBER' as const,
-            eventId: line.messageId,
+          // Style must observe the raw bounded ambient transcript, not the
+          // quality-ranked/de-duplicated provider selection above.
+          groupAmbientContext: this.ambient.entries(request.conversationId).map((entry) => ({
+            text: entry.text,
+            speakerType: entry.speakerType,
+            eventId: entry.messageId,
           })),
         })
       : undefined

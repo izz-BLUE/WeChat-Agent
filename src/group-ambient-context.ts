@@ -28,8 +28,9 @@
  * Hard bounds — both apply, neither replaces the other:
  *  - `maxEntries`: the newest N entries survive per group;
  *  - `ttlMs`: an entry older than the TTL is dropped at the next touch.
- * A final render budget keeps 30 long messages from blowing up the prompt; the
- * most recent lines win.
+ * A final render budget keeps 30 long messages from blowing up the prompt;
+ * informative recent lines win, with bounded neighborhood support and LOW-value
+ * lines used only when budget remains.
  *
  * Privacy: entries keep the trusted runtime identity in memory purely to tell
  * two speakers apart. It is never rendered, never logged and never stored. Logs
@@ -56,6 +57,9 @@ export const CURRENT_REQUESTER_LABEL = 'CURRENT_REQUESTER'
 export const ASSISTANT_LABEL = 'ASSISTANT'
 
 export type AmbientSpeakerType = 'MEMBER' | 'ASSISTANT'
+
+/** Small, explainable quality class used only while selecting ambient context. */
+export type AmbientInformationQuality = 'HIGH' | 'NORMAL' | 'LOW'
 
 /** Provider-safe relation between an assistant line and the current turn. */
 export type AmbientReplyTarget = 'CURRENT_REQUESTER' | 'OTHER_MEMBER' | 'UNKNOWN' | 'NONE'
@@ -122,6 +126,12 @@ export interface AmbientRenderRequest {
   maxChars?: number
 }
 
+/** Provider-independent raw recent text used by deterministic Topic stale checks. */
+export interface AmbientRecentEvent {
+  text: string
+  timestamp: number
+}
+
 export interface AmbientSelection {
   lines: readonly AmbientLine[]
   /** Entries that survived the TTL and every exclusion for this render. */
@@ -136,6 +146,14 @@ export interface AmbientSelection {
   currentEventDropped: number
   /** Entries omitted because a Topic Capsule already covers them. */
   compactedDropped: number
+  /** Selected informative events, split by the deterministic quality class. */
+  highSelected: number
+  normalSelected: number
+  lowSelected: number
+  /** Selected lines added only to keep a small preceding neighborhood. */
+  adjacencyAdded: number
+  /** Short LOW-value consecutive duplicates omitted by selection; the store is unchanged. */
+  duplicateDropped: number
 }
 
 export interface AmbientCompactionSelection {
@@ -173,6 +191,7 @@ export interface GroupAmbientContextOptions {
 export const DEFAULT_AMBIENT_MAX_ENTRIES = 30
 export const DEFAULT_AMBIENT_TTL_MS = 30 * 60 * 1000
 export const DEFAULT_AMBIENT_MAX_CHARS = 4000
+export const DEFAULT_AMBIENT_ADJACENCY_LOOKBACK = 2
 
 /**
  * Per-group ambient transcript. Every mutating path prunes first, so a reader can
@@ -272,36 +291,77 @@ export class GroupAmbientContext {
       ? undefined
       : new Set(request.excludeCompactedEventIds)
 
-    const withoutActive = entries.filter(
-      (entry) => request.excludeMessageId === undefined || entry.messageId !== request.excludeMessageId,
+    const indexedEntries = entries.map((entry, sourceIndex) => ({ entry, sourceIndex }))
+    const withoutActive = indexedEntries.filter(
+      ({ entry }) => request.excludeMessageId === undefined || entry.messageId !== request.excludeMessageId,
     )
     const currentEventDropped = entries.length - withoutActive.length
     const withoutCompacted = compacted === undefined
       ? withoutActive
-      : withoutActive.filter((entry) => !compacted.has(topicSourceEventId(groupKey, entry.messageId)))
+      : withoutActive.filter(({ entry }) => !compacted.has(topicSourceEventId(groupKey, entry.messageId)))
     const compactedDropped = withoutActive.length - withoutCompacted.length
     const eligible = renderedElsewhere === undefined
       ? withoutCompacted
-      : withoutCompacted.filter((entry) => !renderedElsewhere.has(entry.messageId))
+      : withoutCompacted.filter(({ entry }) => !renderedElsewhere.has(entry.messageId))
     const crossContextDropped = withoutCompacted.length - eligible.length
 
     const limit = Math.max(0, Math.min(request.limit ?? this.maxEntries, this.maxEntries))
     const maxChars = Math.max(0, Math.min(request.maxChars ?? this.maxChars, this.maxChars))
-    const lines: AmbientLine[] = []
+    const candidates = eligible.map(({ entry, sourceIndex }, index) => ({
+      entry,
+      index,
+      sourceIndex,
+      quality: classifyAmbientInformationQuality(entry.text),
+    }))
+    const duplicateIndexes = findConsecutiveShortDuplicateIndexes(candidates)
+    const selectedIndexes = new Set<number>()
+    const adjacencyIndexes = new Set<number>()
     let chars = 0
 
-    for (let index = eligible.length - 1; index >= 0 && lines.length < limit; index -= 1) {
-      const entry = eligible[index]
-      const label = this.renderLabel(groupKey, entry, request.currentRequesterId)
-      const displayLabel = entry.publicDisplayName ?? label
-      const lineChars = displayLabel.length + entry.text.length + 2
-      // The budget always keeps the most recent line, even when that single line
-      // is longer than the whole budget: an empty ambient section would be worse.
-      if (lines.length > 0 && chars + lineChars > maxChars) {
-        break
-      }
+    const trySelect = (index: number, adjacency = false): boolean => {
+      if (selectedIndexes.has(index) || duplicateIndexes.has(index) || selectedIndexes.size >= limit) return false
+      const candidate = candidates[index]
+      if (!candidate) return false
+      const renderedLabel = this.renderLabel(groupKey, candidate.entry, request.currentRequesterId)
+      const lineChars = (candidate.entry.publicDisplayName ?? renderedLabel).length + candidate.entry.text.length + 2
+      // The budget always keeps the most recent selected line, even when that
+      // single line is longer than the whole budget: an empty section is worse.
+      if (selectedIndexes.size > 0 && chars + lineChars > maxChars) return false
+      selectedIndexes.add(index)
+      if (adjacency) adjacencyIndexes.add(index)
+      chars += lineChars
+      return true
+    }
 
-      lines.unshift({
+    // Recent informative events are the primary ambient evidence. LOW events
+    // are considered only after that evidence and its neighborhood.
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const candidate = candidates[index]
+      if (candidate !== undefined && candidate.quality !== 'LOW') trySelect(index)
+    }
+
+    // Preserve a small selection neighborhood for already selected evidence.
+    const primaryIndexes = [...selectedIndexes]
+    for (const selectedIndex of primaryIndexes) {
+      for (let offset = 1; offset <= DEFAULT_AMBIENT_ADJACENCY_LOOKBACK; offset += 1) {
+        const supportIndex = selectedIndex - offset
+        if (supportIndex < 0) break
+        trySelect(supportIndex, true)
+      }
+    }
+
+    // LOW is de-prioritized, not deleted. It can fill remaining entry/character
+    // budget after informative events and adjacency support.
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const candidate = candidates[index]
+      if (candidate !== undefined && candidate.quality === 'LOW') trySelect(index)
+    }
+
+    const lines = [...selectedIndexes].sort((left, right) => left - right).map((index) => {
+      const entry = candidates[index]?.entry
+      if (!entry) throw new Error('ambient selection index out of range')
+      const label = this.renderLabel(groupKey, entry, request.currentRequesterId)
+      return {
         label,
         publicDisplayName: entry.publicDisplayName,
         text: entry.text,
@@ -309,18 +369,26 @@ export class GroupAmbientContext {
         ...(entry.speakerType === 'ASSISTANT'
           ? { replyTarget: resolveReplyTarget(entry.replyToSpeakerId, request.currentRequesterId) }
           : {}),
-      })
-      chars += lineChars
-    }
+      }
+    })
+    const selectedCandidates = [...selectedIndexes].map((index) => candidates[index]).filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined)
+    const highSelected = selectedCandidates.filter((candidate) => candidate.quality === 'HIGH').length
+    const normalSelected = selectedCandidates.filter((candidate) => candidate.quality === 'NORMAL').length
+    const lowSelected = selectedCandidates.filter((candidate) => candidate.quality === 'LOW').length
 
     const selection: AmbientSelection = {
       lines,
       availableCount: eligible.length,
-      selectedCount: lines.length,
+      selectedCount: selectedIndexes.size,
       expiredDropped,
       crossContextDropped,
       currentEventDropped,
       compactedDropped,
+      highSelected,
+      normalSelected,
+      lowSelected,
+      adjacencyAdded: adjacencyIndexes.size,
+      duplicateDropped: duplicateIndexes.size,
     }
     this.diagnoseRead(selection)
     return selection
@@ -336,6 +404,15 @@ export class GroupAmbientContext {
   public entries(groupKey: string): readonly AmbientEntryInput[] {
     this.prune(groupKey, this.clock())
     return (this.entriesByGroup.get(groupKey) ?? []).map(({ storedAt: _storedAt, ...entry }) => ({ ...entry }))
+  }
+
+  /** Raw, bounded recent text for deterministic consumers such as stale checks. */
+  public recentEvents(groupKey: string): readonly AmbientRecentEvent[] {
+    this.prune(groupKey, this.clock())
+    return (this.entriesByGroup.get(groupKey) ?? []).map((entry) => ({
+      text: entry.text,
+      timestamp: entry.timestamp,
+    }))
   }
 
   /**
@@ -505,6 +582,44 @@ function resolveReplyTarget(replyToSpeakerId: string | undefined, currentRequest
   }
   return 'OTHER_MEMBER'
 }
+
+/**
+ * Conservative classifier: short does not imply LOW. The explicit allow-list
+ * and structural checks intentionally leave ordinary short statements alone.
+ */
+export function classifyAmbientInformationQuality(text: string): AmbientInformationQuality {
+  const normalized = normalizeAmbientText(text)
+  if (normalized.length === 0) return 'LOW'
+  if (/^[\p{P}\p{S}]+$/u.test(normalized) || /^(?:\p{Extended_Pictographic})+$/u.test(normalized)) return 'LOW'
+  if (/^(?:好|行|嗯|ok|1|\+1|确实|牛|[?？])$/iu.test(normalized)) return 'LOW'
+  const characters = [...normalized]
+  if (characters.length >= 2 && characters.every((character) => character === characters[0])) return 'LOW'
+  if (/^(?:哈{2,}|呵{2,}|嘿{2,}|(?:ha){2,}|lol+)$/iu.test(normalized)) return 'LOW'
+  if (characters.length >= 24) return 'HIGH'
+  return 'NORMAL'
+}
+
+function normalizeAmbientText(text: string): string {
+  return text.replace(/\s+/gu, '').trim().toLocaleLowerCase()
+}
+
+function findConsecutiveShortDuplicateIndexes(
+  candidates: readonly { entry: AmbientStoredEntry; index: number; sourceIndex: number; quality: AmbientInformationQuality }[],
+): Set<number> {
+  const duplicateIndexes = new Set<number>()
+  for (let index = candidates.length - 1; index > 0; index -= 1) {
+    const current = candidates[index]
+    const previous = candidates[index - 1]
+    if (!current || !previous) continue
+    const currentText = normalizeAmbientText(current.entry.text)
+    const previousText = normalizeAmbientText(previous.entry.text)
+    if (current.sourceIndex !== previous.sourceIndex + 1 || current.quality !== 'LOW' || previous.quality !== 'LOW' || currentText.length > 32 || previousText.length > 32 || currentText.length === 0 || currentText !== previousText) continue
+    // Walk backward through a run while retaining only its newest occurrence.
+    duplicateIndexes.add(previous.index)
+  }
+  return duplicateIndexes
+}
+
 
 function redactCompactionText(text: string, rawValues: readonly (string | undefined)[]): string {
   let safe = text
