@@ -4,6 +4,7 @@ import {
   sanitizeFinalAnswer,
 } from './final-answer.js'
 import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
+import type { ProviderPhase } from './provider-cache-usage.js'
 
 export type OwnerPrivateDispatchAction = 'NOOP' | 'DISPATCH'
 
@@ -32,7 +33,7 @@ export interface OwnerPrivateDispatchPlannerLike {
 }
 
 export interface StructuredOwnerPrivateDispatchCompletion {
-  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string): Promise<string>
+  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string, phase?: ProviderPhase): Promise<string>
 }
 
 const PLANNER_SYSTEM_PROMPT = `你是 Owner Private Dispatch Planner，只负责判断已验证 OWNER 的 DIRECT 私聊请求是否应向已经绑定的 GROUP 另行发送一条消息。
@@ -188,6 +189,7 @@ export class OwnerPrivateDispatchPlanner implements OwnerPrivateDispatchPlannerL
           userPrompt,
           deadline,
           msgIdToken,
+          'OWNER_PRIVATE_DISPATCH_PLANNER',
         )
         deadline?.throwIfExpired()
       } catch (error) {

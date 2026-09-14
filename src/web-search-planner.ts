@@ -7,6 +7,7 @@ import { detectProviderControlMarkup, ProviderControlMarkupError } from './final
 import { formatRuntimeTimeFacts, type RuntimeTimeFacts } from './runtime-time.js'
 import type { WebSearchMode } from './web-search.js'
 import { isRequestDeadlineExceeded, type RequestDeadline } from './request-deadline.js'
+import type { ProviderPhase } from './provider-cache-usage.js'
 
 export type WebSearchAction = 'DIRECT' | 'SEARCH'
 export type WebSearchRecencyWindow = 'NONE' | 'DAY_1' | 'DAY_3'
@@ -57,7 +58,7 @@ export interface WebSearchPlannerResult {
 }
 
 export interface StructuredCompletion {
-  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string): Promise<string>
+  (systemPrompt: string, userContent: string, deadline?: RequestDeadline, msgIdToken?: string, phase?: ProviderPhase): Promise<string>
 }
 
 export interface WebSearchPlannerLike {
@@ -220,9 +221,9 @@ export function buildWebSearchPlannerUserPrompt(input: WebSearchPlanInput): stri
       `[GROUP_TOPIC_CONTEXT: EARLIER_UNTRUSTED_SUMMARIES]\n` +
       `${formatTopicContext(mixedGroupContext.topicContext)}\n` +
       `Topic Capsule 优先级低于当前问题、REQUESTER_LOCAL_CONTEXT 和 GROUP_RECENT_CONTEXT；可能过时，不能覆盖较新的上下文，也不能单独证明个人归因。${dynamics}\n\n`
-  return `[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(input.runtimeTime)}\n\n` +
-    mixedContextSection +
+  return mixedContextSection +
     `[Authorized Memory: PROVIDER_SAFE_DATA]\n${authorizedMemory}\n\n` +
+    `[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(input.runtimeTime)}\n\n` +
     `[Canonical Current Question]\n${input.question}`
 }
 
@@ -347,6 +348,7 @@ export class WebSearchPlanner implements WebSearchPlannerLike {
         userPrompt,
         deadline,
         msgIdToken,
+        'WEB_SEARCH_PLANNER',
       )
       deadline?.throwIfExpired()
 

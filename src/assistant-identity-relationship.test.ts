@@ -118,13 +118,14 @@ async function testTrustedAssistantFactsGroundThePrompt(): Promise<void> {
     memory: [],
   }
   const prompt = buildUserPrompt([], question, request)
-  assert(prompt.includes('BOT_DISPLAY_NAME=椰椰'), 'trusted bot display name was not grounded')
-  assert(prompt.includes('BOT_IDENTITY_CLASS=AI_GROUP_MEMBER'), 'assistant identity class was not grounded')
-  assert(prompt.includes('BOT_IDENTITY_SOURCE=TRUSTED_RUNTIME'), 'assistant identity source was not grounded')
-  assert(prompt.includes('BOT_IDENTITY_MUTATION_THIS_TURN=NONE'), 'identity mutation fact was not grounded')
-  assert(prompt.includes('ASSISTANT_RELATIONSHIP_FACTS_PROVIDED=false'), 'relationship absence fact was not grounded')
-  assert(buildSystemPrompt('椰椰').includes('ADDRESS_LABEL ≠ RELATIONSHIP_FACT') ||
-    buildSystemPrompt('椰椰').includes('ADDRESS_PREFERENCE'), 'prompt did not separate address preference from relationship')
+  const systemPrompt = buildSystemPrompt('椰椰')
+  assert(systemPrompt.includes('BOT_DISPLAY_NAME=椰椰'), 'trusted bot display name was not grounded')
+  assert(systemPrompt.includes('BOT_IDENTITY_CLASS=AI_GROUP_MEMBER'), 'assistant identity class was not grounded')
+  assert(systemPrompt.includes('BOT_IDENTITY_SOURCE=TRUSTED_RUNTIME'), 'assistant identity source was not grounded')
+  assert(systemPrompt.includes('BOT_IDENTITY_MUTATION_THIS_TURN=NONE'), 'identity mutation fact was not grounded')
+  assert(systemPrompt.includes('ASSISTANT_RELATIONSHIP_FACTS_PROVIDED=false'), 'relationship absence fact was not grounded')
+  assert(systemPrompt.includes('ADDRESS_LABEL ≠ RELATIONSHIP_FACT') ||
+    systemPrompt.includes('ADDRESS_PREFERENCE'), 'prompt did not separate address preference from relationship')
 }
 
 async function testAssistantIdentityRegeneratesAtOutboundBoundary(): Promise<void> {

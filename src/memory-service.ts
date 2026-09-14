@@ -836,6 +836,7 @@ export class MemoryService {
         mutationUserPrompt(request.question, candidates),
         request.requestDeadline,
         request.msgIdToken,
+        'MEMORY_MUTATION',
       )
       request.requestDeadline?.throwIfExpired()
       parsedMutation = parseMemoryMutationDetailed(rawMutation)

@@ -9,7 +9,7 @@ import {
 import type { AgentRequest } from './agent-adapter.js'
 import type { GroupMessage } from './context.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
-import { RequestDeadline } from './request-deadline.js'
+import { isRequestDeadlineExceeded, RequestDeadline, withRequestDeadline } from './request-deadline.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import type { WebSearchProvider } from './web-search.js'
 
@@ -314,7 +314,7 @@ async function testTavilyTimeoutIsNotExpanded(): Promise<void> {
   assert.equal(capturedTimeout, 8_000)
 }
 
-function testOwnerFastPathDeadlineRegression(): void {
+function testRequestDeadlinePhaseAccounting(): void {
   let oldNow = 0
   const oldChain = new RequestDeadline(120, () => oldNow, 0)
   oldChain.mark('OWNER_DISPATCH_PLANNER')
@@ -338,45 +338,80 @@ function testOwnerFastPathDeadlineRegression(): void {
   assert.equal(fastChain.phaseLatencyMs('FINAL_ANSWER'), 70)
   assert.equal(fastChain.remainingMs(), 30)
   assert.equal(fastChain.expired(), false)
-  console.log('OWNER_FAST_PATH_DEADLINE_REGRESSION=PASS')
+  console.log('REQUEST_DEADLINE_PHASE_ACCOUNTING=PASS')
+}
+
+async function testPreProviderDeadlineFailClosed(): Promise<void> {
+  let fetchCalls = 0
+  const preExpiredAt = Date.now()
+  const preExpiredDeadline = new RequestDeadline(25, () => preExpiredAt + 25, preExpiredAt)
+  await withMockFetch(async () => {
+    fetchCalls += 1
+    return completionResponse('不应启动 Provider')
+  }, async () => {
+    const agent = new ProductionChatAgent(
+      new ChatService('https://provider.invalid/v1', 'test-key', 'test-model'),
+      {
+        requestDeadlineMs: 25,
+        requestDeadlineFactory: () => preExpiredDeadline,
+      },
+    )
+    const result = await agent.complete(REQUEST)
+    assert.equal(result, `${FALLBACK}${YEYE_REPLY_SIGNATURE}`)
+    assert.equal(fetchCalls, 0)
+    assert.notEqual(agent.takeOutboundIdentity(REQUEST, result), null)
+  })
+  console.log('PRE_PROVIDER_DEADLINE_FAIL_CLOSED=PASS')
+}
+
+async function testInFlightProviderAbort(): Promise<void> {
+  let fetchCalls = 0
+  let aborted = false
+  let triggerDeadline: (() => void) | undefined
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  globalThis.setTimeout = ((callback: (...args: unknown[]) => void) => {
+    triggerDeadline = () => callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as typeof globalThis.setTimeout
+  globalThis.clearTimeout = ((_handle: ReturnType<typeof setTimeout>) => {}) as typeof globalThis.clearTimeout
+
+  try {
+    const deadline = new RequestDeadline(1_000, () => 0, 0)
+    await withMockFetch(async (init) => {
+      fetchCalls += 1
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true
+          reject(Object.assign(new Error('provider aborted'), { name: 'AbortError' }))
+        }, { once: true })
+      })
+    }, async () => {
+      const completion = new ChatService('https://provider.invalid/v1', 'test-key', 'test-model').reply(
+        [],
+        FINAL_QUESTION,
+        FINAL_REQUEST,
+        [],
+        undefined,
+        FINAL_QUESTION.messageId,
+        deadline,
+      )
+      assert.equal(fetchCalls, 1)
+      assert.ok(triggerDeadline)
+      triggerDeadline?.()
+      await assert.rejects(completion, isRequestDeadlineExceeded)
+    })
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+  }
+
+  assert.equal(fetchCalls, 1)
+  assert.equal(aborted, true)
+  console.log('IN_FLIGHT_PROVIDER_ABORT=PASS')
 }
 
 async function run(): Promise<void> {
-  const originalFetch = globalThis.fetch
-  let fetchCalls = 0
-  let aborted = false
-
-  globalThis.fetch = async (_input, init) => {
-    fetchCalls += 1
-    const signal = init?.signal
-    return await new Promise<Response>((_resolve, reject) => {
-      signal?.addEventListener('abort', () => {
-        aborted = true
-        reject(Object.assign(new Error('provider aborted'), { name: 'AbortError' }))
-      }, { once: true })
-    })
-  }
-
-  try {
-    const agent = new ProductionChatAgent(
-      new ChatService('https://provider.invalid/v1', 'test-key', 'test-model'),
-      { requestDeadlineMs: 25 },
-    )
-    const result = await Promise.race([
-      agent.complete(REQUEST),
-      new Promise<string>((_resolve, reject) => {
-        setTimeout(() => reject(new Error('request deadline regression: complete hung')), 200)
-      }),
-    ])
-
-    assert.equal(result, `${FALLBACK}${YEYE_REPLY_SIGNATURE}`)
-    assert.equal(fetchCalls, 1)
-    assert.equal(aborted, true)
-    assert.notEqual(agent.takeOutboundIdentity(REQUEST, result), null)
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-
   await testDirectSufficient()
   await testFinalAnswerRunsWithLowBudget()
   await testProviderControlRepairBudgetGate()
@@ -385,9 +420,11 @@ async function run(): Promise<void> {
   await testGroundingRepairAllowed()
   await testGroundingRepairBudgetGate()
   await testTavilyTimeoutIsNotExpanded()
-  testOwnerFastPathDeadlineRegression()
-  console.log('[REQUEST_DEADLINE_CASE] cases=1,2,3,4,5,6,7,8 result=PASS')
+  testRequestDeadlinePhaseAccounting()
+  await testPreProviderDeadlineFailClosed()
+  await testInFlightProviderAbort()
+  console.log('[REQUEST_DEADLINE_CASE] cases=1,2,3,4,5,6,7,8,9,10 result=PASS')
 }
 
 await run()
-console.log('[REQUEST_DEADLINE_CASE] name=provider timeout returns one staged deterministic fallback result=PASS')
+console.log('[REQUEST_DEADLINE_CASE] name=deadline admission and in-flight abort contracts=PASS')

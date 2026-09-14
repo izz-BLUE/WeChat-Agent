@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { sanitizeFinalAnswer } from './final-answer.js'
 import { emitDiagnostic, type PersistentRuntimeLogSink } from './persistent-runtime-log.js'
 import { RequestDeadline, withRequestDeadline } from './request-deadline.js'
+import type { ProviderPhase } from './provider-cache-usage.js'
 
 export type GroupTopicSpeakerType = 'MEMBER' | 'ASSISTANT'
 
@@ -282,6 +283,7 @@ export type TopicCapsuleStructuredCompletion = (
   userContent: string,
   deadline?: RequestDeadline,
   msgIdToken?: string,
+  phase?: ProviderPhase,
 ) => Promise<string>
 
 export interface GroupTopicCapsuleCompactorOptions {
@@ -389,6 +391,7 @@ export class GroupTopicCapsuleCompactor {
           TOPIC_CAPSULE_SYSTEM_PROMPT,
           buildCompactorInput(selection.events),
           deadline,
+          'TOPIC_CAPSULE',
           'TOPIC_CAPSULE',
         ))
       } catch {
