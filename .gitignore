@@ -2,6 +2,12 @@ node_modules/
 dist/
 runtime-data/
 artifacts/
+.local/
+coverage/
+.vscode/
+.idea/
+*.dmp
+*.dump
 .env
 .env.*
 !.env.example

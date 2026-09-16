@@ -2,7 +2,20 @@
   "name": "wechat-ai-bot",
   "version": "0.1.0",
   "private": true,
-  "description": "Minimal Wechaty group AI assistant",
+  "license": "Apache-2.0",
+  "description": "TypeScript Agent for bounded WeChat group conversations, memory, web search, and Named Pipe runtime integration",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/izz-BLUE/WeChat-Agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/izz-BLUE/WeChat-Agent/issues"
+  },
+  "homepage": "https://github.com/izz-BLUE/WeChat-Agent#readme",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=7"
+  },
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
