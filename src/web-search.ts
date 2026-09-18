@@ -81,7 +81,7 @@ export function inspectGroundedSources(
     selectedSourceCount: selection.selected.length,
     removedDanglingMarkerCount,
     visibleMarkerCount: 0,
-    appendedSourceCount: selection.selected.length,
+    appendedSourceCount: 0,
     result: selection.selected.length > 0 ? 'PASS' : 'NO_REFERENCED_SOURCE',
   }
 }
@@ -964,7 +964,7 @@ function cleanupCitationPresentation(answer: string): string {
     .trim()
 }
 
-/** Ground source selection before hiding internal markers and remove model-created URLs. */
+/** Ground source selection before hiding internal markers and removing model-created URLs. */
 export function appendGroundedSources(
   answer: string,
   results: readonly WebSearchResult[],
@@ -996,17 +996,12 @@ export function appendGroundedSources(
       selectedSourceCount: selected.length,
       removedDanglingMarkerCount,
       visibleMarkerCount: 0,
-      appendedSourceCount: selected.length,
+      appendedSourceCount: 0,
       result: selected.length > 0 ? 'PASS' : 'NO_REFERENCED_SOURCE',
     })
   }
 
-  if (selected.length === 0) {
-    return groundedAnswer
-  }
-
-  const sourceLines = selected.map((item, index) => `${index + 1}. ${item.title} ${item.url}`).join('\n')
-  return `${groundedAnswer}\n\n来源：\n${sourceLines}`
+  return groundedAnswer
 }
 
 export class TavilyWebSearchProvider implements WebSearchProvider {

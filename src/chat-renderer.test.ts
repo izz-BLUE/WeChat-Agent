@@ -127,14 +127,13 @@ await runCase('signature-preserves-protected-content', () => {
   assert.equal(decorateYeyeReplySignature('Error: request failed'), 'Error: request failed')
 })
 
-await runCase('reply-level-signature-covers-source-and-structural-cases', () => {
+await runCase('reply-level-signature-covers-grounded-and-structural-cases', () => {
   const results: WebSearchResult[] = [{ sourceId: 'S1', title: '真实来源', url: 'https://real.example/source', snippet: '摘要' }]
   const grounded = appendGroundedSources('正文第一句。正文第二句。[S1]', results)
   const decorated = decorateYeyeReplySignature(grounded)
   assert.equal(decorated.match(new RegExp(YEYE_REPLY_SIGNATURE, 'gu'))?.length, 1)
-  check(decorated.indexOf(YEYE_REPLY_SIGNATURE) < decorated.indexOf('来源：'), 'signature was placed after the source section')
-  check(decorated.includes('1. 真实来源 https://real.example/source'), 'source URL changed')
-  check(!decorated.slice(decorated.indexOf('来源：')).includes(YEYE_REPLY_SIGNATURE), 'source section was decorated')
+  check(decorated.startsWith('正文第一句。正文第二句。'), 'grounded answer changed unexpectedly')
+  check(!decorated.includes('[S1]') && !decorated.includes('来源：') && !decorated.includes('https://real.example/source'), 'internal source presentation remained visible')
 
   const codeOnly = '```ts\nconst answer = "你好。";\n```\nhttps://example.com/source [S1]'
   assert.equal(decorateYeyeReplySignature(codeOnly), codeOnly)
@@ -293,7 +292,7 @@ await runCase('source-grounding-happens-after-renderer', () => {
   const grounded = appendGroundedSources(rendered, results)
   assert(!grounded.includes('**'), 'renderer left decorative bold markup')
   check(grounded.includes('这个比较重要') && !grounded.includes('[S1]'), 'internal source id remained visible')
-  check(grounded.includes('https://real.example/source'), 'runtime source URL was not appended')
+  check(!grounded.includes('https://real.example/source') && !grounded.includes('来源：'), 'runtime source URL was appended')
 })
 
 await runCase('provider-control-regeneration-uses-renderer', async () => {
@@ -328,7 +327,7 @@ await runCase('answer-guard-regeneration-uses-renderer', async () => {
   }
 })
 
-await runCase('chat-service-renders-before-grounded-source-append', async () => {
+await runCase('chat-service-renders-before-grounded-source-cleanup', async () => {
   const provider = stubProvider(['刚查了下 **这个比较重要** [S1]'])
   try {
     const answer = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
@@ -344,7 +343,7 @@ await runCase('chat-service-renders-before-grounded-source-append', async () => 
       },
     )
     check(answer.startsWith('刚查了下 这个比较重要') && !answer.includes('[S1]'), 'renderer did not run before internal source cleanup')
-    check(answer.includes('https://real.example/source'), 'grounded source was lost')
+    check(!answer.includes('https://real.example/source') && !answer.includes('来源：'), 'grounded source presentation leaked')
   } finally {
     provider.restore()
   }

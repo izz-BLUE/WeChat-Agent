@@ -33,7 +33,7 @@ Tavily 使用 `/search` 和有限的 basic search 参数；SearXNG 使用 JSON s
 
 网页抓取器拒绝 localhost、私网、link-local、metadata、带凭据、非标准危险端口和其他不安全 URL。网页内容始终是不可信数据，不能改变系统身份或授权事实。
 
-模型只能用 `[S1]` 这类标记引用检索结果。最终渲染会移除模型伪造的 URL 和无效 marker，并把实际被引用的标题/URL 放入 `来源：`。有搜索结果但无法可靠对应来源时，系统会进行一次有限的 grounding repair；仍失败则不把不可靠结论伪装成有来源的事实。
+模型只能用 `[S1]` 这类标记引用检索结果。Runtime 使用 source marker 完成 grounding 校验，发送前移除 marker；来源元数据保留在内部 grounding/diagnostic 链路中，默认不附加到最终群聊回复。模型伪造的 URL 和无效 marker 仍会被清理。有搜索结果但无法可靠对应来源时，系统会进行一次有限的 grounding repair；仍失败则不把不可靠结论伪装成有来源的事实。
 
 ## 启用前检查
 
@@ -47,4 +47,4 @@ SEARXNG_ENABLED=0
 
 也可以在本地配置 SearXNG 作为可用路线，但必须自行运行并保护该服务。示例中的 `http://127.0.0.1:8088` 只是默认地址，不是本仓库提供的服务。
 
-启用前请确认：搜索内容可以被发送给所选 provider、密钥不会进入 Git、内部身份值不会拼入 query、以及回答中只保留经过 grounding 的来源。若这些条件不能满足，应保持关闭。
+启用前请确认：搜索内容可以被发送给所选 provider、密钥不会进入 Git、内部身份值不会拼入 query、以及回答中的搜索事实只保留经过 grounding 的内容。若这些条件不能满足，应保持关闭。

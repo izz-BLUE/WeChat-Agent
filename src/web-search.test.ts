@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { appendGroundedSources, enrichWebSearchResultsWithPageEvidence, extractWebPageText, fetchWebPage, rankWebSearchResults, SearXNGWebSearchProvider, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebPageDnsLookup, type WebPageFetchImplementation, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
+import { appendGroundedSources, enrichWebSearchResultsWithPageEvidence, extractWebPageText, fetchWebPage, inspectGroundedSources, rankWebSearchResults, SearXNGWebSearchProvider, TavilyWebSearchProvider, WebSearchError, buildWebSearchContext, normalizeWebSearchResults, type GroundedSourceUsage, type WebPageDnsLookup, type WebPageFetchImplementation, type WebSearchProvider, type WebSearchRequest, type WebSearchResult } from './web-search.js'
 import { formatWebSearchDecisionProtocol, WebSearchPlanner, parseWebSearchDecisionProtocol, type WebSearchPlanInput, type WebSearchPlannerLike } from './web-search-planner.js'
 import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
@@ -256,7 +256,7 @@ async function main(): Promise<void> {
     check(mapAgentResponse(content).kind === 'NO_REPLY', 'provider control reached outbound mapping')
   })
 
-  await test('sources are appended only when the final answer references known ids', () => {
+  await test('grounded source markers are validated and hidden without appending source lists', () => {
     const results = [
       result('S1', '来源一', 'https://example.com/one'),
       result('S2', '来源二', 'https://example.com/two'),
@@ -274,35 +274,38 @@ async function main(): Promise<void> {
       result('S4', '来源四', 'https://example.com/four'),
       result('S5', '来源五', 'https://example.com/five'),
     ], [], (diagnostic) => usage.push(diagnostic))
-    check(five.startsWith('A B C D E'), 'internal source markers were not removed from the body')
+    check(five === 'A B C D E', 'internal source markers were not removed from the body')
     check(!/\[S\d+\]/u.test(five), 'a visible source marker survived grounding')
-    check(five.includes('来源：\n1. 来源二 https://example.com/two\n2. 来源一 https://example.com/one\n3. 来源三 https://example.com/three\n4. 来源四 https://example.com/four\n5. 来源五 https://example.com/five'), 'all referenced sources were not appended in marker order')
+    check(!five.includes('来源：') && !five.includes('https://example.com/'), 'source list was appended to the final answer')
     check(usage[1]?.validReferencedSourceCount === 5 && usage[1]?.selectedSourceCount === 5, 'source selection diagnostic counts are incorrect')
-    check(usage[1]?.removedDanglingMarkerCount === 0 && usage[1]?.visibleMarkerCount === 0 && usage[1]?.appendedSourceCount === 5, 'artificial source cap remained active')
+    check(usage[1]?.removedDanglingMarkerCount === 0 && usage[1]?.visibleMarkerCount === 0 && usage[1]?.appendedSourceCount === 0, 'source presentation diagnostic is incorrect')
 
-    const first = appendGroundedSources('结论[S1]', results)
-    check(first.startsWith('结论') && !/\[S\d+\]/u.test(first), 'selected source marker remained visible')
-    check(first.includes('来源一 https://example.com/one'), 'referenced S1 was not appended')
-    check(!first.includes('来源二') && !first.includes('来源三'), 'unreferenced sources were appended with S1')
+    const firstUsage: GroundedSourceUsage[] = []
+    const first = appendGroundedSources('结论[S1]', results, [], (diagnostic) => firstUsage.push(diagnostic))
+    check(first === '结论', 'valid citation did not produce a clean final answer')
+    check(firstUsage[0]?.selectedSourceCount === 1 && firstUsage[0]?.validReferencedSourceCount === 1, 'valid citation was not grounded')
+    check(firstUsage[0]?.appendedSourceCount === 0 && firstUsage[0]?.result === 'PASS', 'valid citation presentation diagnostic is incorrect')
 
     const second = appendGroundedSources('结论[S2]', results)
-    check(second.includes('来源二 https://example.com/two'), 'referenced S2 was not appended')
-    check(!second.includes('来源一') && !second.includes('来源三'), 'unreferenced sources were appended with S2')
+    check(second === '结论', 'second valid citation did not produce a clean final answer')
 
-    const ordered = appendGroundedSources('结论[S2][S1]', results)
-    check(!/\[S\d+\]/u.test(ordered), 'source markers remained visible in ordered answer')
-    check(ordered.indexOf('来源二') < ordered.indexOf('来源一'), 'source order did not follow answer references')
+    const ordered = inspectGroundedSources('A[S2] B[S1] C[S3]', results)
+    check(ordered.validReferencedSourceCount === 3 && ordered.selectedSourceCount === 3, 'multi-source selection count changed')
+    check(ordered.appendedSourceCount === 0 && ordered.result === 'PASS', 'multi-source presentation diagnostic is incorrect')
 
     const duplicate = appendGroundedSources('结论[S1][S1]', results)
-    check(!/\[S\d+\]/u.test(duplicate), 'duplicate source markers remained visible')
-    check(duplicate.split('来源一').length === 2, 'duplicate source was appended more than once')
+    check(duplicate === '结论', 'duplicate source markers remained visible')
 
-    const invalid = appendGroundedSources('结论[S99]', results)
+    const invalidUsage: GroundedSourceUsage[] = []
+    const invalid = appendGroundedSources('结论[S99]', results, [], (diagnostic) => invalidUsage.push(diagnostic))
     check(invalid === '结论', 'unknown source marker survived cleanup')
+    check(invalidUsage[0]?.removedDanglingMarkerCount === 1 && invalidUsage[0]?.appendedSourceCount === 0, 'dangling marker diagnostic is incorrect')
 
-    const mixed = appendGroundedSources('结论[S1][S99]', results)
-    check(mixed === '结论\n\n来源：\n1. 来源一 https://example.com/one', 'valid and unknown source markers were not grounded exactly once')
-    check(mixed.includes('来源一 https://example.com/one') && !mixed.includes('来源二'), 'mixed marker sources were not grounded exactly once')
+    const mixedUsage: GroundedSourceUsage[] = []
+    const mixed = appendGroundedSources('结论[S1][S99]', results, [], (diagnostic) => mixedUsage.push(diagnostic))
+    check(mixed === '结论', 'valid and unknown source markers were not cleaned exactly once')
+    check(mixedUsage[0]?.selectedSourceCount === 1 && mixedUsage[0]?.validReferencedSourceCount === 1, 'valid mixed marker was not grounded')
+    check(mixedUsage[0]?.removedDanglingMarkerCount === 1 && mixedUsage[0]?.appendedSourceCount === 0, 'mixed marker diagnostic is incorrect')
 
     const rawUrl = appendGroundedSources('结论[S1] https://evil.example/fabricated', results)
     check(!rawUrl.includes('https://evil.example/fabricated'), 'model-created URL survived grounding')
@@ -604,7 +607,7 @@ async function main(): Promise<void> {
     }
   })
 
-  await test('final control markup regenerates once and preserves grounded sources', async () => {
+  await test('final control markup regenerates once and preserves grounding', async () => {
     const final = scriptedFinalChat([
       '<|minimax|><tool_call><invoke name="web_search">query</invoke></tool_call>',
       '根据[S1]，这是正常回答。',
@@ -618,7 +621,7 @@ async function main(): Promise<void> {
     })
     const answer = await agent.complete(request())
     check(final.calls.length === 2 && fake.calls === 1, 'final regeneration/search bounds changed')
-    check(answer.includes('正常回答') && answer.includes('https://example.com/s1'), 'regenerated answer lost grounded source')
+    check(answer.includes('正常回答') && !answer.includes('[S1]') && !answer.includes('https://example.com/s1') && !answer.includes('来源：'), 'regenerated answer exposed source presentation')
     check(!answer.includes('tool_call') && !answer.includes('<invoke'), 'provider protocol reached final answer')
     final.restore()
   })
@@ -698,7 +701,7 @@ async function main(): Promise<void> {
     }))
     check(plannerUser.includes('帮我查一下 OpenAI 最近有什么最新消息'), 'live semantic question did not reach Planner')
     check(fake.calls === 1, `expected one Tavily call, got ${fake.calls}`)
-    check(answer.includes('https://example.com/s1'), 'live semantic search result was not grounded')
+    check(answer.includes('根据') && !answer.includes('[S1]') && !answer.includes('https://example.com/s1') && !answer.includes('来源：'), 'live semantic search result was not grounded without source presentation')
     final.restore()
   })
 
@@ -796,7 +799,7 @@ async function main(): Promise<void> {
       check(executionLogs[0]?.includes('mode=NEWS_RECENT') && executionLogs[0]?.includes('window=DAY_1') && executionLogs[0]?.includes('attempt=1') && executionLogs[0]?.includes('result=NO_RESULTS'), 'primary freshness diagnostic is incomplete')
       check(executionLogs[1]?.includes('window=DAY_3') && executionLogs[1]?.includes('attempt=2') && executionLogs[1]?.includes('result=PASS'), 'fallback freshness diagnostic is incomplete')
       check(executionLogs.every((line) => !line.includes('OpenAI') && !line.includes('https://')), 'freshness diagnostic leaked query or URL')
-      check(!answer.includes('[S1]') && answer.includes('https://example.com/recent'), 'fallback result was not grounded safely')
+      check(answer.includes('第二个窗口查到了一条近期消息') && !answer.includes('[S1]') && !answer.includes('https://example.com/recent') && !answer.includes('来源：'), 'fallback result was not grounded safely')
     } finally {
       console.log = originalLog
       final.restore()
@@ -944,7 +947,7 @@ async function main(): Promise<void> {
     check(final.calls.length === 1, 'cited Web Search answer unexpectedly entered grounding repair')
     check(final.calls[0]?.user.includes('[Web Search Results]'), 'search results were not injected')
     check(final.calls[0]?.user.includes('上海公共信息'), 'result title was not injected')
-    check(answer.includes('https://example.com/s1'), 'source URL was not runtime-grounded')
+    check(answer.includes('参考') && !answer.includes('[S1]') && !answer.includes('https://example.com/s1') && !answer.includes('来源：'), 'runtime grounding leaked source presentation')
     final.restore()
   })
 
@@ -967,7 +970,7 @@ async function main(): Promise<void> {
     }))
     const system = final.calls[0]?.system ?? ''
     const initialUser = final.calls[0]?.user ?? ''
-    const body = answer.split('\n\n来源：')[0] ?? answer
+    const body = answer
     check(system.includes('证据池') && system.includes('不是回答提纲'), 'search evidence-pool contract is missing')
     check(system.includes('按用户问题组织') && system.includes('共同支持'), 'multi-source synthesis contract is missing')
     check(system.includes('不要逐条复述') && system.includes('不要为了显得完整'), 'source-by-source report prohibition is missing')
@@ -989,7 +992,7 @@ async function main(): Promise<void> {
     check(final.calls[0]?.user.includes('[S1]') && final.calls[0]?.user.includes('[S4]'), 'all bounded search evidence was not available to Final Chat')
     check(final.calls[0]?.user.includes('WEB_SEARCH_MODE=NEWS_RECENT') && final.calls[0]?.user.includes('WEB_SEARCH_WINDOW=DAY_1'), 'news mode was not handed to Final Chat')
     check(body.includes('最近主要是模型能力和安全合作两条线在推进。') && !/\[S\d+\]/u.test(body) && !/^\s*(?:\d+[.)]|[-*])\s/mu.test(body), 'ordinary search answer was not natural-paragraph oriented')
-    check(answer.includes('来源：') && answer.includes('模型能力'), 'runtime source grounding regressed')
+    check(answer.includes('模型能力') && !answer.includes('来源：') && !answer.includes('https://example.com/'), 'runtime grounding presentation regressed')
     final.restore()
   })
 
@@ -1044,22 +1047,22 @@ async function main(): Promise<void> {
     })
     try {
       const ordinary = await agent.complete(ask('@椰椰 最近有什么重要变化？'))
-      const ordinaryBody = ordinary.split('\n\n来源：')[0] ?? ordinary
+      const ordinaryBody = ordinary
       check(ordinaryBody.includes('核心变化是模型能力继续增强。'), 'one important result was not answered naturally')
       check(!/\[S\d+\]/u.test(ordinaryBody), 'ordinary answer exposed internal source marker')
       check(!/^\s*(?:\d+[.)]|[-*])\s/mu.test(ordinaryBody), 'one important result was forced into a list')
 
       const listed = await agent.complete(ask('@椰椰 列出5条最近的重要消息'))
-      const listedBody = listed.split('\n\n来源：')[0] ?? listed
+      const listedBody = listed
       check(listedBody.includes('1. 第一条') && listedBody.includes('5. 第五条'), 'explicit list request was not preserved')
       check(!/\[S\d+\]/u.test(listedBody), 'explicit list exposed internal source marker')
-      check(listed.includes('来源：'), 'explicit list lost grounded sources')
+      check(!listed.includes('来源：') && !listed.includes('https://example.com/'), 'explicit list exposed source presentation')
 
       const detailed = await agent.complete(ask('@椰椰 详细整理一下最近的情况'))
-      const detailedBody = detailed.split('\n\n来源：')[0] ?? detailed
+      const detailedBody = detailed
       check(detailedBody.includes('- 模型能力：') && detailedBody.includes('- 监管环境：'), 'explicit deep-dive structure was not preserved')
       check(!/\[S\d+\]/u.test(detailedBody), 'explicit deep-dive exposed internal source marker')
-      check(detailed.includes('来源：'), 'explicit deep-dive lost grounded sources')
+      check(!detailed.includes('来源：') && !detailed.includes('https://example.com/'), 'explicit deep-dive exposed source presentation')
     } finally {
       final.restore()
     }
@@ -1074,11 +1077,11 @@ async function main(): Promise<void> {
     })
     try {
       const answer = await agent.complete(request())
-      const body = answer.split('\n\n来源：')[0] ?? answer
+      const body = answer
       check(fake.calls === 1 && final.calls.length === 2, 'zero-citation answer did not receive exactly one repair')
       check(body === `可靠结论${YEYE_REPLY_SIGNATURE}` && !/\[S\d+\]/u.test(body), 'repaired answer exposed an internal source marker')
       check(!answer.includes('https://evil.example/fabricated'), 'repair raw URL survived final grounding')
-      check(answer.includes('来源：\n1. 来源二 https://example.com/s2') && !answer.includes('来源一'), 'repair grounded the wrong source')
+      check(!answer.includes('来源：') && !answer.includes('https://example.com/s2') && !answer.includes('来源一'), 'repair exposed source presentation')
       check(final.calls[1]?.system.includes('Web Search Grounding Repair'), 'grounding repair contract was not used')
       check(final.calls[1]?.user.includes('[Current Final Answer: UNTRUSTED_DRAFT]\n原始搜索事实，没有引用。'), 'current answer was not provided to grounding repair')
     } finally {
@@ -1159,7 +1162,7 @@ async function main(): Promise<void> {
       }
       check(!repairUser.includes('CurrentSpeakerLabel') && !repairUser.includes('[Runtime Facts]') && !repairUser.includes('Group Conversation Style'), 'repair prompt leaked runtime/context sections')
       check(repairSystem.includes('Only Web Search Results may justify a [Sx]') && repairSystem.includes('Memory / conversation context are intentionally unavailable'), 'repair system evidence-only boundary is missing')
-      check(answer.includes('来源：\n1. bounded title https://example.com/bounded') && !/\[S\d+\]/u.test(answer.split('\n\n来源：')[0] ?? answer), 'repair boundary changed final grounding')
+      check(!answer.includes('来源：') && !answer.includes('https://example.com/bounded') && !/\[S\d+\]/u.test(answer), 'repair boundary changed final grounding presentation')
     } finally {
       final.restore()
     }
@@ -1415,9 +1418,10 @@ async function main(): Promise<void> {
     check(diverse.results.length === 5 && diverse.report.uniqueHostCount === 3, 'diversity strategy dropped usable results')
     check(diverse.results.every((item, index) => item.sourceId === `S${index + 1}`), 'reranked source ids are not continuous')
 
-    const grounded = appendGroundedSources(`结论[${diverse.results[0]?.sourceId}]`, diverse.results)
-    check(grounded.includes(`${diverse.results[0]?.title} ${diverse.results[0]?.url}`), 'Grounding did not use reranked source ids')
-    check(!grounded.includes('[S1]'), 'reranked source marker remained visible')
+    const usage: GroundedSourceUsage[] = []
+    const grounded = appendGroundedSources(`结论[${diverse.results[0]?.sourceId}]`, diverse.results, [], (diagnostic) => usage.push(diagnostic))
+    check(grounded === '结论', 'reranked source marker was not cleaned without source presentation')
+    check(usage[0]?.selectedSourceCount === 1 && usage[0]?.validReferencedSourceCount === 1 && usage[0]?.appendedSourceCount === 0, 'Grounding did not use reranked source ids')
   })
 
   await test('page fetch enriches only the ranked Top-2 and keeps the third untouched', async () => {
@@ -1626,7 +1630,7 @@ async function main(): Promise<void> {
       const answer = await agent.complete(request())
       check(provider.calls === 1 && pageUrls.length === 2 && final.calls.length === 1, 'page enrichment added a search or LLM call')
       check(final.calls[0]?.user.includes('PageEvidence: 正文证据'), 'page evidence did not reach Final Chat')
-      check(answer.includes('目标一 https://one.example/1') && !answer.includes('[S1]'), 'Grounding did not retain the same reranked S1 source')
+      check(answer.includes('根据') && !answer.includes('[S1]') && !answer.includes('https://one.example/1') && !answer.includes('来源：'), 'Grounding did not retain the same reranked S1 source')
       check(!pageUrls.some((url) => url.includes('three.example')), 'receiver fetched beyond Top-2')
       const pageLog = logs.find((line) => line.includes('[WEB_PAGE_FETCH]')) ?? ''
       check(pageLog.includes('attemptedCount=2') && pageLog.includes('successCount=2') && pageLog.includes('result=PASS'), 'page fetch diagnostic is incomplete')
@@ -1649,7 +1653,7 @@ async function main(): Promise<void> {
     })
     try {
       const answer = await agent.complete(request())
-      check(provider.calls === 1 && answer.includes('原始标题 https://failed-page.example/1'), 'page failure caused Search to fail instead of using the snippet')
+      check(provider.calls === 1 && answer.includes('根据') && !answer.includes('[S1]') && !answer.includes('https://failed-page.example/1') && !answer.includes('来源：'), 'page failure caused Search to fail instead of using the snippet')
     } finally {
       final.restore()
     }
@@ -1672,7 +1676,7 @@ async function main(): Promise<void> {
     })
     try {
       const answer = await agent.complete(request())
-      check(pageCalls === 0 && answer.includes('保留摘要 https://deadline-page.example/1'), 'final-answer reserve was not preserved when page budget was below minimum')
+      check(pageCalls === 0 && answer.includes('根据') && !answer.includes('[S1]') && !answer.includes('https://deadline-page.example/1') && !answer.includes('来源：'), 'final-answer reserve was not preserved when page budget was below minimum')
     } finally {
       final.restore()
     }
@@ -1770,7 +1774,7 @@ async function main(): Promise<void> {
     final.restore()
   })
 
-  await test('runtime sources use actual titles and URLs, never model-created URLs', async () => {
+  await test('runtime grounding keeps source data internal and removes model-created URLs', async () => {
     const final = fakeFinalChat('结论 [S1] https://evil.example/fabricated')
     const fake = fakeProvider([result('S1', '真实来源标题', 'https://real.example/source')])
     const agent = new ProductionChatAgent(final.chat, {
@@ -1778,7 +1782,7 @@ async function main(): Promise<void> {
       webSearchProvider: fake.provider,
     })
     const answer = await agent.complete(request())
-    check(answer.includes('真实来源标题') && answer.includes('https://real.example/source'), 'actual source was not appended')
+    check(answer.includes('结论') && !answer.includes('真实来源标题') && !answer.includes('https://real.example/source') && !answer.includes('[S1]'), 'source data was exposed in the final answer')
     check(!answer.includes('https://evil.example/fabricated'), 'model-created URL was not removed')
     final.restore()
   })
@@ -2009,7 +2013,7 @@ async function main(): Promise<void> {
       })
       const answer = await agent.complete(request())
       check(calls.join(',') === 'searxng', 'Chinese GENERAL did not use SearXNG as primary')
-      check(answer.includes('searxng 来源 https://example.com/searxng') && !answer.includes('[S1]'), 'SearXNG result did not preserve the existing grounding contract')
+      check(answer.includes('中文结论') && !answer.includes('[S1]') && !answer.includes('https://example.com/searxng') && !answer.includes('来源：'), 'SearXNG result did not preserve the existing grounding contract')
     } finally {
       final.restore()
     }
@@ -2032,7 +2036,7 @@ async function main(): Promise<void> {
       })
       const answer = await agent.complete(request({ text: '@椰椰 OpenAI stable facts', rawText: '@椰椰 OpenAI stable facts' }))
       check(calls.join(',') === 'tavily', 'English GENERAL did not use Tavily as primary')
-      check(answer.includes('tavily source https://example.com/tavily'), 'Tavily global search result changed')
+      check(answer.includes('English conclusion') && !answer.includes('[S1]') && !answer.includes('https://example.com/tavily') && !answer.includes('来源：'), 'Tavily global search result changed')
     } finally {
       final.restore()
     }
@@ -2049,7 +2053,7 @@ async function main(): Promise<void> {
       })
       const answer = await agent.complete(request())
       check(calls.join(',') === 'searxng,tavily', 'NO_RESULTS did not trigger exactly one Tavily fallback')
-      check(answer.includes('Tavily fallback'), 'Tavily fallback result was not grounded')
+      check(answer.includes('fallback 结论') && !answer.includes('[S1]') && !answer.includes('Tavily fallback') && !answer.includes('来源：'), 'Tavily fallback result was not grounded')
     } finally {
       final.restore()
     }
@@ -2066,7 +2070,7 @@ async function main(): Promise<void> {
       })
       const answer = await agent.complete(request())
       check(calls.join(',') === 'searxng,tavily', 'TIMEOUT did not trigger exactly one Tavily fallback')
-      check(answer.includes('Tavily timeout fallback'), 'Tavily timeout fallback result was not grounded')
+      check(answer.includes('timeout fallback') && !answer.includes('[S1]') && !answer.includes('Tavily timeout fallback') && !answer.includes('来源：'), 'Tavily timeout fallback result was not grounded')
     } finally {
       final.restore()
     }
@@ -2171,7 +2175,7 @@ async function main(): Promise<void> {
         webSearchProvider: provider.provider,
       })
       const answer = await agent.complete(request())
-      check(answer.includes('primary result'), 'primary result was lost after alternate failure')
+      check(answer.includes('primary survives') && !answer.includes('[S1]') && !answer.includes('primary result') && !answer.includes('来源：'), 'primary result was lost after alternate failure')
     } finally {
       final.restore()
     }
@@ -2186,7 +2190,7 @@ async function main(): Promise<void> {
         webSearchProvider: provider.provider,
       })
       const answer = await agent.complete(request())
-      check(answer.includes('alternate result'), 'alternate result was not used after primary failure')
+      check(answer.includes('alternate survives') && !answer.includes('[S1]') && !answer.includes('alternate result') && !answer.includes('来源：'), 'alternate result was not used after primary failure')
     } finally {
       final.restore()
     }
@@ -2273,7 +2277,8 @@ async function main(): Promise<void> {
         webSearchProvider: provider.provider,
       })
       const answer = await agent.complete(request())
-      check(answer.includes('primary title') && !answer.includes('alternate title'), 'cross-query canonical URL dedup did not keep primary')
+      const searchContext = final.calls[0]?.user ?? ''
+      check(searchContext.includes('primary title') && !searchContext.includes('alternate title') && !answer.includes('来源：') && !answer.includes('https://example.com/'), 'cross-query canonical URL dedup did not keep primary')
     } finally {
       final.restore()
     }
@@ -2288,7 +2293,8 @@ async function main(): Promise<void> {
         webSearchProvider: provider.provider,
       })
       const answer = await agent.complete(request())
-      check(answer.includes('https://example.com/one') && !answer.includes('https://example.com/two'), 'cross-query title dedup failed')
+      const searchContext = final.calls[0]?.user ?? ''
+      check(searchContext.includes('Same Title') && !searchContext.includes('same title') && !answer.includes('来源：') && !answer.includes('https://example.com/'), 'cross-query title dedup failed')
     } finally {
       final.restore()
     }
@@ -2361,7 +2367,7 @@ async function main(): Promise<void> {
         webSearchProvider: provider.provider,
       })
       const answer = await agent.complete(request())
-      check(answer.includes('alternate source https://example.com/alternate') && !answer.includes('[S2]'), 'Grounding did not use the merged alternate source')
+      check((final.calls[0]?.user ?? '').includes('alternate source') && answer.includes('grounded alternate') && !answer.includes('[S2]') && !answer.includes('https://example.com/alternate') && !answer.includes('来源：'), 'Grounding did not use the merged alternate source')
     } finally {
       final.restore()
     }
@@ -2564,7 +2570,7 @@ async function main(): Promise<void> {
       })
       const answer = await agent.complete(request())
       const fallbackRequest = secondary.requests[0]
-      check(answer.includes('动态 secondary'), 'adaptive secondary result was not used')
+      check(answer.includes('动态 fallback') && !answer.includes('[S1]') && !answer.includes('动态 secondary') && !answer.includes('来源：'), 'adaptive secondary result was not used')
       check(fallbackRequest !== undefined, 'adaptive secondary provider was not called')
       check(fallbackRequest.timeoutMs >= MIN_SEARCH_FALLBACK_BUDGET_MS && fallbackRequest.timeoutMs <= 6_000,
         `secondary timeout did not respect remaining budget: ${fallbackRequest.timeoutMs}`)
