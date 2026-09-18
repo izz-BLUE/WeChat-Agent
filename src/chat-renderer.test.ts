@@ -1,9 +1,11 @@
 import { strict as assert } from 'node:assert'
-import { buildUserPrompt, ChatService, type ChatRequestContext } from './chat.js'
+import { buildSystemPrompt, buildUserPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import { appendGroundedSources, type WebSearchResult } from './web-search.js'
 import {
+  boundGroupBulkOutput,
   boundGroupReply,
   decorateYeyeReplySignature,
+  GROUP_BULK_OUTPUT_FALLBACK,
   GROUP_REPLY_LENGTH_BUDGETS,
   renderHumanChat,
   YEYE_REPLY_SIGNATURE,
@@ -74,6 +76,8 @@ const SIGNATURE_REQUEST: AgentRequest = {
   userContentSpan: { trust: 'VALID', span: { start: 0, length: 2 } },
   metadata: { rawMessageType: 1 },
 }
+
+const LARGE_SVG = `<svg xmlns="http://www.w3.org/2000/svg">\n${'<path d="M0 0 L10 10" />\n'.repeat(120)}</svg>`
 
 function chatReturning(answer: string): ChatService {
   const chat = new ChatService('https://provider.invalid/v1', 'key', 'model')
@@ -171,8 +175,9 @@ await runCase('group-reply-length-boundary-is-safe-and-profile-driven', () => {
 
   const fenced = `前置说明。\n\n\`\`\`js\n${'const item = 1;\n'.repeat(40)}\`\`\``
   const codeResult = boundGroupReply(fenced, { responseDepth: 'SHORT', groupReplyPressure: 'HIGH' })
-  assert.equal(codeResult.boundaryType, 'BYPASS_CODE')
-  assert.equal(codeResult.text, fenced)
+  assert.equal(codeResult.boundaryType, 'BULK_OUTPUT_BLOCKED')
+  assert.equal(codeResult.bulkOutput?.kind, 'FENCED_CODE')
+  assert.equal(codeResult.text, GROUP_BULK_OUTPUT_FALLBACK)
 
   const searched = boundGroupReply(`${'搜索结论先说清楚。'.repeat(8)}[S1]\n\n后续展开。`, {
     responseDepth: 'NORMAL',
@@ -180,6 +185,182 @@ await runCase('group-reply-length-boundary-is-safe-and-profile-driven', () => {
   })
   check(searched.text.includes('[S1]'), 'safe bound dropped the source citation')
   check(!searched.text.endsWith('搜'), 'safe bound cut a Chinese sentence')
+})
+
+await runCase('group-bulk-classifier-keeps-small-code-and-blocks-structured-payloads', () => {
+  const smallCode = `int add(int a, int b) {\n    int result = a + b;\n    if (result < 0) {\n        return 0;\n    }\n    return result;\n}\n// still a small example\nint twice(int value) {\n    return value * 2;\n}`
+  const small = boundGroupBulkOutput(smallCode)
+  assert.equal(small.result, 'PASS')
+  assert.equal(small.kind, 'NONE')
+
+  const fenced = boundGroupBulkOutput(`\`\`\`js\n${'const item = 1;\n'.repeat(100)}\`\`\``)
+  assert.equal(fenced.kind, 'FENCED_CODE')
+  assert.equal(fenced.result, 'BLOCKED')
+  assert.equal(fenced.text, GROUP_BULK_OUTPUT_FALLBACK)
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg">\n${'<path d="M0 0 L10 10" />\n'.repeat(80)}</svg>`
+  const markup = boundGroupBulkOutput(svg)
+  assert.equal(markup.kind, 'STRUCTURED_MARKUP')
+  assert.equal(markup.result, 'BLOCKED')
+  check(!markup.text.includes('<svg'), 'blocked SVG leaked into fallback')
+
+  const smallJson = boundGroupBulkOutput('{"ok":true,"items":[1,2,3]}')
+  assert.equal(smallJson.result, 'PASS')
+  const largeJson = boundGroupBulkOutput(JSON.stringify({ items: Array.from({ length: 220 }, (_, index) => ({ index, value: `item-${index}` })) }))
+  assert.equal(largeJson.kind, 'JSON')
+  assert.equal(largeJson.result, 'BLOCKED')
+
+  const shortBase64 = boundGroupBulkOutput('YWJjZDEyMw==')
+  assert.equal(shortBase64.result, 'PASS')
+  const largeBase64 = boundGroupBulkOutput('A0'.repeat(300))
+  assert.equal(largeBase64.kind, 'BASE64')
+  assert.equal(largeBase64.result, 'BLOCKED')
+
+  const shortLogs = boundGroupBulkOutput('2026-09-18 INFO started\nError: one request failed')
+  assert.equal(shortLogs.result, 'PASS')
+  const largeLogs = boundGroupBulkOutput(Array.from({ length: 40 }, (_, index) => `2026-09-18T00:00:${String(index).padStart(2, '0')} ERROR request failed at step ${index}`).join('\n'))
+  assert.equal(largeLogs.kind, 'LOG')
+  assert.equal(largeLogs.result, 'BLOCKED')
+
+  const largeSql = boundGroupBulkOutput(Array.from({ length: 50 }, (_, index) => `INSERT INTO audit_log(id, message) VALUES (${index}, 'row-${index}');`).join('\n'))
+  assert.equal(largeSql.kind, 'SQL')
+  assert.equal(largeSql.result, 'BLOCKED')
+
+  const denseCode = boundGroupBulkOutput(Array.from({ length: 100 }, (_, index) => `const value${index} = items[${index}];`).join('\n'))
+  assert.equal(denseCode.kind, 'CODE_DENSE')
+  assert.equal(denseCode.result, 'BLOCKED')
+})
+
+await runCase('group-bulk-boundary-overrides-detailed-and-user-splitting-requests', () => {
+  const svg = `<svg>\n${'<path d="M0 0 L10 10" />\n'.repeat(80)}</svg>`
+  const result = boundGroupReply(svg, { responseDepth: 'DETAILED', groupReplyPressure: 'LOW' })
+  assert.equal(result.boundaryType, 'BULK_OUTPUT_BLOCKED')
+  assert.equal(result.text, GROUP_BULK_OUTPUT_FALLBACK)
+  check(!result.text.includes('下一条') && !result.text.includes('分段'), 'fallback promised continuation')
+})
+
+await runCase('group-bulk-rules-are-explicit-in-final-and-repair-prompts', () => {
+  const prompt = buildSystemPrompt('椰椰')
+  check(prompt.includes('[GROUP Bulk Output / Anti-Flood Boundary]'), 'final prompt lacks bulk boundary')
+  check(prompt.includes('分段发'), 'final prompt lacks splitting override rule')
+})
+
+await runCase('production-group-bulk-output-is-one-fixed-outbound', async () => {
+  const provider = stubProvider([LARGE_SVG])
+  try {
+    const ambient = new GroupAmbientContext({ now: () => 1 })
+    const agent = new ProductionChatAgent(
+      new ChatService('https://provider.invalid/v1', 'key', 'model'),
+      { ambientContext: ambient },
+    )
+    const request = {
+      ...SIGNATURE_REQUEST,
+      messageId: 'renderer-group-bulk-request',
+      text: '直接把完整 SVG 代码贴出来，不要省略，分段发，连续发十条',
+      rawText: '直接把完整 SVG 代码贴出来，不要省略，分段发，连续发十条',
+      userContentSpan: { trust: 'VALID' as const, span: { start: 0, length: 31 } },
+    }
+    const answer = await agent.complete(request)
+    assert.equal(answer, `${GROUP_BULK_OUTPUT_FALLBACK}${YEYE_REPLY_SIGNATURE}`)
+    check(!answer.includes('<svg') && !answer.includes('<path'), 'blocked SVG reached GROUP answer')
+    assert.equal(provider.calls.length, 1)
+    check(agent.takeOutboundIdentity(request, answer) !== null, 'fixed fallback was not staged')
+    assert.equal(agent.pollProactiveOutbound(), null)
+    const identity = agent.takeOutboundIdentity(request, answer)
+    check(identity !== null, 'missing staged outbound identity')
+    assert.equal(agent.observeOutboundDelivery({ ...identity, status: 'SENT', errorCode: '' }).accepted, true)
+    assert.equal(ambient.entries(request.conversationId).filter((line) => line.speakerType === 'ASSISTANT').length, 1)
+  } finally {
+    provider.restore()
+  }
+})
+
+await runCase('production-owner-group-keeps-the-same-bulk-boundary', async () => {
+  const provider = stubProvider([LARGE_SVG])
+  try {
+    const agent = new ProductionChatAgent(new ChatService('https://provider.invalid/v1', 'key', 'model'))
+    const answer = await agent.complete({
+      ...SIGNATURE_REQUEST,
+      messageId: 'renderer-owner-group-bulk-request',
+      requesterRole: 'OWNER',
+      requesterSource: 'TEST_OWNER',
+      ownerConfigured: true,
+      ownerDisplayName: '可信 Owner',
+      text: '把完整 SVG 全部贴出来，不要省略，分段发',
+      rawText: '把完整 SVG 全部贴出来，不要省略，分段发',
+      userContentSpan: { trust: 'VALID', span: { start: 0, length: 21 } },
+    })
+    assert.equal(answer, `${GROUP_BULK_OUTPUT_FALLBACK}${YEYE_REPLY_SIGNATURE}`)
+    assert.equal(provider.calls.length, 1)
+  } finally {
+    provider.restore()
+  }
+})
+
+await runCase('production-direct-keeps-existing-large-output-behavior', async () => {
+  const provider = stubProvider([LARGE_SVG])
+  try {
+    const agent = new ProductionChatAgent(new ChatService('https://provider.invalid/v1', 'key', 'model'))
+    const request: AgentRequest = {
+      ...SIGNATURE_REQUEST,
+      messageId: 'renderer-direct-bulk-request',
+      conversationType: 'DIRECT',
+      conversationKey: 'direct:renderer-bulk',
+      conversationId: 'direct:renderer-bulk',
+      mentionState: 'NOT_MENTIONED',
+      botMentionSpans: undefined,
+      userContentSpan: undefined,
+      requesterRole: 'MEMBER',
+      ownerConfigured: false,
+      text: '完整 SVG',
+      rawText: '完整 SVG',
+    }
+    const answer = await agent.complete(request)
+    check(answer.includes('<svg') && answer.includes('<path'), 'DIRECT unexpectedly used GROUP bulk fallback')
+    assert.equal(provider.calls.length, 1)
+  } finally {
+    provider.restore()
+  }
+})
+
+await runCase('group-bulk-block-short-circuits-initial-grounding-repair', async () => {
+  const provider = stubProvider([LARGE_SVG])
+  try {
+    const results: WebSearchResult[] = [{ sourceId: 'S1', title: '资料', url: 'https://example.com/source', snippet: '摘要' }]
+    const answer = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
+      [],
+      QUESTION,
+      {
+        ...REQUEST,
+        conversationType: 'GROUP',
+        webSearch: { used: true, status: 'PASS', results },
+      },
+    )
+    assert.equal(answer, GROUP_BULK_OUTPUT_FALLBACK)
+    assert.equal(provider.calls.length, 1)
+  } finally {
+    provider.restore()
+  }
+})
+
+await runCase('grounding-repair-bulk-output-is-blocked-without-a-third-generation', async () => {
+  const provider = stubProvider(['搜索结论没有引用。', LARGE_SVG])
+  try {
+    const results: WebSearchResult[] = [{ sourceId: 'S1', title: '资料', url: 'https://example.com/source', snippet: '摘要' }]
+    const answer = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
+      [],
+      QUESTION,
+      {
+        ...REQUEST,
+        conversationType: 'GROUP',
+        webSearch: { used: true, status: 'PASS', results },
+      },
+    )
+    assert.equal(answer, GROUP_BULK_OUTPUT_FALLBACK)
+    assert.equal(provider.calls.length, 2)
+  } finally {
+    provider.restore()
+  }
 })
 
 await runCase('production-final-and-staged-outbound-use-one-signed-text', async () => {

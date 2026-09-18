@@ -49,7 +49,24 @@ const SENTENCE_ENDINGS = new Set(['。', '！', '？', '!', '?', '.'])
 
 export type GroupReplyResponseDepth = 'SHORT' | 'NORMAL' | 'DETAILED'
 export type GroupReplyPressure = 'LOW' | 'MEDIUM' | 'HIGH'
-export type GroupReplyBoundaryType = 'NONE' | 'PARAGRAPH' | 'SENTENCE' | 'BYPASS_CODE' | 'BYPASS_DETAILED'
+export type GroupBulkOutputKind =
+  | 'NONE'
+  | 'FENCED_CODE'
+  | 'STRUCTURED_MARKUP'
+  | 'JSON'
+  | 'SQL'
+  | 'LOG'
+  | 'BASE64'
+  | 'CODE_DENSE'
+export type GroupBulkOutputResult = 'PASS' | 'BLOCKED'
+export type GroupReplyBoundaryType = 'NONE' | 'PARAGRAPH' | 'SENTENCE' | 'BULK_OUTPUT_BLOCKED' | 'BYPASS_DETAILED'
+
+export const GROUP_CODE_MAX_CHARS = 800
+export const GROUP_CODE_MAX_LINES = 24
+export const GROUP_CODE_MAX_BLOCKS = 2
+export const GROUP_STRUCTURED_MAX_CHARS = 900
+export const GROUP_BASE64_MIN_CHARS = 384
+export const GROUP_BULK_OUTPUT_FALLBACK = '这段内容太长，不直接在群里刷屏。可以问我具体实现点，我给关键片段。'
 
 export interface GroupReplyPresentationPolicy {
   responseDepth: GroupReplyResponseDepth
@@ -62,6 +79,19 @@ export interface GroupReplyBoundaryResult {
   afterChars: number
   bounded: boolean
   boundaryType: GroupReplyBoundaryType
+  bulkOutput?: GroupBulkOutputBoundaryResult
+}
+
+export interface GroupBulkOutputBoundaryResult {
+  text: string
+  beforeChars: number
+  afterChars: number
+  beforeLines: number
+  codeBlockCount: number
+  kind: GroupBulkOutputKind
+  detected: boolean
+  result: GroupBulkOutputResult
+  reason: 'NONE' | 'GROUP_STRUCTURED_OUTPUT_LIMIT'
 }
 
 /**
@@ -76,9 +106,46 @@ export const GROUP_REPLY_LENGTH_BUDGETS = Object.freeze({
 })
 
 /**
- * Apply the deterministic group presentation fallback before rendering or
- * grounding. It never cuts a fenced-code answer, an explicitly detailed
- * profile, or a reply without a safe paragraph/sentence boundary.
+ * Apply the deterministic anti-flood boundary before ordinary group reply
+ * presentation. The classifier only inspects the final answer payload; it
+ * never uses the user's request text or an LLM decision.
+ */
+export function boundGroupBulkOutput(text: string): GroupBulkOutputBoundaryResult {
+  const beforeChars = text.length
+  const normalized = text.trim()
+  const beforeLines = normalized.length === 0 ? 0 : splitLines(normalized).length
+  const metrics = inspectBulkOutput(normalized)
+  if (metrics.kind === 'NONE') {
+    return {
+      text: normalized,
+      beforeChars,
+      afterChars: normalized.length,
+      beforeLines,
+      codeBlockCount: metrics.codeBlockCount,
+      kind: 'NONE',
+      detected: false,
+      result: 'PASS',
+      reason: 'NONE',
+    }
+  }
+
+  return {
+    text: GROUP_BULK_OUTPUT_FALLBACK,
+    beforeChars,
+    afterChars: GROUP_BULK_OUTPUT_FALLBACK.length,
+    beforeLines,
+    codeBlockCount: metrics.codeBlockCount,
+    kind: metrics.kind,
+    detected: true,
+    result: 'BLOCKED',
+    reason: 'GROUP_STRUCTURED_OUTPUT_LIMIT',
+  }
+}
+
+/**
+ * Apply ordinary group presentation after the anti-flood boundary. Bulk
+ * output is replaced as a whole, so no structured payload is ever cut in the
+ * middle or sent in multiple messages.
  */
 export function boundGroupReply(
   text: string,
@@ -86,17 +153,19 @@ export function boundGroupReply(
 ): GroupReplyBoundaryResult {
   const beforeChars = text.length
   const normalized = text.trim()
+  const bulkOutput = boundGroupBulkOutput(text)
   if (normalized.length === 0) {
-    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE', bulkOutput }
   }
 
-  if (hasFence(normalized)) {
+  if (bulkOutput.result === 'BLOCKED') {
     return {
-      text: normalized,
+      text: bulkOutput.text,
       beforeChars,
-      afterChars: normalized.length,
-      bounded: false,
-      boundaryType: 'BYPASS_CODE',
+      afterChars: bulkOutput.text.length,
+      bounded: true,
+      boundaryType: 'BULK_OUTPUT_BLOCKED',
+      bulkOutput,
     }
   }
 
@@ -107,23 +176,24 @@ export function boundGroupReply(
       afterChars: normalized.length,
       bounded: false,
       boundaryType: 'BYPASS_DETAILED',
+      bulkOutput,
     }
   }
 
   const pressure = policy.groupReplyPressure
   const budget = GROUP_REPLY_LENGTH_BUDGETS[policy.responseDepth][pressure]
   if (normalized.length <= budget) {
-    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE', bulkOutput }
   }
 
   const boundary = findSafeBoundary(normalized, budget)
   if (boundary === null) {
-    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE', bulkOutput }
   }
 
   const boundedText = normalized.slice(0, boundary.end).trimEnd()
   if (!preservesSourceMarkers(normalized, boundedText)) {
-    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE' }
+    return { text: normalized, beforeChars, afterChars: normalized.length, bounded: false, boundaryType: 'NONE', bulkOutput }
   }
   return {
     text: boundedText,
@@ -131,6 +201,7 @@ export function boundGroupReply(
     afterChars: boundedText.length,
     bounded: true,
     boundaryType: boundary.type,
+    bulkOutput,
   }
 }
 
@@ -238,8 +309,150 @@ function isFence(line: string): boolean {
   return /^\s*```/u.test(line)
 }
 
-function hasFence(text: string): boolean {
-  return splitLines(text).some((line) => isFence(line.content))
+interface BulkOutputMetrics {
+  kind: GroupBulkOutputKind
+  codeBlockCount: number
+}
+
+interface FencedCodeMetrics {
+  codeBlockCount: number
+  codeChars: number
+  codeLines: number
+  codeText: string
+}
+
+function inspectBulkOutput(text: string): BulkOutputMetrics {
+  const fenced = inspectFencedCode(text)
+  if (fenced.codeBlockCount > 0) {
+    if (isHighDensityBase64(fenced.codeText)) {
+      return { kind: 'BASE64', codeBlockCount: fenced.codeBlockCount }
+    }
+    if (
+      fenced.codeChars > GROUP_CODE_MAX_CHARS ||
+      fenced.codeLines > GROUP_CODE_MAX_LINES ||
+      fenced.codeBlockCount > GROUP_CODE_MAX_BLOCKS
+    ) {
+      return { kind: 'FENCED_CODE', codeBlockCount: fenced.codeBlockCount }
+    }
+    return { kind: 'NONE', codeBlockCount: fenced.codeBlockCount }
+  }
+
+  if (text.length > GROUP_STRUCTURED_MAX_CHARS && isStructuredMarkup(text)) {
+    return { kind: 'STRUCTURED_MARKUP', codeBlockCount: 0 }
+  }
+  if (text.length > GROUP_STRUCTURED_MAX_CHARS && isLargeJsonPayload(text)) {
+    return { kind: 'JSON', codeBlockCount: 0 }
+  }
+  if (text.length > GROUP_STRUCTURED_MAX_CHARS && isLargeSqlPayload(text)) {
+    return { kind: 'SQL', codeBlockCount: 0 }
+  }
+  if (text.length > GROUP_STRUCTURED_MAX_CHARS && isLargeLogPayload(text)) {
+    return { kind: 'LOG', codeBlockCount: 0 }
+  }
+  if (isHighDensityBase64(text)) {
+    return { kind: 'BASE64', codeBlockCount: 0 }
+  }
+
+  const codeLike = inspectCodeLikeLines(text)
+  if (codeLike.chars > GROUP_CODE_MAX_CHARS || codeLike.lines > GROUP_CODE_MAX_LINES) {
+    return { kind: 'CODE_DENSE', codeBlockCount: 0 }
+  }
+  return { kind: 'NONE', codeBlockCount: 0 }
+}
+
+function inspectFencedCode(text: string): FencedCodeMetrics {
+  let inCodeBlock = false
+  let codeBlockCount = 0
+  let codeChars = 0
+  let codeLines = 0
+  const codeLinesText: string[] = []
+  for (const line of splitLines(text)) {
+    if (isFence(line.content)) {
+      if (inCodeBlock) {
+        inCodeBlock = false
+      } else {
+        inCodeBlock = true
+        codeBlockCount += 1
+      }
+      continue
+    }
+    if (!inCodeBlock) continue
+    codeChars += line.content.length
+    codeLines += 1
+    codeLinesText.push(line.content)
+  }
+  return { codeBlockCount, codeChars, codeLines, codeText: codeLinesText.join('\n') }
+}
+
+function isStructuredMarkup(text: string): boolean {
+  const tags = text.match(/<\/?[A-Za-z][^>\r\n]*>/gu) ?? []
+  if (tags.length < 4) return false
+  const hasKnownRoot = /<\s*(?:svg|html|xml)\b/iu.test(text) || /<\?xml\b/iu.test(text)
+  const closingTagCount = tags.filter((tag) => /^<\//u.test(tag)).length
+  return hasKnownRoot || closingTagCount >= 2
+}
+
+function isLargeJsonPayload(text: string): boolean {
+  const normalized = text.trim()
+  const candidates = [normalized]
+  const embedded = /(?:^|\r?\n)\s*([\[{][\s\S]*[\]}])\s*$/u.exec(normalized)?.[1]
+  if (embedded !== undefined && embedded !== normalized) {
+    candidates.push(embedded)
+  }
+  for (const candidate of candidates) {
+    const first = candidate[0]
+    if (first !== '{' && first !== '[') continue
+    try {
+      const parsed: unknown = JSON.parse(candidate)
+      if (parsed !== null && typeof parsed === 'object') return true
+    } catch {
+      // A prose prefix or a non-JSON code block is not a structured payload.
+    }
+  }
+  return false
+}
+
+function isLargeSqlPayload(text: string): boolean {
+  const statementCount = text.match(/(?:^|[;\r\n])\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+(?:TABLE|DATABASE|INDEX)|ALTER\s+TABLE|DROP\s+(?:TABLE|DATABASE|INDEX)|WITH)\b/giu)?.length ?? 0
+  const semicolonCount = text.match(/;/gu)?.length ?? 0
+  return statementCount >= 2 || (statementCount >= 1 && semicolonCount >= 2)
+}
+
+function isLargeLogPayload(text: string): boolean {
+  const logLikeLines = splitLines(text).filter((line) =>
+    /^(?:\[?\d{4}[-/]\d{2}[-/]\d{2}|(?:DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b|Traceback \(|(?:[A-Za-z_$][\w$]*(?:Error|Exception))\b|at\s+\S+)/iu.test(line.content.trim()),
+  ).length
+  return logLikeLines >= 4
+}
+
+function isHighDensityBase64(text: string): boolean {
+  const compact = text.replace(/\s+/gu, '')
+  if (compact.length < GROUP_BASE64_MIN_CHARS || /[\p{Script=Han}<>{};]/u.test(text)) return false
+  if (!/^[A-Za-z0-9+/]+={0,2}$/u.test(compact)) return false
+  // Long prose is not an encoded payload merely because it contains letters.
+  // Require an encoding-shaped signal when whitespace is present.
+  return !/\s/u.test(text) || /[0-9+/=]/u.test(compact)
+}
+
+function inspectCodeLikeLines(text: string): { lines: number; chars: number } {
+  let lines = 0
+  let chars = 0
+  for (const line of splitLines(text)) {
+    if (!isCodeLikeLine(line.content)) continue
+    lines += 1
+    chars += line.content.length
+  }
+  return { lines, chars }
+}
+
+function isCodeLikeLine(line: string): boolean {
+  const trimmed = line.trim()
+  if (trimmed.length === 0) return false
+  if (isClearlyCodeOrDiagnostic(trimmed)) return true
+  if (/^(?:public|private|protected|static|async|await|def|fn|func|using|package)\b/iu.test(trimmed)) return true
+  if (/^(?:echo|set|export|source|grep|sed|awk|chmod|mkdir|touch|#!\/|then|else|elif|fi|done|esac)\b/iu.test(trimmed)) return true
+  if (/^(?:int|long|short|float|double|boolean|bool|char|string|String|var|List|Map|Set)\b[^=\r\n]*=/u.test(trimmed)) return true
+  return /[A-Za-z_$][\w$]*\s*[({=].*[;{}]?$/.test(trimmed) && !/[\p{Script=Han}]/u.test(trimmed)
 }
 
 function normalizePresentationLine(line: string): string {

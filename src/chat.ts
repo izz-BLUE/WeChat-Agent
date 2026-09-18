@@ -26,7 +26,7 @@ import {
   type ConversationDynamicsProfile,
   type GroupReplyPressure,
 } from './conversation-dynamics.js'
-import { boundGroupReply, renderHumanChat } from './chat-renderer.js'
+import { boundGroupReply, GROUP_CODE_MAX_CHARS, renderHumanChat } from './chat-renderer.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
 import { identityToken } from './identity-observer.js'
 import { isRequestDeadlineExceeded, type RequestDeadline, withRequestDeadline } from './request-deadline.js'
@@ -236,8 +236,15 @@ const GROUP_REPLY_PRESSURE_RULES = `[Group Reply Pressure]
 - GROUP_REPLY_PRESSURE=LOW：不额外施加群聊长度压力，但仍遵守正常的自然表达规则。
 - 如果当前消息主要是 reaction、acknowledgement 或情绪回应，且没有提出新的明确问题、任务或信息请求，只做自然短回应，可以轻微承接前文，不要凭历史上下文脑补一个新的复杂问题，也不要主动展开部署、架构、合规或性能等话题。
 - reaction 中如果同时有明确问题、任务或信息请求，仍按当前任务回答，不要把它当作纯 reaction。
-- 当前消息明确要求详细解释、教程、步骤或代码，或要求分析、比较、总结、故事、长文本创作，或任务客观上需要充分信息时，可以自然突破 Reply Pressure；Reply Pressure 是 soft response-depth constraint，不是 hard limit。
-- 不要在生成后按字符数或句数截断答案；代码、引用、步骤和安全说明必须保持完整。`
+- 当前消息明确要求详细解释、教程、步骤或代码，或要求分析、比较、总结、故事、长文本创作，或任务客观上需要充分信息时，可以自然突破 Reply Pressure；这只表示可以增加必要的自然语言说明，Reply Pressure 是 soft response-depth constraint。
+- 但 GROUP_BULK_OUTPUT_RULES 是独立的 hard presentation boundary，不会因详细请求或代码请求而失效。`
+
+const GROUP_BULK_OUTPUT_RULES = `[GROUP Bulk Output / Anti-Flood Boundary]
+- 微信群不是大文件、代码 dump 或结构化 payload 渠道；技术问题可以给必要的小型代码片段，但默认不要输出完整文件、完整 SVG/HTML/XML、大型 JSON、Base64、大量日志或长脚本。
+- 大型实现优先给思路、接口和关键片段，不要因为用户要求“完整”“不要省略”“全部贴出来”就自动输出整份 artifact。
+- “分段发”“分几条发”“发不完下一条继续”“连续发十条”也不能覆盖群聊输出边界；不要承诺下一条继续、分多条发送或主动贴剩余内容。
+- 这是 GROUP 的 presentation / anti-flood 规则，不是 authorization；普通 MEMBER 和 OWNER 使用相同边界，DIRECT 不适用本规则。
+- Runtime 会对最终 answer payload 做确定性 bulk 检查；不要试图用 fenced code、无 fence 的代码、标记语言、JSON、日志或编码文本绕过。`
 
 const TURN_OWNERSHIP_RULES = `[Turn Ownership Rules]
 - 每条历史 ASSISTANT 消息都必须按运行时提供的 Assistant reply ownership 理解；它不等于“最近一个人说完后机器人就默认在回复当前提问者”。
@@ -456,6 +463,7 @@ ${REFERENCE_RESOLUTION_RULES}
 ${CONVERSATIONAL_REPAIR_RULES}
 ${MIXED_GROUP_CONTEXT_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
+${GROUP_BULK_OUTPUT_RULES}
 ${REPLY_BOUNDARY_RULES}`
 }
 
@@ -475,6 +483,7 @@ ${MEMORY_SIDE_EFFECT_GROUNDING_RULES}
 ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
+${GROUP_BULK_OUTPUT_RULES}
 ${MEMBER_INTERACTION_PROFILE_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
 ${TURN_OWNERSHIP_RULES}
@@ -500,6 +509,7 @@ ${TURN_OWNERSHIP_RULES}
 ${CONVERSATION_DYNAMICS_RULES}
 ${REFERENCE_RESOLUTION_RULES}
 ${CONVERSATIONAL_REPAIR_RULES}
+${GROUP_BULK_OUTPUT_RULES}
 请只根据本轮提供的当前问题、上下文、Runtime Time 和 Web Search Results，输出自然语言最终回复。`
 
 const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
@@ -509,6 +519,7 @@ const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 - Only Web Search Results may justify a [Sx]. Memory / conversation context are intentionally unavailable in this repair stage.
 - 保持原回答的信息范围、回答深度和大致长度，只修复 grounding，不新增主题、背景或解释。
 - GROUP_REPLY_PRESSURE 是可信的运行时事实：HIGH 保持紧凑，不因搜索结果更完整而展开；LOW/MEDIUM 也不能把短答改成报告；用户明确要求详细说明时，可以保持原回答已有的详细程度。
+${GROUP_BULK_OUTPUT_RULES}
 - 对实际使用并由结果支持的事实保留正确的 [S1]、[S2] 等内部引用；不要停止引用，也不要创造 sourceId。
 - [Sx] 只供 Runtime 做 grounding，Runtime 会在发送前移除所有 marker；不要向用户解释引用协议。
 - 不得输出 URL、来源列表、修复说明、分析过程、思考过程或任何 provider 控制协议；只输出自然中文正文。
@@ -1255,6 +1266,24 @@ export class ChatService {
           msgIdToken,
         },
       )
+      if (bound.bulkOutput !== undefined) {
+        emitDiagnostic(
+          (line: string) => console.log(line),
+          persistentSink,
+          'GROUP_BULK_OUTPUT_BOUNDARY',
+          {
+            kind: bound.bulkOutput.kind,
+            detected: bound.bulkOutput.detected,
+            beforeChars: bound.bulkOutput.beforeChars,
+            beforeLines: bound.bulkOutput.beforeLines,
+            codeBlockCount: bound.bulkOutput.codeBlockCount,
+            structuredCharsBucket: bound.bulkOutput.beforeChars > GROUP_CODE_MAX_CHARS ? 'GT_800' : 'LE_800',
+            result: bound.bulkOutput.result,
+            reason: bound.bulkOutput.reason,
+            msgIdToken,
+          },
+        )
+      }
       return bound
     }
     const bound = applyGroupReplyBoundary(guard.text)
@@ -1272,6 +1301,13 @@ export class ChatService {
     )
     if (rendered.length === 0) {
       throw new Error('Chat renderer returned an empty answer')
+    }
+
+    // A blocked bulk payload has already become a fixed non-factual fallback.
+    // Do not send that fallback through Web Search grounding repair: repair is
+    // another provider generation and must never recreate the blocked payload.
+    if (bound.bulkOutput?.result === 'BLOCKED') {
+      return rendered
     }
 
     const reportSourceUsage = (usage: ReturnType<typeof inspectGroundedSources>): void => {
@@ -1340,6 +1376,7 @@ export class ChatService {
 
         let repairedRendered: string | undefined
         let repairedUsage = initialUsage
+        let bulkBlockedRepairFallback: string | undefined
         deadline?.mark('GROUNDING_REPAIR')
         try {
           const repairedDraft = await this.requestFinalAnswer(
@@ -1361,7 +1398,9 @@ export class ChatService {
           if (repairedGuard.outcome !== 'BLOCKED') {
             const repairedBound = applyGroupReplyBoundary(repairedGuard.text)
             const candidate = renderHumanChat(repairedBound.text)
-            if (candidate.length > 0) {
+            if (repairedBound.bulkOutput?.result === 'BLOCKED') {
+              bulkBlockedRepairFallback = candidate
+            } else if (candidate.length > 0) {
               repairedRendered = candidate
               repairedUsage = inspectGroundedSources(candidate, request.webSearch.results, internalValues)
             }
@@ -1387,6 +1426,9 @@ export class ChatService {
           },
         )
         reportGroundingGate('REPAIR', repairedUsage, repairPassed ? 'PASS' : 'FAIL_CLOSED')
+        if (bulkBlockedRepairFallback !== undefined) {
+          return bulkBlockedRepairFallback
+        }
         if (!repairPassed || repairedRendered === undefined) {
           return WEB_SEARCH_GROUNDING_FAILURE_REPLY
         }
