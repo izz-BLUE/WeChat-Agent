@@ -171,7 +171,7 @@ function parseExtractorInput(user: string): MemoryInputMessage[] {
   const body = user.split('messages:\n')[1] ?? ''
   const messages: MemoryInputMessage[] = []
   for (const block of body.split(/\n(?=\[)/u)) {
-    const match = /^\[(.+) \| (OWNER|MEMBER)\]\n([\s\S]*)$/u.exec(block.trim())
+    const match = /^\[M\d+ \| (.+) \| (OWNER|MEMBER)\]\n([\s\S]*)$/u.exec(block.trim())
     if (match) {
       messages.push({ speakerLabel: match[1] as string, role: match[2] as 'OWNER' | 'MEMBER', content: match[3] as string })
     }
@@ -370,7 +370,7 @@ async function feed(service: MemoryService, count: number, options: TurnOptions 
 
 /** 1. Same requester, same conversation: memory persists across turns. */
 async function testSameRequesterContinuity(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { signature: 'sig-a', text: '记住我的代号是 Alpha' })
 
   const first = await retrieve(harness.service, { signature: 'sig-a' })
@@ -409,7 +409,7 @@ async function testRestartPersistence(): Promise<void> {
 
 /** 3. Personal memory is isolated per requester. */
 async function testCrossRequesterIsolation(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { signature: 'sig-a' })
 
   const a = await retrieve(harness.service, { signature: 'sig-a' })
@@ -421,7 +421,7 @@ async function testCrossRequesterIsolation(): Promise<void> {
 
 /** 4. Personal memory follows the requester across conversations. */
 async function testCrossGroupPersonalContinuity(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { signature: 'sig-a', conversationId: 'room-a@chatroom' })
 
   const otherRoom = await retrieve(harness.service, { signature: 'sig-a', conversationId: 'room-b@chatroom' })
@@ -457,7 +457,7 @@ async function testGroupCrossRoomIsolation(): Promise<void> {
 
 /** 7. Owner personal writes land in the OWNER scope. */
 async function testOwnerPersonalScope(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"OWNER","content":"Owner 的代号是 Boss"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"OWNER","content":"Owner 的代号是 Boss","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { signature: 'sig-o', role: 'OWNER' })
 
   const record = harness.store.retrieve([{ scopeType: 'OWNER', scopeId: 'sig-o', visibility: 'SHARED' }], 10)
@@ -470,7 +470,7 @@ async function testOwnerPersonalScope(): Promise<void> {
 
 /** 8. Member personal writes land in the MEMBER scope. */
 async function testMemberPersonalScope(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { signature: 'sig-a', role: 'MEMBER' })
 
   const record = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: 'sig-a', visibility: 'SHARED' }], 10)
@@ -640,7 +640,7 @@ async function testTimerNeverReplies(): Promise<void> {
     store,
     extractor: new MemoryExtractor(async (_system, user) => {
       structuredCalls.push(user)
-      return '[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'
+      return '[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'
     }),
     mutate: async (_system, user) => {
       structuredCalls.push(user)
@@ -678,7 +678,7 @@ async function testTimerNeverReplies(): Promise<void> {
 
 /** 17. One message enters the memory pipeline exactly once. */
 async function testDuplicateMessageWritesOnce(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { chatTriggered: true, msgId: 'dup' })
   assert(extractorCallCount(harness) === 1, 'the first batch did not run once')
   assert(harness.service.recordCount === 1, 'the first batch did not write exactly one record')
@@ -761,7 +761,7 @@ async function testEmptyExtractorNoWrite(): Promise<void> {
 /** 22. Provider reasoning is never persisted as memory. */
 async function testReasoningNeverPersisted(): Promise<void> {
   const harness = createHarness({
-    extractorResponses: ['<think>我在推理用户想让我记住什么</think>[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'],
+    extractorResponses: ['<think>我在推理用户想让我记住什么</think>[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'],
   })
   await feed(harness.service, 3, { chatTriggered: true })
   assert(harness.service.recordCount === 1, 'the balanced thinking block broke extraction')
@@ -828,7 +828,7 @@ async function testRawIdentityNeverLogged(): Promise<void> {
 
 /** 25. A provider failure never fabricates a memory write. */
 async function testProviderFailureNoFalseWrite(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   const chat = createChatService()
   chat.fail = true
   let failed = false
@@ -924,7 +924,7 @@ async function testRecentContextSeparatedFromMemory(): Promise<void> {
 
 /** 29. Two members in one room are never conflated in memory or transcript. */
 async function testSpeakerAttributionDoesNotConfusePersonalMemory(): Promise<void> {
-  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha"}]'] })
+  const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   const chat = createChatService()
 
   // A tells the bot its codename; the automatic batch writes A's personal scope.

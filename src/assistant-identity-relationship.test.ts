@@ -553,7 +553,7 @@ async function testAddressPreferenceIsNotRelationship(): Promise<void> {
   const store = new MemoryStore({ filePath: memoryFileIn(directory), pathSource: 'TEST' })
   const service = new MemoryService({
     store,
-    extractor: new MemoryExtractor(async () => '[{"scope":"MEMBER","kind":"ADDRESS_PREFERENCE","content":"叫我妈妈"}]'),
+    extractor: new MemoryExtractor(async () => '[{"scope":"MEMBER","kind":"ADDRESS_PREFERENCE","content":"叫我妈妈","evidenceType":"EXPLICIT_PREFERENCE","evidence":["M1"]}]'),
     mutate: async () => '{"operation":"NONE"}',
     idFactory: () => 'address-preference-1',
   })

@@ -21,6 +21,7 @@
 import { createHash } from 'node:crypto'
 import type { ConversationType } from './message-contract.js'
 import type { MemoryKind, MemorySubject } from './assistant-identity.js'
+import type { MemoryEvidenceType } from './memory-evidence.js'
 
 /** Personal scope of the owner requester. */
 export const MEMORY_SCOPE_OWNER = 'OWNER'
@@ -60,6 +61,18 @@ export interface MemoryRecord {
   createdAt: number
   updatedAt: number
   isDeleted: boolean
+  /**
+   * EVIDENCE / CONFIDENCE FOUNDATION (optional backward-compatible extension,
+   * file schema stays version 1). Absent on legacy records, which read as
+   * LEGACY_UNKNOWN; the fields are audit/write metadata only and never affect
+   * retrieval semantics. `confidence` is always runtime-derived (see
+   * `memory-evidence.ts`), never provider-supplied.
+   */
+  evidenceType?: MemoryEvidenceType
+  confidence?: number
+  evidenceCount?: number
+  firstEvidenceAt?: number
+  lastEvidenceAt?: number
 }
 
 export interface MemoryAccessRule {
@@ -93,6 +106,18 @@ export interface MemoryCandidate {
   subject: MemorySubject
   kind: MemoryKind
   content: string
+  /**
+   * The extractor's declared evidence class (automatic subset only). The
+   * runtime validates it against the closed set — a provider declaring a
+   * runtime-owned class is rejected, never trusted.
+   */
+  evidenceType?: MemoryEvidenceType
+  /**
+   * The extractor's declared batch references, exactly as parsed (raw values).
+   * Batch-local transport only: never persisted, never rendered — the runtime
+   * converts them to an evidence count or rejects the candidate.
+   */
+  evidenceRefs?: readonly unknown[]
 }
 
 /** Rejected candidate reason, used for `[MEMORY_WRITE]` diagnostics. */
@@ -108,6 +133,11 @@ export type MemoryCandidateRejection =
   | 'ASSISTANT_RULE_NOT_WRITABLE'
   | 'THIRD_PARTY_ASSERTION_NOT_WRITABLE'
   | 'EPHEMERAL_CONVENTION_NOT_WRITABLE'
+  | 'EVIDENCE_TYPE_NOT_ALLOWED'
+  | 'EVIDENCE_MISSING'
+  | 'EVIDENCE_INVALID'
+  | 'INSUFFICIENT_EVIDENCE'
+  | 'INFERRED_PATTERN_NOT_DURABLE'
 
 export const MEMORY_TEXT_MARKER = 'wxid_'
 export const MEMORY_MAX_CONTENT_CHARS = 500

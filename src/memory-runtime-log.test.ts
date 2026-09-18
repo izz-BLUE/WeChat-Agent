@@ -314,7 +314,7 @@ async function testMemoryStoreEventsAreDurable(): Promise<void> {
  */
 async function testTriggerAndWriteEventsAreDurable(): Promise<void> {
   const harness = createMemoryHarness({
-    extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"}]`],
+    extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`],
   })
 
   // Two messages only buffer; the third reaches the chat threshold and flushes.
@@ -349,7 +349,7 @@ async function testTriggerAndWriteEventsAreDurable(): Promise<void> {
   // A candidate whose scope contradicts the trusted role is durable too, reported
   // as the reason enum only.
   const rejected = createMemoryHarness({
-    extractorResponses: [`[{"scope":"OWNER","content":"${FACT}"}]`],
+    extractorResponses: [`[{"scope":"OWNER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`],
   })
   observe(rejected.service, 3, { text: FACT, messageIdPrefix: 'reject' })
   await rejected.service.flushAll()
@@ -517,7 +517,7 @@ async function testContextEventsUseTheirOwnNamespace(): Promise<void> {
 async function testDurableMemoryLogCarriesNoRawIdentityOrContent(): Promise<void> {
   const harness = createMemoryHarness({
     extractorResponses: [
-      `[{"scope":"MEMBER","content":"${FACT}"}]`,
+      `[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`,
       `[{"scope":"MEMBER","content":"代号是 ${RAW_REQUESTER}"}]`,
     ],
   })
@@ -555,7 +555,7 @@ async function testDurableMemoryLogCarriesNoRawIdentityOrContent(): Promise<void
  */
 async function testStdoutAndDurableEventsAgree(): Promise<void> {
   const harness = createMemoryHarness({
-    extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"}]`],
+    extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`],
   })
   seed(harness.store, { memoryId: 'agree-1', scopeType: 'MEMBER', scopeId: REQUESTER, content: FACT })
   observe(harness.service, 3, { text: FACT })
@@ -615,7 +615,7 @@ async function testLoggingFailureNeverBreaksMemoryOrChat(): Promise<void> {
   })
   const service = new MemoryService({
     store,
-    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}"}]`),
+    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`),
     mutate: async () => '{"operation":"NONE"}',
     idFactory: sequentialIds(),
     log: () => undefined,
@@ -652,7 +652,7 @@ async function testLoggingFailureNeverBreaksMemoryOrChat(): Promise<void> {
   })
   const secondService = new MemoryService({
     store: secondStore,
-    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}"}]`),
+    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`),
     mutate: async () => '{"operation":"NONE"}',
     idFactory: sequentialIds(),
     log: () => undefined,

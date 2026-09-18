@@ -172,7 +172,7 @@ async function testCurrentRequesterRawIdentityCannotRemain(): Promise<void> {
 /** Case 2. MEMBER automatic extraction uses the same safe personal boundary. */
 async function testMemberRememberWritesSafeContent(): Promise<void> {
   const harness = createHarness()
-  harness.setExtraction(`[{'scope':'MEMBER','content':'${MEMBER} 的名字是${FACT}'}]`.replaceAll("'", '"'))
+  harness.setExtraction(`[{'scope':'MEMBER','content':'${MEMBER} 的名字是${FACT}','evidenceType':'EXPLICIT_SELF_STATEMENT','evidence':['M1']}]`.replaceAll("'", '"'))
 
   await automaticMemberRemember(harness, MEMBER)
 

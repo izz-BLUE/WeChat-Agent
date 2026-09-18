@@ -96,7 +96,7 @@ function startFakeProvider(): Promise<FakeProvider> {
         if (system.includes(MUTATION_PROMPT_MARKER)) {
           content = '{"operation":"NONE"}'
         } else if (system.includes(EXTRACTOR_PROMPT_MARKER)) {
-          content = `[{"scope":"MEMBER","content":"${MEMORY_FACT}"}]`
+          content = `[{"scope":"MEMBER","content":"${MEMORY_FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`
         }
       } catch {
         // A body that does not parse still gets the plain reply: the test asserts

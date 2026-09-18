@@ -276,7 +276,7 @@ function chatCallCount(chat: CapturingChatService): number {
  */
 async function testDuplicateKeyNeverDuplicatesARecord(): Promise<void> {
   // 1. Two identical extractor batches write one record.
-  const harness = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"}]`] })
+  const harness = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`] })
   await feed(harness.service, 3, { text: FACT })
   await feed(harness.service, 3, { text: FACT })
   assert(memoryRecordCount(harness.service) === 1, `a duplicate extractor batch wrote ${memoryRecordCount(harness.service)} records`)
@@ -286,14 +286,14 @@ async function testDuplicateKeyNeverDuplicatesARecord(): Promise<void> {
   )
 
   // 2. Whitespace-only differences normalize to the same content hash.
-  const spaced = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"}]`, '[{"scope":"MEMBER","content":"A  的代号是    Alpha"}]'] })
+  const spaced = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`, '[{"scope":"MEMBER","content":"A  的代号是    Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(spaced.service, 3, { text: FACT })
   await feed(spaced.service, 3, { text: FACT })
   assert(memoryRecordCount(spaced.service) === 1, `a normalized duplicate wrote ${memoryRecordCount(spaced.service)} records`)
 
   // 3. The key is per scope: a legal explicit GROUP record with the same
   // content is a new record, while automatic GROUP extraction is rejected.
-  const scoped = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"}]`] })
+  const scoped = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`] })
   await feed(scoped.service, 3, { text: FACT })
   seed(scoped.store, { memoryId: 'scoped-group', scopeType: 'GROUP', scopeId: ROOM_A, content: FACT })
   assert(memoryRecordCount(scoped.service) === 2, `distinct scopes collapsed into ${memoryRecordCount(scoped.service)} records`)
@@ -304,7 +304,7 @@ async function testDuplicateKeyNeverDuplicatesARecord(): Promise<void> {
   const firstStore = new MemoryStore({ filePath: memoryFileIn(restartRoot), log: (message) => firstLogs.push(message), pathSource: 'TEST' })
   const firstService = new MemoryService({
     store: firstStore,
-    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}"}]`),
+    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`),
     mutate: async () => '{"operation":"NONE"}',
     idFactory: sequentialIds(),
     log: (message) => firstLogs.push(message),
@@ -318,7 +318,7 @@ async function testDuplicateKeyNeverDuplicatesARecord(): Promise<void> {
   const secondStore = new MemoryStore({ filePath: memoryFileIn(restartRoot), log: (message) => secondLogs.push(message), pathSource: 'TEST' })
   const secondService = new MemoryService({
     store: secondStore,
-    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}"}]`),
+    extractor: new MemoryExtractor(async () => `[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`),
     mutate: async () => '{"operation":"NONE"}',
     idFactory: sequentialIds(),
     log: (message) => secondLogs.push(message),
@@ -408,7 +408,7 @@ async function testSoftDeletedRecordIsNeverRetrieved(): Promise<void> {
 async function testTimerExtractionWritesMemoryWithoutAnyOutbound(): Promise<void> {
   assert(MEMORY_TIMER_INTERVAL_MS === 300_000, 'the timer interval is not the historical five minutes')
 
-  const harness = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}"}]`] })
+  const harness = createHarness({ extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]`] })
   const chat = createChatService()
   const session = createSession(harness.service, chat)
 

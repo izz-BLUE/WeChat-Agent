@@ -145,6 +145,8 @@ async function testAutomaticPreferencesNormalizeToRequesterScope(): Promise<void
       : kind === 'CONTENT_PREFERENCE'
         ? '我不喜欢剧透'
         : '以后回答我短一点',
+    evidenceType: 'EXPLICIT_PREFERENCE',
+    evidence: ['M1'],
   })))
 
   for (const role of ['OWNER', 'MEMBER'] as const) {

@@ -41,6 +41,7 @@ import {
   type MemoryVisibility,
   type MemoryWriteStatus,
 } from './memory-models.js'
+import { isMemoryEvidenceType, type MemoryEvidenceMetadata } from './memory-evidence.js'
 
 export const MEMORY_STORE_SCHEMA_VERSION = 1
 
@@ -201,6 +202,15 @@ export class MemoryStore {
             origin: record.origin,
             kind: 'ADDRESS_PREFERENCE',
             subject: 'CURRENT_REQUESTER',
+            // The service builds authoritative explicit evidence for the
+            // replacement; legacy records without evidence keep their absence.
+            ...(record.evidenceType === undefined ? {} : {
+              evidenceType: record.evidenceType,
+              confidence: record.confidence,
+              evidenceCount: record.evidenceCount,
+              firstEvidenceAt: record.firstEvidenceAt,
+              lastEvidenceAt: record.lastEvidenceAt,
+            }),
           }
         }
         return matchingIndexes.has(index)
@@ -222,6 +232,7 @@ export class MemoryStore {
     updatedAt: number,
     kind?: MemoryKind,
     subject?: MemorySubject,
+    evidence?: MemoryEvidenceMetadata,
   ): boolean {
     if (!this.enabled) {
       return false
@@ -245,6 +256,13 @@ export class MemoryStore {
       updatedAt,
       ...(kind === undefined ? {} : { kind }),
       ...(subject === undefined ? {} : { subject }),
+      ...(evidence === undefined ? {} : {
+        evidenceType: evidence.evidenceType,
+        confidence: evidence.confidence,
+        evidenceCount: evidence.evidenceCount,
+        firstEvidenceAt: evidence.firstEvidenceAt,
+        lastEvidenceAt: evidence.lastEvidenceAt,
+      }),
     }
     if (!this.save()) {
       this.records[index] = previous
@@ -424,6 +442,57 @@ function parseDocument(value: unknown): MemoryRecord[] | null {
 const SCOPE_TYPES: readonly MemoryScopeType[] = ['OWNER', 'MEMBER', 'GROUP']
 const VISIBILITIES: readonly MemoryVisibility[] = ['PRIVATE', 'SHARED']
 
+const EVIDENCE_FIELD_KEYS = [
+  'evidenceType',
+  'confidence',
+  'evidenceCount',
+  'firstEvidenceAt',
+  'lastEvidenceAt',
+] as const
+
+/**
+ * Backward-compatible evidence extension (file schema stays version 1).
+ * A record without any evidence field is a legacy record and is accepted as
+ * always. A record with evidence fields must carry the complete, valid set —
+ * the writer always stores all five together, so a partial or out-of-range set
+ * is corruption, same as any other invalid field.
+ */
+function parseEvidenceFields(record: Record<string, unknown>): MemoryEvidenceMetadata | undefined | null {
+  const present = EVIDENCE_FIELD_KEYS.filter((key) => record[key] !== undefined)
+  if (present.length === 0) {
+    return undefined
+  }
+  if (present.length !== EVIDENCE_FIELD_KEYS.length) {
+    return null
+  }
+  if (!isMemoryEvidenceType(record.evidenceType)) {
+    return null
+  }
+  const confidence = record.confidence
+  if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+    return null
+  }
+  const evidenceCount = record.evidenceCount
+  if (typeof evidenceCount !== 'number' || !Number.isSafeInteger(evidenceCount) || evidenceCount < 1) {
+    return null
+  }
+  const firstEvidenceAt = record.firstEvidenceAt
+  const lastEvidenceAt = record.lastEvidenceAt
+  if (!Number.isFinite(firstEvidenceAt) || !Number.isFinite(lastEvidenceAt)) {
+    return null
+  }
+  if ((firstEvidenceAt as number) > (lastEvidenceAt as number)) {
+    return null
+  }
+  return {
+    evidenceType: record.evidenceType,
+    confidence,
+    evidenceCount,
+    firstEvidenceAt: firstEvidenceAt as number,
+    lastEvidenceAt: lastEvidenceAt as number,
+  }
+}
+
 function parseRecord(value: unknown): MemoryRecord | null {
   if (typeof value !== 'object' || value === null) {
     return null
@@ -449,6 +518,11 @@ function parseRecord(value: unknown): MemoryRecord | null {
   if (!Number.isFinite(record.createdAt) || !Number.isFinite(record.updatedAt)) return null
   if (typeof record.isDeleted !== 'boolean') return null
 
+  const evidence = parseEvidenceFields(record)
+  if (evidence === null) {
+    return null
+  }
+
   return {
     memoryId: record.memoryId,
     scopeType: scopeType as MemoryScopeType,
@@ -465,6 +539,7 @@ function parseRecord(value: unknown): MemoryRecord | null {
     createdAt: record.createdAt as number,
     updatedAt: record.updatedAt as number,
     isDeleted: record.isDeleted,
+    ...(evidence === undefined ? {} : evidence),
   }
 }
 

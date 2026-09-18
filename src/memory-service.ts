@@ -60,6 +60,11 @@ import {
   type MemoryWriteStatus,
 } from './memory-models.js'
 import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
+import {
+  admitAutomaticEvidence,
+  memoryConfidenceBand,
+  upgradedExplicitEvidence,
+} from './memory-evidence.js'
 import type { BotMentionSpanTrust, UserContentSpanTrust, UserTextShape } from './canonical-user-text.js'
 import type { MentionState } from './agent-adapter.js'
 import {
@@ -101,6 +106,15 @@ export const MEMORY_BACKGROUND_TIMEOUT_MS = 8_000
  * could not answer when a real `@bot 记住…` message silently became ordinary chat.
  */
 export const MEMORY_ADMISSION_EVENT = 'MEMORY_ADMISSION'
+
+/**
+ * EVIDENCE FOUNDATION diagnostic. One line per evidence decision: either the
+ * gate admitted a candidate's evidence (and the metadata reached a durable
+ * record) or it skipped the candidate with a closed-set reason. Fields are the
+ * origin, the evidence class, the evidence count and the confidence band —
+ * never the memory content, a source message, a scope id or a requester id.
+ */
+export const MEMORY_EVIDENCE_EVENT = 'MEMORY_EVIDENCE'
 
 /**
  * Why an explicit-memory entry ended the way it did.
@@ -433,6 +447,15 @@ export class MemoryService {
     emitDiagnostic(this.log, this.sink, event, fields)
   }
 
+  /**
+   * One `[MEMORY_EVIDENCE]` line per evidence decision. Fields are enums,
+   * counts and the confidence BAND only — never a memory content, a source
+   * message, a scope id, a requester id or an exact confidence decimal.
+   */
+  private emitMemoryEvidence(fields: DiagnosticFields): void {
+    emitDiagnostic(this.log, this.sink, MEMORY_EVIDENCE_EVENT, fields)
+  }
+
   public get isEnabled(): boolean {
     return this.store.isEnabled
   }
@@ -687,6 +710,14 @@ export class MemoryService {
     }
 
     const now = this.now()
+    // The self-address choice is authoritative explicit evidence. An update of
+    // an existing preference keeps the original first-evidence time and counts
+    // the new statement; a repeat (store SKIPPED) changes nothing on disk, so
+    // the existing record's evidence is never downgraded.
+    const previousPreference = this.store
+      .retrieve([{ scopeType, scopeId: request.requesterId, visibility: 'SHARED' }], MEMORY_ELIGIBLE_LIMIT)
+      .find((record) => record.kind === 'ADDRESS_PREFERENCE' && record.subject === 'CURRENT_REQUESTER')
+    const evidence = upgradedExplicitEvidence(previousPreference, 'EXPLICIT_SELF_ADDRESS', now)
     const status = this.store.upsertAddressPreference({
       memoryId: this.idFactory(),
       scopeType,
@@ -703,8 +734,19 @@ export class MemoryService {
       isDeleted: false,
       kind: 'ADDRESS_PREFERENCE',
       subject: 'CURRENT_REQUESTER',
+      ...evidence,
     })
     this.emit('MEMORY_WRITE', { scope: scopeType, visibility: 'SHARED', result: status })
+    if (status === 'WRITTEN') {
+      this.emitMemoryEvidence({
+        origin: 'EXPLICIT_SELF_ADDRESS',
+        evidenceType: evidence.evidenceType,
+        evidenceCount: evidence.evidenceCount,
+        confidenceBand: memoryConfidenceBand(evidence.confidence),
+        result: 'ADMITTED',
+        reason: 'EVIDENCE_ADMITTED',
+      })
+    }
     this.emit('MEMORY_TRIGGER', {
       trigger: 'SELF_ADDRESS_PREFERENCE_FAST_PATH',
       role: request.requesterRole,
@@ -900,6 +942,9 @@ export class MemoryService {
         return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
       }
 
+      // An owner command is authoritative evidence: a fresh ADD starts at
+      // confidence 1 with a single evidence item stamped now.
+      const evidence = upgradedExplicitEvidence(undefined, 'EXPLICIT_OWNER_COMMAND', now)
       const status = this.store.add({
         memoryId: this.idFactory(),
         scopeType,
@@ -916,8 +961,19 @@ export class MemoryService {
         createdAt: now,
         updatedAt: now,
         isDeleted: false,
+        ...evidence,
       })
       this.emit('MEMORY_WRITE', { scope: scopeType, visibility: 'SHARED', result: status })
+      if (status === 'WRITTEN') {
+        this.emitMemoryEvidence({
+          origin: 'EXPLICIT_OWNER',
+          evidenceType: evidence.evidenceType,
+          evidenceCount: evidence.evidenceCount,
+          confidenceBand: memoryConfidenceBand(evidence.confidence),
+          result: 'ADMITTED',
+          reason: 'EVIDENCE_ADMITTED',
+        })
+      }
       this.emit('MEMORY_TRIGGER', {
         trigger: 'EXPLICIT_REMEMBER',
         role: request.requesterRole,
@@ -947,8 +1003,22 @@ export class MemoryService {
         this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: 'FAIL', reason: rejection })
         return { handled: true, reply: MEMORY_WRITE_FAILURE_REPLY }
       }
-      const updated = this.store.update(candidate.memoryId, content, now, kind, subject)
+      // An owner UPDATE upgrades the record to authoritative evidence: the
+      // original first-evidence time is kept, the statement counts as one more
+      // piece of evidence, and a legacy record without evidence starts fresh.
+      const evidence = upgradedExplicitEvidence(candidate, 'EXPLICIT_OWNER_COMMAND', now)
+      const updated = this.store.update(candidate.memoryId, content, now, kind, subject, evidence)
       this.emit('MEMORY_WRITE', { scope: candidate.scopeType, visibility: 'SHARED', result: updated ? 'WRITTEN' : 'FAILED' })
+      if (updated) {
+        this.emitMemoryEvidence({
+          origin: 'EXPLICIT_OWNER',
+          evidenceType: evidence.evidenceType,
+          evidenceCount: evidence.evidenceCount,
+          confidenceBand: memoryConfidenceBand(evidence.confidence),
+          result: 'ADMITTED',
+          reason: 'EVIDENCE_ADMITTED',
+        })
+      }
       this.emit('MEMORY_TRIGGER', { trigger: 'EXPLICIT_REMEMBER', role: request.requesterRole, result: updated ? 'PASS' : 'FAIL' })
       return { handled: true, reply: updated ? '改好了。' : '这条记忆没有更新成功。' }
     }
@@ -1014,7 +1084,7 @@ export class MemoryService {
       let written = 0
       let skipped = 0
       for (const candidate of candidates) {
-        const built = this.buildAutomaticRecord(slot, candidate)
+        const built = this.buildAutomaticRecord(slot, candidate, batch.length)
         if ('rejection' in built) {
           const kind = classifyMemoryKind(candidate.content, candidate.kind)
           const subject = classifyMemorySubject(candidate.scopeType, kind, candidate.subject)
@@ -1030,6 +1100,15 @@ export class MemoryService {
         const status = this.store.add(built.record)
         this.emit('MEMORY_WRITE', { scope: built.record.scopeType, visibility: 'SHARED', result: status })
         if (status === 'WRITTEN') {
+          // ADMITTED means the evidence metadata above reached a durable record.
+          this.emitMemoryEvidence({
+            origin: 'AUTOMATIC',
+            evidenceType: built.record.evidenceType,
+            evidenceCount: built.record.evidenceCount,
+            confidenceBand: memoryConfidenceBand(built.record.confidence),
+            result: 'ADMITTED',
+            reason: 'EVIDENCE_ADMITTED',
+          })
           written += 1
         } else {
           skipped += 1
@@ -1069,6 +1148,7 @@ export class MemoryService {
   private buildAutomaticRecord(
     slot: PendingSlot,
     candidate: MemoryCandidate,
+    batchSize: number,
   ): { record: MemoryRecord } | { rejection: MemoryCandidateRejection } {
     const kind = classifyMemoryKind(candidate.content, candidate.kind)
     const subject = classifyMemorySubject(candidate.scopeType, kind, candidate.subject)
@@ -1107,6 +1187,29 @@ export class MemoryService {
       return { rejection }
     }
 
+    // EVIDENCE GATE — the last check before a durable write. The extractor
+    // declared the class and the batch references; this runtime derives the
+    // confidence, counts distinct valid references and rejects anything the
+    // provider was not allowed to claim. Nothing batch-local (M1/M2, message
+    // bodies, ids) survives into the record.
+    const gate = admitAutomaticEvidence({
+      declaredEvidenceType: candidate.evidenceType,
+      declaredEvidenceRefs: candidate.evidenceRefs,
+      batchSize,
+      now: this.now(),
+    })
+    if (gate.outcome === 'SKIP') {
+      this.emitMemoryEvidence({
+        origin: 'AUTOMATIC',
+        evidenceType: gate.declaredEvidenceType,
+        evidenceCount: gate.validReferenceCount,
+        confidenceBand: 'LEGACY',
+        result: 'SKIPPED',
+        reason: gate.reason,
+      })
+      return { rejection: gate.reason }
+    }
+
     const now = this.now()
     return {
       record: {
@@ -1126,6 +1229,7 @@ export class MemoryService {
         createdAt: now,
         updatedAt: now,
         isDeleted: false,
+        ...gate.metadata,
       },
     }
   }

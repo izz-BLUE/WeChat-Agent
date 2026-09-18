@@ -293,13 +293,13 @@ async function testPersonalAutomaticMemoryStillWorks(): Promise<void> {
     {
       role: 'MEMBER' as const,
       requesterId: 'requester-a',
-      candidate: '[{"scope":"MEMBER","subject":"CURRENT_REQUESTER","kind":"SELF_FACT","content":"我做 Java 开发"}]',
+      candidate: '[{"scope":"MEMBER","subject":"CURRENT_REQUESTER","kind":"SELF_FACT","content":"我做 Java 开发","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]',
       scopeType: 'MEMBER' as const,
     },
     {
       role: 'OWNER' as const,
       requesterId: 'owner-a',
-      candidate: '[{"scope":"OWNER","subject":"CURRENT_REQUESTER","kind":"CONTENT_PREFERENCE","content":"我喜欢科幻电影"}]',
+      candidate: '[{"scope":"OWNER","subject":"CURRENT_REQUESTER","kind":"CONTENT_PREFERENCE","content":"我喜欢科幻电影","evidenceType":"EXPLICIT_PREFERENCE","evidence":["M1"]}]',
       scopeType: 'OWNER' as const,
     },
   ]
