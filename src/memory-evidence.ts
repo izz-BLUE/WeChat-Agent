@@ -18,10 +18,15 @@
  *    owner command and the self-address fast path;
  *  - `memoryConfidenceBand` — the only confidence form allowed in diagnostics.
  *
- * Deliberately NOT here (later phases): cross-batch evidence accumulation,
- * memory merge, conflict resolution, TTL/decay, confidence-based retrieval
- * ranking. Retrieval and the member interaction profile keep reading memory by
- * kind and content only; evidence metadata is write/audit metadata.
+ * Cross-batch accumulation of REPEATED_BEHAVIOR evidence lives in
+ * `memory-evidence-accumulator.ts` (P1): this gate still counts one batch, and
+ * the service routes a REPEATED_BEHAVIOR candidate through the in-memory pool
+ * whose runtime-maintained count — never a provider claim — decides admission.
+ *
+ * Deliberately NOT here (later phases): memory merge, conflict resolution,
+ * TTL/decay of durable records, confidence-based retrieval ranking. Retrieval
+ * and the member interaction profile keep reading memory by kind and content
+ * only; evidence metadata is write/audit metadata.
  */
 
 /** Closed evidence classes. The first two are Runtime-assigned only. */
@@ -131,6 +136,13 @@ export function evidenceTypeOf(record: { evidenceType?: MemoryEvidenceType }): M
 /** Strict batch reference shape: M1, M2, … — no M0, no leading zeros, no gaps in trust. */
 const EVIDENCE_REF_PATTERN = /^M[1-9][0-9]*$/u
 
+/**
+ * Distinct accumulated REPEATED_BEHAVIOR evidence items required for a durable
+ * write. The per-batch gate and the cross-batch accumulator
+ * (`memory-evidence-accumulator.ts`) share this one threshold.
+ */
+export const REPEATED_EVIDENCE_ADMISSION_THRESHOLD = 2
+
 export type AutomaticEvidenceRejection =
   | 'EVIDENCE_TYPE_NOT_ALLOWED'
   | 'EVIDENCE_MISSING'
@@ -139,13 +151,14 @@ export type AutomaticEvidenceRejection =
   | 'INFERRED_PATTERN_NOT_DURABLE'
 
 export type AutomaticEvidenceGateResult =
-  | { outcome: 'ADMIT'; metadata: MemoryEvidenceMetadata }
+  | { outcome: 'ADMIT'; metadata: MemoryEvidenceMetadata; validRefs: readonly string[] }
   | {
     outcome: 'SKIP'
     reason: AutomaticEvidenceRejection
     /** Deterministic diagnostic facts about what was declared and what counted. */
     declaredEvidenceType?: MemoryEvidenceType
     validReferenceCount: number
+    validRefs: readonly string[]
   }
 
 export interface AutomaticEvidenceGateInput {
@@ -174,6 +187,7 @@ export function admitAutomaticEvidence(input: AutomaticEvidenceGateInput): Autom
       reason: 'EVIDENCE_TYPE_NOT_ALLOWED',
       declaredEvidenceType,
       validReferenceCount: 0,
+      validRefs: [],
     }
   }
 
@@ -183,14 +197,16 @@ export function admitAutomaticEvidence(input: AutomaticEvidenceGateInput): Autom
       reason: 'EVIDENCE_MISSING',
       declaredEvidenceType,
       validReferenceCount: 0,
+      validRefs: [],
     }
   }
 
-  const skipWith = (reason: AutomaticEvidenceRejection, validReferenceCount: number): AutomaticEvidenceGateResult => ({
+  const skipWith = (reason: AutomaticEvidenceRejection, validRefs: readonly string[]): AutomaticEvidenceGateResult => ({
     outcome: 'SKIP',
     reason,
     declaredEvidenceType,
-    validReferenceCount,
+    validReferenceCount: validRefs.length,
+    validRefs,
   })
 
   // Every reference must be well-formed, inside the current batch, and distinct.
@@ -201,37 +217,31 @@ export function admitAutomaticEvidence(input: AutomaticEvidenceGateInput): Autom
   const validRefs: string[] = []
   for (const ref of input.declaredEvidenceRefs) {
     if (typeof ref !== 'string' || !EVIDENCE_REF_PATTERN.test(ref)) {
-      return skipWith('EVIDENCE_INVALID', validRefs.length)
+      return skipWith('EVIDENCE_INVALID', validRefs)
     }
     const index = Number.parseInt(ref.slice(1), 10)
     if (!Number.isInteger(index) || index < 1 || index > input.batchSize) {
-      return skipWith('EVIDENCE_INVALID', validRefs.length)
+      return skipWith('EVIDENCE_INVALID', validRefs)
     }
     if (validRefs.includes(ref)) {
-      return skipWith('EVIDENCE_INVALID', validRefs.length)
+      return skipWith('EVIDENCE_INVALID', validRefs)
     }
     validRefs.push(ref)
   }
 
-  const evidenceCount = validRefs.length
-  const skip = (reason: AutomaticEvidenceRejection): AutomaticEvidenceGateResult => ({
-    outcome: 'SKIP',
-    reason,
-    declaredEvidenceType,
-    validReferenceCount: evidenceCount,
-  })
+  const skip = (reason: AutomaticEvidenceRejection): AutomaticEvidenceGateResult => skipWith(reason, validRefs)
 
   if (declaredEvidenceType === 'INFERRED_PATTERN') {
     // Phase 1: an inferred pattern is never durable on its own. A later
     // evidence accumulator will decide when inference earns a write.
     return skip('INFERRED_PATTERN_NOT_DURABLE')
   }
-  if (declaredEvidenceType === 'REPEATED_BEHAVIOR' && evidenceCount < 2) {
+  if (declaredEvidenceType === 'REPEATED_BEHAVIOR' && validRefs.length < REPEATED_EVIDENCE_ADMISSION_THRESHOLD) {
     return skip('INSUFFICIENT_EVIDENCE')
   }
 
   const confidence = deriveMemoryEvidenceConfidence(declaredEvidenceType)
-  if (confidence === null || evidenceCount < 1) {
+  if (confidence === null || validRefs.length < 1) {
     return skip('EVIDENCE_MISSING')
   }
   return {
@@ -239,10 +249,11 @@ export function admitAutomaticEvidence(input: AutomaticEvidenceGateInput): Autom
     metadata: {
       evidenceType: declaredEvidenceType,
       confidence,
-      evidenceCount,
+      evidenceCount: validRefs.length,
       firstEvidenceAt: input.now,
       lastEvidenceAt: input.now,
     },
+    validRefs,
   }
 }
 
@@ -266,5 +277,29 @@ export function upgradedExplicitEvidence(
       ? previous.firstEvidenceAt
       : now,
     lastEvidenceAt: now,
+  }
+}
+
+/**
+ * Metadata for a REPEATED_BEHAVIOR record admitted on the accumulator's
+ * runtime-maintained count. The confidence stays the fixed table value (never
+ * provider-derived); firstEvidenceAt carries the pool's first-seen time, so
+ * provenance can predate the record's own creation.
+ */
+export function accumulatedRepeatedEvidenceMetadata(input: {
+  evidenceCount: number
+  firstSeenAt: number
+  now: number
+}): MemoryEvidenceMetadata {
+  const confidence = deriveMemoryEvidenceConfidence('REPEATED_BEHAVIOR')
+  return {
+    evidenceType: 'REPEATED_BEHAVIOR',
+    confidence: confidence ?? 0,
+    evidenceCount: input.evidenceCount,
+    // The pool clock and the service clock are the same function in
+    // production, so firstSeenAt <= now always holds; the clamp keeps the
+    // first <= last invariant intact even if a caller injects skewed clocks.
+    firstEvidenceAt: Math.min(input.firstSeenAt, input.now),
+    lastEvidenceAt: Math.max(input.firstSeenAt, input.now),
   }
 }

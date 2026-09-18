@@ -24,6 +24,10 @@
  *    another (historical buffers used the last speaker for the whole batch);
  *  - each admitted message is consumed at most once (duplicate MsgId is skipped);
  *  - write validation also rejects over-long content and raw identity markers;
+ *  - EVIDENCE FOUNDATION P1: a REPEATED_BEHAVIOR candidate joins an in-memory
+ *    cross-batch accumulator (`memory-evidence-accumulator.ts`, sliding 7-day
+ *    TTL, never persisted) whose runtime-maintained distinct count decides
+ *    admission; every other class keeps the direct per-batch gate decision;
  *  - GROUP retrieval returns the authorize-then-budget WORKING SET
  *    (`authorized-memory-working-set.ts`). The lexical rule is no longer a
  *    visibility gate: `MEMORY_FINAL_LIMIT` bounds the historical explicit
@@ -62,9 +66,16 @@ import {
 import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import {
   admitAutomaticEvidence,
+  accumulatedRepeatedEvidenceMetadata,
   memoryConfidenceBand,
+  REPEATED_EVIDENCE_ADMISSION_THRESHOLD,
   upgradedExplicitEvidence,
+  type MemoryEvidenceMetadata,
 } from './memory-evidence.js'
+import {
+  MemoryEvidenceAccumulator,
+  normalizeEvidenceKeyContent,
+} from './memory-evidence-accumulator.js'
 import type { BotMentionSpanTrust, UserContentSpanTrust, UserTextShape } from './canonical-user-text.js'
 import type { MentionState } from './agent-adapter.js'
 import {
@@ -115,6 +126,16 @@ export const MEMORY_ADMISSION_EVENT = 'MEMORY_ADMISSION'
  * never the memory content, a source message, a scope id or a requester id.
  */
 export const MEMORY_EVIDENCE_EVENT = 'MEMORY_EVIDENCE'
+
+/**
+ * EVIDENCE FOUNDATION P1 diagnostic for the cross-batch accumulator. One line
+ * per REPEATED_BEHAVIOR contribution: PASS (threshold reached), WAITING
+ * (pooling), EXPIRED (prior pooled evidence aged out), REJECTED (invalid
+ * contribution). Fields are the evidence class, the runtime-maintained count
+ * and closed-set results — never the memory content, a scope id, a requester
+ * id or a conversation id.
+ */
+export const MEMORY_EVIDENCE_ACCUMULATOR_EVENT = 'MEMORY_EVIDENCE_ACCUMULATOR'
 
 /**
  * Why an explicit-memory entry ended the way it did.
@@ -351,6 +372,12 @@ export interface MemoryServiceOptions {
   timerIntervalMs?: number
   /** Independent timeout for AUTO_CHAT_THRESHOLD, AUTO_BATCH and AUTO_TIMER flushes. */
   backgroundTimeoutMs?: number
+  /**
+   * P1 cross-batch REPEATED_BEHAVIOR evidence pool (in memory only, never
+   * persisted). Defaults to a fresh private pool bound to this service's clock;
+   * tests inject one to share or control it.
+   */
+  accumulator?: MemoryEvidenceAccumulator
 }
 
 type MemoryFlushTrigger = 'AUTO_BATCH' | 'AUTO_CHAT_THRESHOLD' | 'AUTO_TIMER'
@@ -412,6 +439,7 @@ export class MemoryService {
   private readonly log: (message: string) => void
   private readonly sink: PersistentRuntimeLogSink | undefined
   private readonly backgroundTimeoutMs: number
+  private readonly accumulator: MemoryEvidenceAccumulator
   private readonly slots = new Map<string, PendingSlot>()
   private readonly pendingFlushes = new Set<Promise<void>>()
   private readonly seenMessageIds: string[] = []
@@ -430,6 +458,7 @@ export class MemoryService {
     if (!Number.isSafeInteger(this.backgroundTimeoutMs) || this.backgroundTimeoutMs <= 0) {
       throw new Error('Memory background timeout must be a positive integer')
     }
+    this.accumulator = options.accumulator ?? new MemoryEvidenceAccumulator({ now: this.now })
 
     if (options.enableTimer === true) {
       this.timer = setInterval(() => this.flushPendingBuffers(), options.timerIntervalMs ?? MEMORY_TIMER_INTERVAL_MS)
@@ -454,6 +483,14 @@ export class MemoryService {
    */
   private emitMemoryEvidence(fields: DiagnosticFields): void {
     emitDiagnostic(this.log, this.sink, MEMORY_EVIDENCE_EVENT, fields)
+  }
+
+  /**
+   * One `[MEMORY_EVIDENCE_ACCUMULATOR]` line per cross-batch contribution.
+   * Same privacy contract: enums, counts and closed-set results only.
+   */
+  private emitMemoryEvidenceAccumulator(fields: DiagnosticFields): void {
+    emitDiagnostic(this.log, this.sink, MEMORY_EVIDENCE_ACCUMULATOR_EVENT, fields)
   }
 
   public get isEnabled(): boolean {
@@ -1192,13 +1229,43 @@ export class MemoryService {
     // confidence, counts distinct valid references and rejects anything the
     // provider was not allowed to claim. Nothing batch-local (M1/M2, message
     // bodies, ids) survives into the record.
+    const now = this.now()
     const gate = admitAutomaticEvidence({
       declaredEvidenceType: candidate.evidenceType,
       declaredEvidenceRefs: candidate.evidenceRefs,
       batchSize,
-      now: this.now(),
+      now,
     })
-    if (gate.outcome === 'SKIP') {
+
+    const buildRecord = (metadata: MemoryEvidenceMetadata) => ({
+      memoryId: this.idFactory(),
+      scopeType,
+      subject,
+      kind,
+      scopeId,
+      content,
+      contentHash: '',
+      // Historical GROUP writes are always SHARED.
+      visibility: 'SHARED' as const,
+      origin: 'AUTOMATIC' as const,
+      sourceConversationType: 'GROUP' as const,
+      sourceConversationId: slot.conversationId,
+      sourceSenderId: slot.requesterId,
+      createdAt: now,
+      updatedAt: now,
+      isDeleted: false,
+      ...metadata,
+    })
+
+    // EVIDENCE FOUNDATION P1: REPEATED_BEHAVIOR routes through the in-memory
+    // cross-batch accumulator before admission; every other class keeps the
+    // direct phase-1 gate decision, and every policy/scope/content rejection
+    // above keeps its original reason.
+    if (gate.outcome === 'ADMIT' && gate.metadata.evidenceType !== 'REPEATED_BEHAVIOR') {
+      return { record: buildRecord(gate.metadata) }
+    }
+
+    if (gate.outcome === 'SKIP' && gate.reason !== 'INSUFFICIENT_EVIDENCE') {
       this.emitMemoryEvidence({
         origin: 'AUTOMATIC',
         evidenceType: gate.declaredEvidenceType,
@@ -1210,28 +1277,58 @@ export class MemoryService {
       return { rejection: gate.reason }
     }
 
-    const now = this.now()
-    return {
-      record: {
-        memoryId: this.idFactory(),
-        scopeType,
-        subject,
-        kind,
-        scopeId,
-        content,
-        contentHash: '',
-        // Historical GROUP writes are always SHARED.
-        visibility: 'SHARED',
-        origin: 'AUTOMATIC',
-        sourceConversationType: 'GROUP',
-        sourceConversationId: slot.conversationId,
-        sourceSenderId: slot.requesterId,
-        createdAt: now,
-        updatedAt: now,
-        isDeleted: false,
-        ...gate.metadata,
-      },
+    // REPEATED_BEHAVIOR: this batch's contribution joins the runtime-maintained
+    // pool, and the accumulated count — never any provider claim — decides
+    // admission. The candidate key is deterministic (scope identity + subject +
+    // kind + normalized content); no raw content enters the pool.
+    const candidateKey = `${scopeType}:${scopeId}:${subject}:${kind}:${normalizeEvidenceKeyContent(content)}`
+    const added = this.accumulator.addEvidence({
+      candidateKey,
+      evidenceType: 'REPEATED_BEHAVIOR',
+      evidenceRefs: gate.validRefs,
+      scopeId,
+    })
+    if (added.outcome === 'ACCEPTED') {
+      const thresholdReached = added.entry.evidenceCount >= REPEATED_EVIDENCE_ADMISSION_THRESHOLD
+      this.emitMemoryEvidenceAccumulator({
+        evidenceType: 'REPEATED_BEHAVIOR',
+        count: added.entry.evidenceCount,
+        result: added.expiredPrior ? 'EXPIRED' : thresholdReached ? 'PASS' : 'WAITING',
+        reason: added.expiredPrior ? 'TTL_EXPIRED' : thresholdReached ? 'EVIDENCE_ADMITTED' : 'INSUFFICIENT_EVIDENCE',
+      })
+    } else {
+      this.emitMemoryEvidenceAccumulator({
+        evidenceType: 'REPEATED_BEHAVIOR',
+        count: 0,
+        result: 'REJECTED',
+        reason: added.reason,
+      })
     }
+
+    if (added.outcome === 'ACCEPTED' && added.entry.evidenceCount >= REPEATED_EVIDENCE_ADMISSION_THRESHOLD) {
+      return {
+        record: buildRecord(accumulatedRepeatedEvidenceMetadata({
+          evidenceCount: added.entry.evidenceCount,
+          firstSeenAt: added.entry.firstSeenAt,
+          now,
+        })),
+      }
+    }
+    if (gate.outcome === 'ADMIT') {
+      // Defensive fallback: the batch evidence was already gate-admitted, so a
+      // below-threshold or rejected accumulation must never regress the
+      // phase-1 batch decision.
+      return { record: buildRecord(gate.metadata) }
+    }
+    this.emitMemoryEvidence({
+      origin: 'AUTOMATIC',
+      evidenceType: gate.declaredEvidenceType,
+      evidenceCount: gate.validReferenceCount,
+      confidenceBand: 'LEGACY',
+      result: 'SKIPPED',
+      reason: 'INSUFFICIENT_EVIDENCE',
+    })
+    return { rejection: 'INSUFFICIENT_EVIDENCE' }
   }
 
   private groupRetrievalRules(request: MemoryReadRequest): MemoryAccessRule[] {
