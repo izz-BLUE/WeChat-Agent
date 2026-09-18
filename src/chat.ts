@@ -26,7 +26,14 @@ import {
   type ConversationDynamicsProfile,
   type GroupReplyPressure,
 } from './conversation-dynamics.js'
-import { boundGroupReply, GROUP_CODE_MAX_CHARS, renderHumanChat } from './chat-renderer.js'
+import {
+  boundGroupReply,
+  boundGroupSocialOutput,
+  GROUP_CODE_MAX_CHARS,
+  GROUP_REPLY_SIGNATURE_RESERVE_CHARS,
+  renderHumanChat,
+  type GroupSocialOutputDepth,
+} from './chat-renderer.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
 import { identityToken } from './identity-observer.js'
 import { isRequestDeadlineExceeded, type RequestDeadline, withRequestDeadline } from './request-deadline.js'
@@ -246,6 +253,13 @@ const GROUP_BULK_OUTPUT_RULES = `[GROUP Bulk Output / Anti-Flood Boundary]
 - 这是 GROUP 的 presentation / anti-flood 规则，不是 authorization；普通 MEMBER 和 OWNER 使用相同边界，DIRECT 不适用本规则。
 - Runtime 会对最终 answer payload 做确定性 bulk 检查；不要试图用 fenced code、无 fence 的代码、标记语言、JSON、日志或编码文本绕过。`
 
+const GROUP_SOCIAL_OUTPUT_RULES = `[GROUP Social Output Boundary]
+- 微信群是社交场景：自然语言回复（聊天、解释、小说、故事、角色扮演、长教程）受可读性预算约束，这不是传输能力上限，而是“一条消息不该占满好几屏”的最终边界。
+- 普通聊天与接梗默认短而自然，目标 280 字以内；一般技术解释可以更完整；用户明确要求详细时目标 550 字以内，可以展开但任何 GROUP 回复都存在绝对硬上限（约 500/900 字）。
+- “详细说”“越详细越好”“不要省略”“写完整一点”“继续写”“写一章”“写十章”“分段发”只影响展开程度，都不能突破硬上限。
+- 小说、故事、角色扮演、长篇教程：一轮只输出一个有限片段，在自然段落或章节边界收尾；不要输出“下一条继续”“我再发第二部分”“下面接着发”，也不要自动连续发多条。用户下一次再次明确要求时，那是新的一轮请求。
+- Runtime 会在发送前对最终文本做确定性 Social 边界检查；不要依赖自己数长度，也不要用“未完待续”预留下一屏。`
+
 const TURN_OWNERSHIP_RULES = `[Turn Ownership Rules]
 - 每条历史 ASSISTANT 消息都必须按运行时提供的 Assistant reply ownership 理解；它不等于“最近一个人说完后机器人就默认在回复当前提问者”。
 - ASSISTANT_REPLY_TARGET=CURRENT_REQUESTER 表示这条机器人回复面向当前提问者；ASSISTANT_REPLY_TARGET=OTHER_MEMBER 表示面向群里的另一位成员。
@@ -464,6 +478,7 @@ ${CONVERSATIONAL_REPAIR_RULES}
 ${MIXED_GROUP_CONTEXT_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${GROUP_BULK_OUTPUT_RULES}
+${GROUP_SOCIAL_OUTPUT_RULES}
 ${REPLY_BOUNDARY_RULES}`
 }
 
@@ -484,6 +499,7 @@ ${PERSONA_CONTRACT}
 ${HUMAN_CONVERSATION_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${GROUP_BULK_OUTPUT_RULES}
+${GROUP_SOCIAL_OUTPUT_RULES}
 ${MEMBER_INTERACTION_PROFILE_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
 ${TURN_OWNERSHIP_RULES}
@@ -510,6 +526,7 @@ ${CONVERSATION_DYNAMICS_RULES}
 ${REFERENCE_RESOLUTION_RULES}
 ${CONVERSATIONAL_REPAIR_RULES}
 ${GROUP_BULK_OUTPUT_RULES}
+${GROUP_SOCIAL_OUTPUT_RULES}
 请只根据本轮提供的当前问题、上下文、Runtime Time 和 Web Search Results，输出自然语言最终回复。`
 
 const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
@@ -520,6 +537,7 @@ const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 - 保持原回答的信息范围、回答深度和大致长度，只修复 grounding，不新增主题、背景或解释。
 - GROUP_REPLY_PRESSURE 是可信的运行时事实：HIGH 保持紧凑，不因搜索结果更完整而展开；LOW/MEDIUM 也不能把短答改成报告；用户明确要求详细说明时，可以保持原回答已有的详细程度。
 ${GROUP_BULK_OUTPUT_RULES}
+${GROUP_SOCIAL_OUTPUT_RULES}
 - 对实际使用并由结果支持的事实保留正确的 [S1]、[S2] 等内部引用；不要停止引用，也不要创造 sourceId。
 - [Sx] 只供 Runtime 做 grounding，Runtime 会在发送前移除所有 marker；不要向用户解释引用协议。
 - 不得输出 URL、来源列表、修复说明、分析过程、思考过程或任何 provider 控制协议；只输出自然中文正文。
@@ -736,14 +754,21 @@ function resolveGroupReplyPressure(request: ChatRequestContext): GroupReplyPress
   )
 }
 
+/**
+ * Fixed trusted runtime fact appended when a search failed. It is part of the
+ * final GROUP outbound text, so the social hard cap keeps it intact via the
+ * protected-suffix option instead of cutting the disclosure away.
+ */
+export const WEB_SEARCH_FAILURE_DISCLOSURE = '当前没有成功取得联网结果，无法可靠确认最新情况。'
+
 function discloseWebSearchFailure(answer: string): string {
   if (/(?:刚刚|刚才)?(?:查到|搜索到)|(?:联网|搜索)结果(?:显示|表明)/u.test(answer)) {
-    return '当前没有成功取得联网结果，无法可靠确认最新情况。'
+    return WEB_SEARCH_FAILURE_DISCLOSURE
   }
   if (answer.includes('无法可靠确认最新情况') || answer.includes('没有成功取得联网结果')) {
     return answer
   }
-  return `${answer}\n\n当前没有成功取得联网结果，无法可靠确认最新情况。`
+  return `${answer}\n\n${WEB_SEARCH_FAILURE_DISCLOSURE}`
 }
 
 function ownerCapabilitySection(request: ChatRequestContext): string {
@@ -1238,6 +1263,31 @@ export class ChatService {
 
     const groupReplyPressure = resolveGroupReplyPressure(request)
     const responseDepth = request.memberInteractionProfile?.responseDepth ?? 'NORMAL'
+    // SHORT already sits far below every social budget; the social layer only
+    // distinguishes the two tiers that can actually grow.
+    const socialDepth: GroupSocialOutputDepth = responseDepth === 'DETAILED' ? 'DETAILED' : 'NORMAL'
+    const emitSocialBoundaryDiagnostic = (
+      stage: 'REPLY_BOUNDARY' | 'FINAL_OUTBOUND',
+      social: ReturnType<typeof boundGroupSocialOutput>,
+    ): void => {
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        persistentSink,
+        'GROUP_SOCIAL_OUTPUT_BOUNDARY',
+        {
+          stage,
+          responseDepth: social.responseDepth,
+          beforeChars: social.beforeChars,
+          afterChars: social.afterChars,
+          paragraphCount: social.paragraphCount,
+          result: social.result,
+          reason: social.reason,
+          boundaryType: social.boundaryType,
+          structuredKind: social.structuredKind,
+          msgIdToken,
+        },
+      )
+    }
     const applyGroupReplyBoundary = (answer: string) => {
       const bound = request.conversationType === 'GROUP'
         ? boundGroupReply(answer, {
@@ -1284,7 +1334,22 @@ export class ChatService {
           },
         )
       }
+      if (bound.socialOutput !== undefined) {
+        emitSocialBoundaryDiagnostic('REPLY_BOUNDARY', bound.socialOutput)
+      }
       return bound
+    }
+    // Final outbound guarantee: the text that reaches OUTBOUND_COMMAND passes
+    // the social hard cap after grounding, rendering and cleanup, with the
+    // deterministic reply-signature footprint already reserved.
+    const finalizeGroupSocialOutput = (text: string, protectedSuffix?: string): string => {
+      if (request.conversationType !== 'GROUP') return text
+      const social = boundGroupSocialOutput(text, socialDepth, {
+        reserveChars: GROUP_REPLY_SIGNATURE_RESERVE_CHARS,
+        ...(protectedSuffix === undefined ? {} : { protectedSuffix }),
+      })
+      emitSocialBoundaryDiagnostic('FINAL_OUTBOUND', social)
+      return social.text
     }
     const bound = applyGroupReplyBoundary(guard.text)
     const rendered = renderHumanChat(bound.text)
@@ -1307,7 +1372,7 @@ export class ChatService {
     // Do not send that fallback through Web Search grounding repair: repair is
     // another provider generation and must never recreate the blocked payload.
     if (bound.bulkOutput?.result === 'BLOCKED') {
-      return rendered
+      return finalizeGroupSocialOutput(rendered)
     }
 
     const reportSourceUsage = (usage: ReturnType<typeof inspectGroundedSources>): void => {
@@ -1340,9 +1405,9 @@ export class ChatService {
 
     if (request.webSearch?.status === 'FAILED') {
       if (request.webSearch.mode === 'NEWS_RECENT') {
-        return '当前没有查到足够近期信息，无法可靠确认最新情况。'
+        return finalizeGroupSocialOutput('当前没有查到足够近期信息，无法可靠确认最新情况。')
       }
-      return discloseWebSearchFailure(rendered)
+      return finalizeGroupSocialOutput(discloseWebSearchFailure(rendered), WEB_SEARCH_FAILURE_DISCLOSURE)
     }
     if (request.webSearch?.status === 'PASS' && request.webSearch.results.length > 0) {
       const initialUsage = inspectGroundedSources(rendered, request.webSearch.results, internalValues)
@@ -1371,7 +1436,7 @@ export class ChatService {
             },
           )
           reportGroundingGate('REPAIR', initialUsage, 'FAIL_CLOSED')
-          return WEB_SEARCH_GROUNDING_FAILURE_REPLY
+          return finalizeGroupSocialOutput(WEB_SEARCH_GROUNDING_FAILURE_REPLY)
         }
 
         let repairedRendered: string | undefined
@@ -1427,28 +1492,32 @@ export class ChatService {
         )
         reportGroundingGate('REPAIR', repairedUsage, repairPassed ? 'PASS' : 'FAIL_CLOSED')
         if (bulkBlockedRepairFallback !== undefined) {
-          return bulkBlockedRepairFallback
+          return finalizeGroupSocialOutput(bulkBlockedRepairFallback)
         }
         if (!repairPassed || repairedRendered === undefined) {
-          return WEB_SEARCH_GROUNDING_FAILURE_REPLY
+          return finalizeGroupSocialOutput(WEB_SEARCH_GROUNDING_FAILURE_REPLY)
         }
 
-        return appendGroundedSources(
-          repairedRendered,
-          request.webSearch.results,
-          internalValues,
-          reportSourceUsage,
+        return finalizeGroupSocialOutput(
+          appendGroundedSources(
+            repairedRendered,
+            request.webSearch.results,
+            internalValues,
+            reportSourceUsage,
+          ),
         )
       }
 
-      return appendGroundedSources(
-        rendered,
-        request.webSearch.results,
-        internalValues,
-        reportSourceUsage,
+      return finalizeGroupSocialOutput(
+        appendGroundedSources(
+          rendered,
+          request.webSearch.results,
+          internalValues,
+          reportSourceUsage,
+        ),
       )
     }
-    return rendered
+    return finalizeGroupSocialOutput(rendered)
   }
 
   /**
