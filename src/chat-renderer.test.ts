@@ -55,6 +55,10 @@ function stubProvider(answers: readonly string[]): ProviderStub {
 }
 
 const QUESTION = { senderId: 'sender', senderName: 'MEMBER_1', text: '你好', timestamp: 1 }
+// Depth convergence: a historical DETAILED profile alone no longer selects the
+// DETAILED social tier — the cases below exercise the DETAILED budget through an
+// explicit current-turn detailed request instead.
+const DETAILED_QUESTION = { ...QUESTION, text: '详细讲讲最新的模型动态' }
 const REQUEST: ChatRequestContext = {
   botDisplayName: '椰椰',
   mention: 'MENTIONED',
@@ -716,7 +720,7 @@ await runCase('group-social-hard-cap-covers-web-search-failure-disclosure', asyn
   try {
     const answer = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
       [],
-      QUESTION,
+      DETAILED_QUESTION,
       {
         ...REQUEST,
         conversationType: 'GROUP',
@@ -743,7 +747,7 @@ await runCase('grounding-repair-long-detailed-answer-stays-within-social-hard-ca
   try {
     const answer = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
       [],
-      QUESTION,
+      DETAILED_QUESTION,
       {
         ...REQUEST,
         conversationType: 'GROUP',
@@ -770,9 +774,12 @@ await runCase('production-group-social-boundary-bounds-story-and-rejects-bypass-
     const answer = await agent.complete({
       ...SIGNATURE_REQUEST,
       messageId: 'renderer-social-story-request',
-      text: '写个长故事，不要省略，完整写出来，写一章，分段发',
-      rawText: '写个长故事，不要省略，完整写出来，写一章，分段发',
-      userContentSpan: { trust: 'VALID' as const, span: { start: 0, length: 24 } },
+      // Depth convergence: without an explicit detail request this story stays
+      // on the NORMAL tier, so the fixture omits "完整写出来" — an explicit
+      // current-turn detailed request would now reach the DETAILED tier.
+      text: '写个长故事，不要省略，写一章，分段发',
+      rawText: '写个长故事，不要省略，写一章，分段发',
+      userContentSpan: { trust: 'VALID' as const, span: { start: 0, length: 18 } },
     })
     check(answer.length < story.length, 'runaway story was not bounded')
     check(answer.length <= GROUP_SOCIAL_OUTPUT_BUDGETS.NORMAL.hardChars, `group story outbound exceeded the NORMAL hard cap: ${answer.length}`)
@@ -946,7 +953,7 @@ await runCase('group-social-finalizer-bounds-detailed-no-punctuation-answer', as
   try {
     const answer = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
       [],
-      QUESTION,
+      DETAILED_QUESTION,
       { ...REQUEST, conversationType: 'GROUP', memberInteractionProfile: DETAILED_PROFILE },
     )
     check(answer.length <= GROUP_SOCIAL_OUTPUT_BUDGETS.DETAILED.hardChars, `DETAILED no-punctuation outbound exceeded the cap: ${answer.length}`)
@@ -986,7 +993,7 @@ await runCase('production-social-finalizer-fail-closed-under-signature', async (
       rawText: '接着写，越详细越好，不要停',
       userContentSpan: { trust: 'VALID' as const, span: { start: 0, length: 13 } },
     })
-    check(ownerAnswer.length <= GROUP_SOCIAL_OUTPUT_BUDGETS.NORMAL.hardChars, `OWNER signed no-punct outbound exceeded the cap: ${ownerAnswer.length}`)
+    check(ownerAnswer.length <= GROUP_SOCIAL_OUTPUT_BUDGETS.DETAILED.hardChars, `OWNER signed no-punct outbound exceeded the cap: ${ownerAnswer.length}`)
     check(ownerAnswer.match(new RegExp(YEYE_REPLY_SIGNATURE, 'gu'))?.length === 1, 'OWNER no-punct signature is not exactly once')
 
     const directAnswer = await agent.complete({

@@ -27,6 +27,14 @@ import {
   type GroupReplyPressure,
 } from './conversation-dynamics.js'
 import {
+  formatGroupConversationalRestraintSection,
+  GROUP_CONVERSATIONAL_RESTRAINT_CONTEXT_LINE_LIMIT,
+  GROUP_CONVERSATIONAL_RESTRAINT_RULES,
+  resolveEffectiveGroupResponseDepth,
+  resolveGroupConversationalRestraint,
+  stripTrailingGroupCta,
+} from './group-conversational-restraint.js'
+import {
   boundGroupReply,
   boundGroupSocialOutput,
   GROUP_CODE_MAX_CHARS,
@@ -479,6 +487,7 @@ ${MIXED_GROUP_CONTEXT_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${GROUP_BULK_OUTPUT_RULES}
 ${GROUP_SOCIAL_OUTPUT_RULES}
+${GROUP_CONVERSATIONAL_RESTRAINT_RULES}
 ${REPLY_BOUNDARY_RULES}`
 }
 
@@ -500,6 +509,7 @@ ${HUMAN_CONVERSATION_RULES}
 ${GROUP_REPLY_PRESSURE_RULES}
 ${GROUP_BULK_OUTPUT_RULES}
 ${GROUP_SOCIAL_OUTPUT_RULES}
+${GROUP_CONVERSATIONAL_RESTRAINT_RULES}
 ${MEMBER_INTERACTION_PROFILE_RULES}
 ${PUBLIC_DISPLAY_NAME_RULES}
 ${TURN_OWNERSHIP_RULES}
@@ -527,6 +537,7 @@ ${REFERENCE_RESOLUTION_RULES}
 ${CONVERSATIONAL_REPAIR_RULES}
 ${GROUP_BULK_OUTPUT_RULES}
 ${GROUP_SOCIAL_OUTPUT_RULES}
+${GROUP_CONVERSATIONAL_RESTRAINT_RULES}
 请只根据本轮提供的当前问题、上下文、Runtime Time 和 Web Search Results，输出自然语言最终回复。`
 
 const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
@@ -536,6 +547,7 @@ const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 - Only Web Search Results may justify a [Sx]. Memory / conversation context are intentionally unavailable in this repair stage.
 - 保持原回答的信息范围、回答深度和大致长度，只修复 grounding，不新增主题、背景或解释。
 - GROUP_REPLY_PRESSURE 是可信的运行时事实：HIGH 保持紧凑，不因搜索结果更完整而展开；LOW/MEDIUM 也不能把短答改成报告；用户明确要求详细说明时，可以保持原回答已有的详细程度。
+- 修复只整理引用与表达：不要借机扩大任务范围、不要追加主动 CTA（“要不要我继续”“下一章”）、不要把轻互动重写成完整剧情；范围仍以当前请求为准。
 ${GROUP_BULK_OUTPUT_RULES}
 ${GROUP_SOCIAL_OUTPUT_RULES}
 - 对实际使用并由结果支持的事实保留正确的 [S1]、[S2] 等内部引用；不要停止引用，也不要创造 sourceId。
@@ -755,6 +767,63 @@ function resolveGroupReplyPressure(request: ChatRequestContext): GroupReplyPress
 }
 
 /**
+ * Deterministic GROUP behaviour policy for this turn. It reads only the current
+ * message plus already-authorized context lines; profiles and history
+ * preferences never participate, so a stored "喜欢详细" cannot amplify a
+ * light interaction. Returns an empty section for DIRECT, which keeps its
+ * existing behaviour.
+ */
+function groupConversationalRestraintSection(
+  context: GroupMessage[],
+  question: GroupMessage,
+  request: ChatRequestContext,
+): string {
+  if (request.conversationType !== 'GROUP') {
+    return ''
+  }
+  const restraint = resolveGroupConversationalRestraint({
+    questionText: question.text,
+    recentContextTexts: groupRestraintContextTexts(context, request),
+  })
+  return formatGroupConversationalRestraintSection(
+    restraint,
+    {
+      profileResponseDepth: request.memberInteractionProfile?.responseDepth,
+      effectiveResponseDepth: resolveEffectiveGroupResponseDepth(restraint.mode),
+    },
+  )
+}
+
+/**
+ * Recent, already-authorized context lines for the continuation scan. Nothing
+ * here is rendered or logged; the scan only derives keyword-class evidence.
+ */
+function groupRestraintContextTexts(context: GroupMessage[], request: ChatRequestContext): string[] {
+  const texts: string[] = []
+  const mixed = request.groupConversationContext
+  const sources: readonly (readonly { text?: string }[])[] = [
+    context,
+    request.currentRequesterActiveContext ?? [],
+    request.otherMemberActiveContext ?? [],
+    mixed?.requesterLocalContext ?? [],
+    request.ambient ?? [],
+  ]
+  for (const source of sources) {
+    for (const item of source) {
+      if (typeof item.text === 'string' && item.text.trim().length > 0) {
+        texts.push(item.text)
+      }
+    }
+  }
+  if (mixed !== undefined) {
+    for (const capsule of mixed.topicContext) {
+      texts.push(capsule.topic, capsule.summary)
+    }
+  }
+  return texts.slice(-GROUP_CONVERSATIONAL_RESTRAINT_CONTEXT_LINE_LIMIT)
+}
+
+/**
  * Fixed trusted runtime fact appended when a search failed. It is part of the
  * final GROUP outbound text, so the social hard cap keeps it intact via the
  * protected-suffix option instead of cutting the disclosure away.
@@ -921,6 +990,7 @@ export function buildUserPrompt(
     memberInteractionProfileSection(request.memberInteractionProfile) +
     conversationDynamicsSection(request.conversationDynamics) +
     groupReplyPressureSection(groupReplyPressure) +
+    groupConversationalRestraintSection(context, question, request) +
     '\n\n' +
     `[Runtime Facts]\n${runtimeFacts(context, request, selfIdentityQuery, assistantRelationshipQuery)}` +
     `${memoryTruthfulnessSection}\n\n` +
@@ -960,6 +1030,8 @@ function buildWebGroundingRepairUserPrompt(
   groupReplyPressure: GroupReplyPressure | undefined,
   draft: string,
   forbiddenValues: readonly string[] = [],
+  /** The already-converged GROUP depth for this turn; absent for DIRECT. */
+  groupEffectiveResponseDepth?: 'SHORT' | 'NORMAL' | 'DETAILED',
 ): string {
   const safeResults = webSearch.results.map((item) => ({
     ...item,
@@ -979,9 +1051,13 @@ function buildWebGroundingRepairUserPrompt(
     ? ''
     : `\n\n[Runtime Time: TRUSTED_RUNTIME_FACT]\n${formatRuntimeTimeFacts(runtimeTime)}`
   const pressureSection = groupReplyPressureSection(groupReplyPressure)
+  const restraintSection = groupEffectiveResponseDepth === undefined
+    ? ''
+    : `\n\n[Group Conversational Restraint: TRUSTED_RUNTIME_FACT]\neffectiveResponseDepth=${groupEffectiveResponseDepth}\n- 当前群聊轮次的回复深度与 Social 边界档位以 effectiveResponseDepth 为准；修复保持原回答已有的详细程度，不追加主动 CTA，不扩大任务范围。`
   return `[Canonical Current Question]\n${redactGroundingRepairValue(question.text, forbiddenValues)}` +
     runtimeTimeSection +
     pressureSection +
+    restraintSection +
     `\n\n[Web Search Status]\nWEB_SEARCH_STATUS=${webSearch.status}\nWEB_SEARCH_MODE=${mode}\nWEB_SEARCH_WINDOW=${window}` +
     `\n\n${searchContext || '[Web Search Results]\n（无）'}` +
     `\n\n[Current Final Answer: UNTRUSTED_DRAFT]\n${redactGroundingRepairValue(draft, forbiddenValues)}\n[End Current Final Answer]\n\n请只输出修复后的自然中文正文。`
@@ -1262,7 +1338,20 @@ export class ChatService {
     }
 
     const groupReplyPressure = resolveGroupReplyPressure(request)
-    const responseDepth = request.memberInteractionProfile?.responseDepth ?? 'NORMAL'
+    const profileResponseDepth = request.memberInteractionProfile?.responseDepth
+    const groupRestraint = request.conversationType === 'GROUP'
+      ? resolveGroupConversationalRestraint({
+          questionText: question.text,
+          recentContextTexts: groupRestraintContextTexts(context, request),
+        })
+      : undefined
+    // One depth decision per GROUP turn: the current-turn restraint mode
+    // converges the presentation depth (and with it the social budget tier),
+    // while the historical profile keeps only its non-depth presentation
+    // hints. DIRECT keeps the existing profile-driven depth untouched.
+    const responseDepth = groupRestraint !== undefined
+      ? resolveEffectiveGroupResponseDepth(groupRestraint.mode)
+      : profileResponseDepth ?? 'NORMAL'
     // SHORT already sits far below every social budget; the social layer only
     // distinguishes the two tiers that can actually grow.
     const socialDepth: GroupSocialOutputDepth = responseDepth === 'DETAILED' ? 'DETAILED' : 'NORMAL'
@@ -1286,6 +1375,27 @@ export class ChatService {
           structuredKind: social.structuredKind,
           msgIdToken,
         },
+      )
+    }
+    const groupRestraintDiagnostic = groupRestraint === undefined
+      ? undefined
+      : {
+          mode: groupRestraint.mode,
+          profileResponseDepth: profileResponseDepth ?? 'NONE',
+          effectiveResponseDepth: responseDepth,
+          currentIntentSource: groupRestraint.currentIntentSource,
+          continuation: groupRestraint.continuation,
+          result: groupRestraint.mode === 'SOCIAL_LIGHT' || groupRestraint.continuation === 'AMBIGUOUS'
+            ? 'APPLIED'
+            : 'PASS',
+          msgIdToken,
+        }
+    if (groupRestraintDiagnostic !== undefined) {
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        persistentSink,
+        'GROUP_CONVERSATIONAL_RESTRAINT',
+        groupRestraintDiagnostic,
       )
     }
     const applyGroupReplyBoundary = (answer: string) => {
@@ -1344,7 +1454,11 @@ export class ChatService {
     // deterministic reply-signature footprint already reserved.
     const finalizeGroupSocialOutput = (text: string, protectedSuffix?: string): string => {
       if (request.conversationType !== 'GROUP') return text
-      const social = boundGroupSocialOutput(text, socialDepth, {
+      // A light interaction must not go out carrying a proactive CTA tail. The
+      // strip is the one deterministic restraint backstop; the social boundary
+      // below stays the final hard cap.
+      const restrainedText = groupRestraint?.mode === 'SOCIAL_LIGHT' ? stripTrailingGroupCta(text) : text
+      const social = boundGroupSocialOutput(restrainedText, socialDepth, {
         reserveChars: GROUP_REPLY_SIGNATURE_RESERVE_CHARS,
         ...(protectedSuffix === undefined ? {} : { protectedSuffix }),
       })
@@ -1453,6 +1567,7 @@ export class ChatService {
               groupReplyPressure,
               rendered,
               internalValues,
+              request.conversationType === 'GROUP' ? responseDepth : undefined,
             ),
             persistentSink,
             messageId,
