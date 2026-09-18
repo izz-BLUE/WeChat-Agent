@@ -27,7 +27,7 @@ import { ASSISTANT_LABEL, CURRENT_REQUESTER_LABEL } from './group-ambient-contex
 import { isInternalSpeakerLabel } from './speaker-labels.js'
 import {
   classifyAssistantIdentityClaims,
-  countTrustedOwnerRelationshipClaims,
+  countTrustedAssistantRelationshipClaims,
   createTrustedAssistantRuntimeFacts,
   type AssistantRuntimeFacts,
 } from './assistant-identity.js'
@@ -446,8 +446,8 @@ export function guardFinalAnswer(input: string, facts: AnswerGuardFacts = {}): A
     // fail-closed self-identity boundary. A name such as 管理员 must not make
     // "我是管理员" or "你是主人" acceptable here.
     const claims = [...text.matchAll(UNGROUNDED_IDENTITY_CLAIM_PATTERN)].length
-    const trustedOwnerRelationshipClaims = countTrustedOwnerRelationshipClaims(text, assistantRuntime)
-    if (claims > 0 && trustedOwnerRelationshipClaims !== claims) {
+    const trustedRelationshipClaims = countTrustedAssistantRelationshipClaims(text, assistantRuntime)
+    if (claims > 0 && trustedRelationshipClaims !== claims) {
       bump('UNGROUNDED_IDENTITY_CLAIM', claims)
       blocked = true
     }

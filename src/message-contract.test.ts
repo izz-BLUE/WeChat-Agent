@@ -131,6 +131,23 @@ async function testGroupWithoutMentionIsIgnored(): Promise<void> {
   assert(toAgentRequest(message).mentionState === 'NOT_MENTIONED', 'not-mentioned state was not carried')
 }
 
+async function testCreatorFieldIsAdditiveAndOptional(): Promise<void> {
+  const withCreator = validMessage(groupRaw({
+    isMentioned: true,
+    ownerConfigured: true,
+    ownerDisplayName: '张三',
+    assistantCreatorDisplayName: '辞老师',
+  }))
+  const request = toAgentRequest(withCreator)
+  assert(withCreator.assistantCreatorDisplayName === '辞老师', 'Creator display name was not normalized')
+  assert(request.assistantCreatorDisplayName === '辞老师', 'Creator display name was not carried to AgentRequest')
+
+  const legacy = validMessage(groupRaw({ isMentioned: true }))
+  assert(legacy.assistantCreatorDisplayName === null, 'legacy runtime without Creator did not fail safe to unknown')
+  assert(toAgentRequest(legacy).assistantCreatorDisplayName === null,
+    'legacy runtime Creator absence was not preserved as unknown')
+}
+
 async function testConversationIsolation(): Promise<void> {
   const roomA = validMessage(groupRaw({ from: 'room-a@chatroom', msgId: 'room-a-message' }))
   const roomB = validMessage(groupRaw({ from: 'room-b@chatroom', msgId: 'room-b-message' }))
@@ -210,6 +227,7 @@ const cases: Array<[string, () => Promise<void>]> = [
   ['direct-is-refused', testDirectIsRefused],
   ['group-mention-policy', testGroupMentionPolicy],
   ['group-without-mention-ignored', testGroupWithoutMentionIsIgnored],
+  ['creator-field-is-additive-and-optional', testCreatorFieldIsAdditiveAndOptional],
   ['conversation-isolation', testConversationIsolation],
   ['invalid-and-unsupported', testInvalidAndUnsupported],
   ['adapter-field-isolation', testAdapterDoesNotLeakRawFields],

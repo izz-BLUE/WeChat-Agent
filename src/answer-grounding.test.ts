@@ -454,7 +454,7 @@ async function testRetentionPolicyIsNeverInvented(): Promise<void> {
     const facts = runtimeFactLines(call.user)
     assert(
       facts.map((line) => line.split('=')[0]).join(',') ===
-        'SELF_IDENTITY_QUERY,CURRENT_CONTEXT_PRESENT,RETRIEVED_MEMORY_PRESENT,RETRIEVED_MEMORY_COUNT,PERSISTENT_MEMORY_AVAILABLE,RETENTION_POLICY_PROVIDED',
+        'SELF_IDENTITY_QUERY,CURRENT_CONTEXT_PRESENT,RETRIEVED_MEMORY_PRESENT,RETRIEVED_MEMORY_COUNT,PERSISTENT_MEMORY_AVAILABLE,RETENTION_POLICY_PROVIDED,ASSISTANT_RELATIONSHIP_QUERY',
       `the runtime fact block changed shape: ${facts.join(' | ')}`,
     )
     assert(facts[0] === 'SELF_IDENTITY_QUERY=false', 'the identity-query fact is wrong')
@@ -463,6 +463,7 @@ async function testRetentionPolicyIsNeverInvented(): Promise<void> {
     assert(facts[3] === 'RETRIEVED_MEMORY_COUNT=0', 'the retrieved memory count is wrong')
     assert(facts[4] === 'PERSISTENT_MEMORY_AVAILABLE=true', 'the available persistent store is not stated')
     assert(facts[5] === 'RETENTION_POLICY_PROVIDED=false', 'a retention policy was invented')
+    assert(facts[6] === 'ASSISTANT_RELATIONSHIP_QUERY=NONE', 'an unrelated question was classified as a relationship query')
     for (const line of facts) {
       assert(
         !/\d+\s*(分钟|小时|天|条|token)/iu.test(line),

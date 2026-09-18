@@ -792,6 +792,7 @@ export class ProductionChatAgent implements AgentExecutor {
       config.botDisplayName,
       request.ownerConfigured,
       request.ownerDisplayName,
+      request.assistantCreatorDisplayName,
     )
     const label = this.speakerLabels.labelFor({
       conversationType: request.conversationType,

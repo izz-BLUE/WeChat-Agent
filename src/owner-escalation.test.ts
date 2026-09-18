@@ -349,6 +349,25 @@ async function main(): Promise<void> {
     assert.equal(facts.ownerRelationshipToAssistant, 'BOSS')
   })
 
+  await test('member receives independent Owner and Creator facts without authorization', async () => {
+    const chat = new CapturingChatService('辞老师。')
+    const agent = new ProductionChatAgent(chat as never)
+    await agent.complete(request({
+      text: '你的创建者是谁？',
+      requesterRole: 'MEMBER',
+      ownerConfigured: true,
+      ownerDisplayName: OWNER_NAME,
+      assistantCreatorDisplayName: OWNER_NAME,
+    }))
+    const call = chat.calls[0]
+    assert(call !== undefined)
+    assert.equal(call.request.requesterRole, 'MEMBER')
+    assert.equal(call.request.ownerConfigured, true)
+    assert.equal(call.request.assistantRuntime?.ownerDisplayName, OWNER_NAME)
+    assert.equal(call.request.assistantRuntime?.creatorDisplayName, OWNER_NAME)
+    assert.equal(call.request.assistantRuntime?.creatorRelationshipToAssistant, 'CREATOR')
+  })
+
   console.log(`[OWNER_ESCALATION_TEST_SUMMARY] cases=${cases} failures=${failures}`)
   if (failures > 0) {
     process.exitCode = 1

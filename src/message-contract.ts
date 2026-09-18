@@ -57,6 +57,8 @@ export interface RawHookMessage {
   ownerConfigured?: boolean | null
   /** Runtime-supplied Owner display label; it never authorizes the requester by itself. */
   ownerDisplayName?: string | null
+  /** Optional additive trusted Creator display label; older runtimes omit it. */
+  assistantCreatorDisplayName?: string | null
   /** Local operator-bound public display metadata; never identity or authority. */
   publicDisplayName?: string | null
   /**
@@ -84,6 +86,8 @@ export interface InboundMessage {
   ownerConfigured: boolean
   /** Trusted runtime Owner display label; only paired with ownerConfigured for Owner facts. */
   ownerDisplayName: string | null
+  /** Trusted runtime Creator display label; absent on older runtimes. */
+  assistantCreatorDisplayName?: string | null
   /** Provider-facing public display metadata; never requester/role/memory input. */
   publicDisplayName: string | null
   /** Optional C# runtime target; only verified OWNER DIRECT may consume it. */
@@ -174,6 +178,7 @@ type IdentityResolution =
       requesterRole: RequesterRole
       ownerConfigured: boolean
       ownerDisplayName: string | null
+      assistantCreatorDisplayName: string | null
     }
   | { status: 'INVALID'; reason: string }
 
@@ -191,6 +196,7 @@ function resolveIdentity(
   const wireRequesterId = normalized(raw.requesterId)
   const wireSource = normalized(raw.requesterSource)
   const ownerDisplayName = normalized(raw.ownerDisplayName) || null
+  const assistantCreatorDisplayName = normalized(raw.assistantCreatorDisplayName) || null
 
   if (conversationType === 'GROUP') {
     // GROUP identity is decided once by the runtime. The Agent consumes the wire
@@ -230,6 +236,7 @@ function resolveIdentity(
       requesterRole,
       ownerConfigured: raw.ownerConfigured,
       ownerDisplayName,
+      assistantCreatorDisplayName,
     }
   }
 
@@ -253,6 +260,7 @@ function resolveIdentity(
       requesterRole: 'OWNER',
       ownerConfigured: true,
       ownerDisplayName,
+      assistantCreatorDisplayName,
     }
   }
 
@@ -272,6 +280,7 @@ function resolveIdentity(
     requesterRole: 'MEMBER',
     ownerConfigured: raw.ownerConfigured === true,
     ownerDisplayName,
+    assistantCreatorDisplayName,
   }
 }
 
@@ -321,6 +330,7 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       requesterRole: identity.requesterRole,
       ownerConfigured: identity.ownerConfigured,
       ownerDisplayName: identity.ownerDisplayName,
+      assistantCreatorDisplayName: identity.assistantCreatorDisplayName,
       publicDisplayName: conversationType === 'GROUP'
         ? sanitizePublicDisplayName(raw.publicDisplayName)
         : null,

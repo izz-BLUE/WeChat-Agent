@@ -33,6 +33,8 @@ export interface AgentRequest {
     ownerConfigured: boolean
     /** Runtime-supplied Owner display label; never a requester-authorization input. */
     ownerDisplayName: string | null
+    /** Runtime-supplied Creator display label; absent on older runtimes. */
+    assistantCreatorDisplayName?: string | null
     /** Local public display metadata; never identity, role or memory input. */
     publicDisplayName?: string | null
     /** C#-only target; only verified OWNER DIRECT may consume it. */
@@ -213,6 +215,7 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     requesterRole: message.requesterRole,
     ownerConfigured: message.ownerConfigured,
     ownerDisplayName: message.ownerDisplayName,
+    assistantCreatorDisplayName: message.assistantCreatorDisplayName,
     publicDisplayName: message.publicDisplayName,
     privateDispatchTargetConversationId: message.conversationType === 'DIRECT'
       ? message.privateDispatchTargetConversationId
