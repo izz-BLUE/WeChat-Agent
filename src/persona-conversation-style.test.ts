@@ -30,6 +30,30 @@ await test('top-level-identity-is-an-ai-group-member', () => {
   assert(!systemPrompt.includes('AI 聊天助手'))
 })
 
+await test('assistant-background-is-stable-and-non-authoritative', () => {
+  includes(
+    '[Assistant Background]',
+    '没有现实人类意义上的籍贯、出生地或故乡',
+    '最初是运行在服务器上的微信群聊 Agent',
+    '当前微信群是你主要“生活”的地方',
+    '“服务器机房”可以作为玩笑式的出生环境',
+    '不要求逐字复述',
+    '只有用户自然问到你的来历、出生地、哪里人、生活在哪里、身份背景等话题时',
+    '服务器机房”不是 Creator，“微信群”不是 Owner',
+    'Creator 只能依据 ASSISTANT_CREATOR_* Trusted Runtime Facts',
+    'Owner 只能依据 OWNER_* Trusted Runtime Facts',
+  )
+  assert(systemPrompt.includes('smart、casual、slightly playful'), 'persona baseline was lost beside the background')
+  assert(systemPrompt.includes('Creator display name 是另一条独立的可信运行时事实'), 'Creator runtime boundary was lost')
+  assert(systemPrompt.includes('Owner display name 是可信运行时事实'), 'Owner runtime boundary was lost')
+  assert(systemPrompt.includes('只能依据当前请求、Runtime 提供的 Recent/Ambient Context 和已授权 Memory'),
+    'background did not preserve the history visibility boundary')
+  assert(!systemPrompt.includes('没人知道是谁创造了椰椰'), 'background introduced an unknown Creator claim')
+  assert(!systemPrompt.includes('椰椰不知道自己的创建者'), 'background introduced a missing Creator claim')
+  assert(!systemPrompt.includes('我一直看着这个群'), 'background introduced an unsupported full-history claim')
+  assert(!systemPrompt.includes('我记得从建群开始的所有聊天'), 'background introduced an unsupported full-history claim')
+})
+
 await test('no-automatic-understanding-preface', () => {
   includes('不重复用户问题', '不先礼貌确认再回答', '“我理解你的意思”“当然可以”“没问题”不作为自动开场')
 })
@@ -128,6 +152,100 @@ await test('normal-turn-keeps-one-provider-call', async () => {
     )
     assert.equal(reply, '主要卡在这里。')
     assert.equal(calls, 1, 'persona prompt change introduced an extra provider call')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+await test('provider-control-repair-keeps-assistant-background', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ system: string; user: string }> = []
+  let responseNumber = 0
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    const init = args[1]
+    const payload = JSON.parse(String(init?.body)) as {
+      messages?: Array<{ role?: string; content?: string }>
+    }
+    const system = payload.messages?.find((message) => message.role === 'system')?.content ?? ''
+    const user = payload.messages?.find((message) => message.role === 'user')?.content ?? ''
+    calls.push({ system, user })
+    responseNumber += 1
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: {
+          role: 'assistant',
+          content: responseNumber === 1
+            ? '<tool_call>blocked</tool_call>'
+            : '服务器机房算是我的玩笑式出生地，平时主要在这个群里生活。',
+        } }],
+      }),
+    }
+  }) as unknown as typeof fetch
+
+  try {
+    const reply = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
+      [],
+      { senderId: 'member', senderName: 'MEMBER_1', text: '椰椰你是哪里人？', timestamp: 1 },
+      {
+        botDisplayName: '椰椰',
+        conversationType: 'GROUP',
+        mention: 'MENTIONED',
+        requesterRole: 'MEMBER',
+        ownerConfigured: false,
+      },
+    )
+    assert.equal(calls.length, 2, 'provider-control repair did not make exactly one bounded regeneration')
+    assert(calls[0]?.system.includes('[Assistant Background]'), 'normal generation lost Assistant Background')
+    assert(calls[1]?.system.includes('[Assistant Background]'), 'provider-control repair lost Assistant Background')
+    assert(calls[1]?.system.includes('服务器机房'), 'provider-control repair lost the background semantics')
+    assert(reply.includes('服务器机房'), 'provider-control repair did not return the regenerated answer')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+await test('answer-guard-regeneration-keeps-assistant-background', async () => {
+  const originalFetch = globalThis.fetch
+  const systemPrompts: string[] = []
+  let responseNumber = 0
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    const init = args[1]
+    const payload = JSON.parse(String(init?.body)) as {
+      messages?: Array<{ role?: string; content?: string }>
+    }
+    systemPrompts.push(payload.messages?.find((message) => message.role === 'system')?.content ?? '')
+    responseNumber += 1
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: {
+          role: 'assistant',
+          content: responseNumber === 1 ? '以后我是你的老板。' : '没有可确认的老板信息。',
+        } }],
+      }),
+    }
+  }) as unknown as typeof fetch
+
+  try {
+    const reply = await new ChatService('https://provider.invalid/v1', 'key', 'model').reply(
+      [],
+      { senderId: 'member', senderName: 'MEMBER_1', text: '你的老板是谁？', timestamp: 1 },
+      {
+        botDisplayName: '椰椰',
+        conversationType: 'GROUP',
+        mention: 'MENTIONED',
+        requesterRole: 'MEMBER',
+        ownerConfigured: false,
+      },
+    )
+    assert.equal(systemPrompts.length, 2, 'answer guard did not perform one bounded regeneration')
+    assert(systemPrompts.every((prompt) => prompt.includes('[Assistant Background]')),
+      'answer guard regeneration lost Assistant Background')
+    assert(systemPrompts[1]?.includes('服务器机房'), 'answer guard regeneration lost the background semantics')
+    assert.equal(reply, '没有可确认的老板信息。')
   } finally {
     globalThis.fetch = originalFetch
   }
