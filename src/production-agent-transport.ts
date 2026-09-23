@@ -28,6 +28,7 @@ import {
 import {
   PersistentRuntimeLog,
   PersistentRuntimeLogSink,
+  emitDiagnostic,
 } from './persistent-runtime-log.js'
 
 export interface ProductionAgentTransportOptions {
@@ -273,6 +274,19 @@ export class ProductionAgentTransportServer {
       await this.processProactivePoll(socket)
       return
     }
+
+    emitDiagnostic(
+      console.log,
+      this.persistentSink ?? undefined,
+      'AGENT_DISPLAY_NAME',
+      {
+        stage: 'INGRESS',
+        msgIdShort: this.messageIdToken(envelope.message.msgId),
+        publicDisplayNamePresent:
+          envelope.message.publicDisplayName !== undefined &&
+          envelope.message.publicDisplayName !== null,
+      },
+    )
 
     this.messageCount += 1
     observeRawInbound(envelope.message)
