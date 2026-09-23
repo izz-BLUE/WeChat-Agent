@@ -23,6 +23,8 @@ export const DIRECT_OWNER_FIELD_VERIFIED = 'DIRECT_OWNER_FIELD_VERIFIED'
 
 export type ConversationType = 'DIRECT' | 'GROUP'
 
+export type PublicDisplayNameSource = 'ROOM_DATA' | 'LOCAL_BINDING' | 'LEGACY_RUNTIME' | 'NONE'
+
 /** The only roles the trusted runtime can decide. */
 export type RequesterRole = 'OWNER' | 'MEMBER'
 
@@ -61,6 +63,8 @@ export interface RawHookMessage {
   assistantCreatorDisplayName?: string | null
   /** Local operator-bound public display metadata; never identity or authority. */
   publicDisplayName?: string | null
+  /** Provenance of the runtime display metadata; never an identity key. */
+  publicDisplayNameSource?: string | null
   /**
    * Confirmed BOT mention token spans over `content`, in UTF-16 code units, as
    * produced by the runtime's single mention scan. Optional additive field: an
@@ -90,6 +94,8 @@ export interface InboundMessage {
   assistantCreatorDisplayName?: string | null
   /** Provider-facing public display metadata; never requester/role/memory input. */
   publicDisplayName: string | null
+  /** Trusted provenance of publicDisplayName; never an identity or authorization fact. */
+  publicDisplayNameSource: PublicDisplayNameSource
   /** Optional C# runtime target; only verified OWNER DIRECT may consume it. */
   privateDispatchTargetConversationId?: string | null
   senderName: string | null
@@ -144,6 +150,8 @@ export interface PassiveContextMessage {
   requesterSource: string
   /** Provider-facing public display metadata; carries no authority. */
   publicDisplayName: string | null
+  /** Trusted provenance of publicDisplayName; never an identity key. */
+  publicDisplayNameSource?: PublicDisplayNameSource
   text: string
   timestamp: number
   rawMessageType: number
@@ -334,6 +342,9 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       publicDisplayName: conversationType === 'GROUP'
         ? sanitizePublicDisplayName(raw.publicDisplayName)
         : null,
+      publicDisplayNameSource: conversationType === 'GROUP'
+        ? normalizePublicDisplayNameSource(raw.publicDisplayNameSource, raw.publicDisplayName)
+        : 'NONE',
       privateDispatchTargetConversationId: normalized(raw.privateDispatchTargetConversationId) || null,
       senderName: normalized(raw.senderName) || null,
       text,
@@ -455,9 +466,23 @@ export function normalizePassiveContextMessage(raw: RawHookMessage): PassiveNorm
       requesterId,
       requesterSource: normalized(raw.requesterSource) || 'UNKNOWN',
       publicDisplayName: sanitizePublicDisplayName(raw.publicDisplayName),
+      publicDisplayNameSource: normalizePublicDisplayNameSource(raw.publicDisplayNameSource, raw.publicDisplayName),
       text,
       timestamp: raw.timestamp,
       rawMessageType,
     },
   }
+}
+
+function normalizePublicDisplayNameSource(
+  source: string | null | undefined,
+  displayName: string | null | undefined,
+): PublicDisplayNameSource {
+  const display = sanitizePublicDisplayName(displayName)
+  if (display === null) return 'NONE'
+  const normalized = typeof source === 'string' ? source.trim().toUpperCase() : ''
+  if (normalized === 'ROOM_DATA' || normalized === 'LOCAL_BINDING' || normalized === 'LEGACY_RUNTIME') {
+    return normalized
+  }
+  return 'LEGACY_RUNTIME'
 }

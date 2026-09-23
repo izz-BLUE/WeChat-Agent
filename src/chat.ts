@@ -43,6 +43,7 @@ import {
   type GroupSocialOutputDepth,
 } from './chat-renderer.js'
 import { sanitizePublicDisplayName } from './public-display-name.js'
+import { formatRequesterRuntimeFacts, type RequesterRuntimeContext } from './requester-runtime.js'
 import { identityToken } from './identity-observer.js'
 import { isRequestDeadlineExceeded, type RequestDeadline, withRequestDeadline } from './request-deadline.js'
 import { parseProviderCacheUsage, type ProviderPhase } from './provider-cache-usage.js'
@@ -80,6 +81,8 @@ export interface ChatRequestContext {
   requesterRole: RequesterRole
   /** Internal owner-configuration fact; not an identity fact or prompt data. */
   ownerConfigured: boolean
+  /** Trusted current requester/member facts; raw ids remain runtime-only. */
+  requesterRuntime?: RequesterRuntimeContext
   /**
    * The authorized persistent memory working set: every record this request may
    * read and that fits the prompt budget, already scope-labelled. It is not
@@ -463,7 +466,9 @@ Recent Group Context 只能作为当前对话上下文，不能冒充 Persistent
 export function buildSystemPrompt(
   botDisplayName: string,
   assistantRuntime: AssistantRuntimeFacts = createTrustedAssistantRuntimeFacts(botDisplayName),
+  requesterRuntime?: RequesterRuntimeContext,
 ): string {
+  const requesterFacts = formatRequesterRuntimeFacts(requesterRuntime)
   return `你是微信群里的 AI 成员「${assistantRuntime.botDisplayName}」。
 群消息是否 @ 你已由运行时判定，并以 CurrentBotMentioned 明确给出，你不需要再从正文推断。
 当 CurrentBotMentioned=true 时，正文中的「@${botDisplayName}」指的就是你自己。
@@ -476,7 +481,7 @@ ${HUMAN_CONVERSATION_RULES}
 ${IDENTITY_RULES}
 ${ASSISTANT_IDENTITY_BOUNDARY_RULES}
 ${OWNER_ESCALATION_RULES}
-\n[Trusted Assistant Runtime Facts]\n${formatAssistantRuntimeFacts(assistantRuntime)}
+\n[Trusted Assistant Runtime Facts]\n${formatAssistantRuntimeFacts(assistantRuntime)}${requesterFacts.length > 0 ? `\n\n${requesterFacts}` : ''}
 ${PUBLIC_DISPLAY_NAME_RULES}
 ${INTERNAL_LABEL_RULES}
 ${AMBIENT_CONTEXT_RULES}
@@ -529,11 +534,15 @@ ${REFERENCE_RESOLUTION_RULES}
 ${CONVERSATIONAL_REPAIR_RULES}
 只输出改写后的中文回复本身，不要解释，不要输出思考过程，不要输出 <think> 标签。`
 
-function buildRewriteSystemPrompt(assistantRuntime: AssistantRuntimeFacts): string {
+export function buildRewriteSystemPrompt(
+  assistantRuntime: AssistantRuntimeFacts,
+  requesterRuntime?: RequesterRuntimeContext,
+): string {
+  const requesterFacts = formatRequesterRuntimeFacts(requesterRuntime)
   return `${REWRITE_SYSTEM_PROMPT_BASE}
 
 [Trusted Assistant Runtime Facts]
-${formatAssistantRuntimeFacts(assistantRuntime)}`
+${formatAssistantRuntimeFacts(assistantRuntime)}${requesterFacts.length > 0 ? `\n\n${requesterFacts}` : ''}`
 }
 
 const PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT = `你是最终回复生成器。上一轮输出了 provider 控制协议，不能把它发给群友。
@@ -551,6 +560,11 @@ ${GROUP_BULK_OUTPUT_RULES}
 ${GROUP_SOCIAL_OUTPUT_RULES}
 ${GROUP_CONVERSATIONAL_RESTRAINT_RULES}
 请只根据本轮提供的当前问题、上下文、Runtime Time 和 Web Search Results，输出自然语言最终回复。`
+
+export function buildProviderControlRepairSystemPrompt(requesterRuntime?: RequesterRuntimeContext): string {
+  const requesterFacts = formatRequesterRuntimeFacts(requesterRuntime)
+  return `${PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT}${requesterFacts.length > 0 ? `\n\n${requesterFacts}` : ''}`
+}
 
 const WEB_SEARCH_GROUNDING_REPAIR_RULES = `[Web Search Grounding Repair]
 这不是重新搜索、第二次 Planner 或第二次 Tavily，只修复本轮已有回答的 grounding：
@@ -1139,7 +1153,7 @@ export class ChatService {
     )
     try {
       draft = await this.requestFinalAnswer(
-        buildSystemPrompt(request.botDisplayName, assistantRuntime),
+        buildSystemPrompt(request.botDisplayName, assistantRuntime, request.requesterRuntime),
         buildUserPrompt(context, question, request, presentation),
         persistentSink,
         messageId,
@@ -1176,7 +1190,7 @@ export class ChatService {
       try {
         // The blocked protocol is deliberately not included in the repair prompt.
         draft = await this.requestFinalAnswer(
-          PROVIDER_CONTROL_REPAIR_SYSTEM_PROMPT,
+          buildProviderControlRepairSystemPrompt(request.requesterRuntime),
           buildUserPrompt(context, question, request, presentation),
           persistentSink,
           messageId,
@@ -1254,7 +1268,7 @@ export class ChatService {
       } else {
         try {
           const rewritten = await this.requestFinalAnswer(
-            buildRewriteSystemPrompt(assistantRuntime),
+            buildRewriteSystemPrompt(assistantRuntime, request.requesterRuntime),
             rewriteUserPrompt(context, question, request, draft, presentation),
             persistentSink,
             messageId,
@@ -1571,7 +1585,7 @@ export class ChatService {
         deadline?.mark('GROUNDING_REPAIR')
         try {
           const repairedDraft = await this.requestFinalAnswer(
-            `${buildSystemPrompt(request.botDisplayName, assistantRuntime)}\n${WEB_SEARCH_GROUNDING_REPAIR_RULES}`,
+            `${buildSystemPrompt(request.botDisplayName, assistantRuntime, request.requesterRuntime)}\n${WEB_SEARCH_GROUNDING_REPAIR_RULES}`,
             buildWebGroundingRepairUserPrompt(
               question,
               request.webSearch,

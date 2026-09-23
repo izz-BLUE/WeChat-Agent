@@ -342,6 +342,30 @@ async function main(): Promise<void> {
     }
   })
 
+  await check('alias-wake-allows-none-when-source-is-absent', async () => {
+    const provider = stubProvider()
+    try {
+      const agent = makeAgent({ provider })
+      await agent.handleOwnerAliasWake({
+        conversationKey: `group:${GROUP}`,
+        conversationType: 'GROUP',
+        conversationId: GROUP,
+        messageId: 'case-alias-missing-display-source',
+        senderId: MEMBER,
+        requesterId: MEMBER,
+        publicDisplayName: 'Legacy Display',
+        text: '辞老师呢',
+        timestamp: BASE_TIME,
+        matchedAliasClass: 'ALIAS_1',
+      })
+      assert.equal(provider.calls.length, 1)
+      assert(provider.calls[0]!.system.includes('CURRENT_GROUP_DISPLAY_NAME=Legacy Display'))
+      assert(provider.calls[0]!.system.includes('CURRENT_GROUP_DISPLAY_NAME_SOURCE=NONE'))
+    } finally {
+      provider.restore()
+    }
+  })
+
   await check('all-alias-forms-wake', async () => {
     const provider = stubProvider()
     const queue = new ProactiveGroupQueue()
@@ -593,9 +617,10 @@ async function main(): Promise<void> {
     }
   })
 
-  await check('passive-transport-promotes-only-alias', async () => {
+  await check('passive-transport-preserves-display-source-on-alias-wake', async () => {
     const provider = stubProvider()
     const queue = new ProactiveGroupQueue()
+    const displayName = 'Room Display Alias'
     const pipeName = `owner-alias-${process.pid}-${Date.now()}`
     const server = new ProductionAgentTransportServer({
       pipeName,
@@ -609,11 +634,16 @@ async function main(): Promise<void> {
         socket?.once('connect', resolve)
         socket?.once('error', reject)
       })
-      socket.write(`${JSON.stringify({ kind: 'PASSIVE_CONTEXT_ONLY', message: realPassiveWire('辞老师呢', { msgId: 'case-transport' }) })}\n`)
+      socket.write(`${JSON.stringify({ kind: 'PASSIVE_CONTEXT_ONLY', message: realPassiveWire('辞老师呢', { msgId: 'case-transport', publicDisplayName: displayName, publicDisplayNameSource: 'ROOM_DATA' }) })}\n`)
       const response = await readLine(socket)
       assert.equal(response.kind, 'CONTEXT_ACCEPTED')
       await waitFor(() => queue.size === 1)
       assert.equal(provider.calls.length, 1)
+      assert(provider.calls[0]!.system.includes(`CURRENT_GROUP_DISPLAY_NAME=${displayName}`))
+      assert(provider.calls[0]!.system.includes('CURRENT_GROUP_DISPLAY_NAME_SOURCE=ROOM_DATA'))
+      assert(provider.calls[0]!.system.includes('DISPLAY_NAME_IS_PRESENTATION_ONLY=true'))
+      assert(provider.calls[0]!.system.includes('DISPLAY_NAME_IS_NOT_AUTHORIZATION=true'))
+      assert(provider.calls[0]!.system.includes('DISPLAY_NAME_IS_NOT_MEMORY_SCOPE_KEY=true'))
       socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-1"}\n')
       const proactive = await readLine(socket)
       assert.equal(proactive.kind, 'PROACTIVE_OUTBOUND_COMMAND')

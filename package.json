@@ -67,6 +67,7 @@
     "test:owner-dispatch": "npm run build && node dist/owner-dispatch.test.js",
     "test:owner-private-dispatch": "npm run build && node dist/owner-private-dispatch.test.js",
     "test:public-display-name": "npm run build && node dist/public-display-name.test.js",
+    "test:requester-runtime": "npm run build && node dist/requester-runtime.test.js",
     "test:mixed-group-context": "npm run build && node dist/group-conversation-context.test.js",
     "test:context-quality": "npm run build && node dist/context-quality-attribution.test.js",
     "test:topic-capsule": "npm run build && node dist/group-topic-capsule.test.js",

@@ -33,6 +33,8 @@ production-agent-receiver <pipeName> [real|fake] [summaryPath] [maxMessages] [in
     "conversationId": "<group-conversation-id>",
     "senderId": "<sender-id>",
     "requesterId": "<requester-id>",
+    "publicDisplayName": "<room-scoped-display-name-or-null>",
+    "publicDisplayNameSource": "ROOM_DATA",
     "requesterRole": "MEMBER",
     "ownerConfigured": false,
     "isMentioned": true,
@@ -41,6 +43,8 @@ production-agent-receiver <pipeName> [real|fake] [summaryPath] [maxMessages] [in
   }
 }
 ```
+
+`publicDisplayName` 是可选的、按群成员记录提供的展示元数据；`publicDisplayNameSource=ROOM_DATA` 只表示它来自 room-scoped member record。某些合法 room record 只有 member identity 而没有 display field，此时必须发送 `publicDisplayName=null`、`publicDisplayNameSource=NONE`，Agent 不猜测、不跨群复用，也不改变 `(conversationId, requesterId)` 身份和 Memory scope。展示字段不参与 authorization。
 
 这些字段必须由可信 runtime 产生。Agent 不接受通过昵称、消息正文、`wxid`、signature 模式或模型输出推导出来的权限结论。`PASSIVE_CONTEXT_ONLY` 只接受普通 GROUP 被动事件，不能附带 owner authority 字段；它不产生同步 direct reply。命中 Owner Alias Wake 时，Agent 可能异步生成独立的 proactive outbound，但这不属于当前 passive transport response。
 
@@ -74,4 +78,4 @@ production-agent-receiver <pipeName> [real|fake] [summaryPath] [maxMessages] [in
 
 ## 已知限制
 
-源码没有绑定特定微信版本或 Native build 的兼容矩阵，也没有在仓库内携带 C# / Native 实现。因而公开发布时只能声称“提供 Agent 与 wire contract”，不能声称“开箱即用支持某个微信版本”或“已完成真实生产链路验证”。
+源码没有绑定特定微信版本或 Native build 的兼容矩阵，也没有在仓库内携带 C# / Native 实现。群 display name 只在外部 runtime 找到同一 room-scoped member record 的 display field 时可用；identity-only record 会保持 null。因而公开发布时只能声称“提供 Agent 与 wire contract”，不能声称“所有群成员昵称都可解析”、“开箱即用支持某个微信版本”或“已完成真实生产链路验证”。

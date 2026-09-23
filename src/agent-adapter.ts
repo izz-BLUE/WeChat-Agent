@@ -9,6 +9,7 @@ import {
   type InboundMessage,
   type NormalizationResult,
   type PassiveContextMessage,
+  type PublicDisplayNameSource,
   type PassiveNormalizationResult,
   type RawHookMessage,
   type RequesterRole,
@@ -30,15 +31,17 @@ export interface AgentRequest {
   requesterSource: string
   /** Runtime-decided role fact; consumed as-is, never re-derived here. */
   requesterRole: RequesterRole
-    ownerConfigured: boolean
-    /** Runtime-supplied Owner display label; never a requester-authorization input. */
-    ownerDisplayName: string | null
-    /** Runtime-supplied Creator display label; absent on older runtimes. */
-    assistantCreatorDisplayName?: string | null
-    /** Local public display metadata; never identity, role or memory input. */
-    publicDisplayName?: string | null
-    /** C#-only target; only verified OWNER DIRECT may consume it. */
-    privateDispatchTargetConversationId?: string | null
+  ownerConfigured: boolean
+  /** Runtime-supplied Owner display label; never a requester-authorization input. */
+  ownerDisplayName: string | null
+  /** Runtime-supplied Creator display label; absent on older runtimes. */
+  assistantCreatorDisplayName?: string | null
+  /** Local public display metadata; never identity, role or memory input. */
+  publicDisplayName?: string | null
+  /** Provenance of publicDisplayName; never an identity key. */
+  publicDisplayNameSource?: PublicDisplayNameSource
+  /** C#-only target; only verified OWNER DIRECT may consume it. */
+  privateDispatchTargetConversationId?: string | null
   senderName: string | null
   text: string
   /**
@@ -92,6 +95,8 @@ export interface AgentPassiveContext {
   requesterId: string
   /** Local public display metadata for presentation only. */
   publicDisplayName?: string | null
+  /** Provenance of publicDisplayName; never an identity key. */
+  publicDisplayNameSource?: PublicDisplayNameSource
   text: string
   timestamp: number
 }
@@ -168,6 +173,7 @@ export function toPassiveContext(message: PassiveContextMessage): AgentPassiveCo
     senderId: message.senderId,
     requesterId: message.requesterId,
     publicDisplayName: message.publicDisplayName,
+    publicDisplayNameSource: message.publicDisplayNameSource,
     text: message.text,
     timestamp: message.timestamp,
   }
@@ -217,6 +223,7 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     ownerDisplayName: message.ownerDisplayName,
     assistantCreatorDisplayName: message.assistantCreatorDisplayName,
     publicDisplayName: message.publicDisplayName,
+    publicDisplayNameSource: message.publicDisplayNameSource,
     privateDispatchTargetConversationId: message.conversationType === 'DIRECT'
       ? message.privateDispatchTargetConversationId
       : null,

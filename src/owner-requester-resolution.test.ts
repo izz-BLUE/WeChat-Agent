@@ -287,7 +287,11 @@ async function testRawOwnerIdNeverReachesProvider(): Promise<void> {
   assert(call.request.ownerConfigured === true, 'the owner-configured fact was not passed to the chat service')
   assert(systemPrompt.includes('OWNER_DISPLAY_NAME=Boss'), 'the trusted owner name was not provided to the provider system prompt')
   assert(systemPrompt.includes('OWNER_RELATIONSHIP_TO_ASSISTANT=BOSS'), 'the trusted owner relationship was not provided to the provider system prompt')
-  assert(!JSON.stringify(call.request).includes('owner-sig'), 'the raw owner identity reached the chat context')
+  // The ChatRequestContext now carries the trusted requester runtime context for
+  // memory/authorization scoping. The provider boundary is the prompt, where the
+  // raw identity must still remain absent.
+  assert(call.request.requesterRuntime?.requesterId === 'owner-sig', 'the trusted requester runtime context was dropped')
+  assert(!prompt.includes('owner-sig'), 'the raw owner identity reached the provider prompt')
 }
 
 async function testRawRequesterIdNeverReachesProvider(): Promise<void> {
