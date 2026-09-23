@@ -63,7 +63,7 @@ import {
   type MemoryScopeType,
   type MemoryWriteStatus,
 } from './memory-models.js'
-import { isCurrentSelfIdentityQuery } from './memory-relevance.js'
+import { isCurrentRequesterPersonalMemory, isCurrentSelfIdentityQuery } from './memory-relevance.js'
 import {
   admitAutomaticEvidence,
   accumulatedRepeatedEvidenceMetadata,
@@ -382,6 +382,11 @@ export interface MemoryServiceOptions {
 
 type MemoryFlushTrigger = 'AUTO_BATCH' | 'AUTO_CHAT_THRESHOLD' | 'AUTO_TIMER'
 
+/** Collision-safe persistent key for one member inside one group. */
+export function memberScopeId(conversationId: string, requesterId: string): string {
+  return `${conversationId.length}:${conversationId}${requesterId.length}:${requesterId}`
+}
+
 interface BufferedEntry {
   messageId: string
   message: MemoryInputMessage
@@ -425,6 +430,7 @@ class PendingBuffer {
 
 interface PendingSlot {
   buffer: PendingBuffer
+  conversationType: ConversationType
   conversationId: string
   requesterId: string
   requesterRole: RequesterRole
@@ -639,6 +645,7 @@ export class MemoryService {
     const key = `${observation.conversationId}\u0000${observation.requesterId}`
     const slot = this.slots.get(key) ?? {
       buffer: new PendingBuffer(),
+      conversationType: observation.conversationType,
       conversationId: observation.conversationId,
       requesterId: observation.requesterId,
       requesterRole: observation.requesterRole,
@@ -718,6 +725,7 @@ export class MemoryService {
     }
 
     const scopeType = this.personalScope(request.requesterRole)
+    const scopeId = this.personalScopeId(request)
     if (!this.store.isEnabled || request.requesterId.trim().length === 0) {
       this.emit('MEMORY_WRITE', {
         scope: scopeType,
@@ -751,14 +759,16 @@ export class MemoryService {
     // an existing preference keeps the original first-evidence time and counts
     // the new statement; a repeat (store SKIPPED) changes nothing on disk, so
     // the existing record's evidence is never downgraded.
-    const previousPreference = this.store
-      .retrieve([{ scopeType, scopeId: request.requesterId, visibility: 'SHARED' }], MEMORY_ELIGIBLE_LIMIT)
+    const previousPreference = this.filterRequesterScopedRecords(
+      this.store.retrieve(this.personalScopeRules(request), MEMORY_ELIGIBLE_LIMIT),
+      request,
+    )
       .find((record) => record.kind === 'ADDRESS_PREFERENCE' && record.subject === 'CURRENT_REQUESTER')
     const evidence = upgradedExplicitEvidence(previousPreference, 'EXPLICIT_SELF_ADDRESS', now)
     const status = this.store.upsertAddressPreference({
       memoryId: this.idFactory(),
       scopeType,
-      scopeId: request.requesterId,
+      scopeId,
       content: parsed.nickname,
       contentHash: '',
       visibility: 'SHARED',
@@ -827,11 +837,17 @@ export class MemoryService {
       return []
     }
 
-    const identityContext = { requesterId: request.requesterId, personalScopeType: scope }
+    const identityContext = {
+      requesterId: request.requesterId,
+      personalScopeType: scope,
+      personalScopeId: this.personalScopeId(request),
+      legacyMemberConversationId: request.requesterRole === 'MEMBER' ? request.conversationId : undefined,
+    }
     // Step 1: deterministic authorization/scope/visibility filtering. Everything
     // downstream of this line can only ever see records this request may read.
-    const eligible = this.readableRecords(
-      this.store.retrieve(this.groupRetrievalRules(request), MEMORY_ELIGIBLE_LIMIT),
+    const eligible = this.filterRequesterScopedRecords(
+      this.readableRecords(this.store.retrieve(this.groupRetrievalRules(request), MEMORY_ELIGIBLE_LIMIT)),
+      request,
     )
     const personalCount = eligible.filter((record) => scopeClassOf(record) === 'PERSONAL').length
     const groupCount = eligible.length - personalCount
@@ -904,8 +920,9 @@ export class MemoryService {
     }
     this.emitAdmission(request, 'ADMITTED', 'EXPLICIT_COMMAND')
 
-    const candidates = this.readableRecords(
-      this.store.retrieve(this.explicitCandidateRules(request), MEMORY_FINAL_LIMIT),
+    const candidates = this.filterRequesterScopedRecords(
+      this.readableRecords(this.store.retrieve(this.explicitCandidateRules(request), MEMORY_FINAL_LIMIT)),
+      request,
     )
     let parsedMutation: MemoryMutationParseDiagnostics
     try {
@@ -965,7 +982,9 @@ export class MemoryService {
       const scopeType = isRequesterLocalPreference(subject, kind)
         ? this.personalScope(request.requesterRole)
         : requestedScopeType
-      const scopeId = scopeType === MEMORY_SCOPE_GROUP ? request.conversationId : request.requesterId
+      const scopeId = scopeType === MEMORY_SCOPE_GROUP
+        ? request.conversationId
+        : this.personalScopeId(request)
       const content = normalizeContentForWrite(mutation.content ?? '', scopeType, request.requesterId)
       const policyRejection = memoryKindWriteRejection(kind, subject)
       if (policyRejection !== null) {
@@ -1213,7 +1232,9 @@ export class MemoryService {
       return { rejection: 'SCOPE_NOT_ALLOWED_FOR_ROLE' }
     }
 
-    const scopeId = scopeType === MEMORY_SCOPE_GROUP ? slot.conversationId : slot.requesterId
+    const scopeId = scopeType === MEMORY_SCOPE_GROUP
+      ? slot.conversationId
+      : this.personalScopeId(slot)
     if (scopeId.length === 0) {
       return { rejection: 'SCOPE_IDENTITY_MISSING' }
     }
@@ -1334,11 +1355,7 @@ export class MemoryService {
   private groupRetrievalRules(request: MemoryReadRequest): MemoryAccessRule[] {
     return [
       { scopeType: MEMORY_SCOPE_GROUP, scopeId: request.conversationId, visibility: 'SHARED' },
-      {
-        scopeType: this.personalScope(request.requesterRole),
-        scopeId: request.requesterId,
-        visibility: 'SHARED',
-      },
+      ...this.personalScopeRules(request),
     ]
   }
 
@@ -1365,13 +1382,48 @@ export class MemoryService {
 
   private explicitCandidateRules(request: ExplicitMemoryRequest): MemoryAccessRule[] {
     return [
-      { scopeType: this.personalScope(request.requesterRole), scopeId: request.requesterId, visibility: 'SHARED' },
+      ...this.personalScopeRules(request),
       { scopeType: MEMORY_SCOPE_GROUP, scopeId: request.conversationId, visibility: 'SHARED' },
     ]
   }
 
   private personalScope(role: RequesterRole): typeof MEMORY_SCOPE_OWNER | typeof MEMORY_SCOPE_MEMBER {
     return role === 'OWNER' ? MEMORY_SCOPE_OWNER : MEMORY_SCOPE_MEMBER
+  }
+
+  private personalScopeId(request: Pick<MemoryReadRequest, 'conversationType' | 'conversationId' | 'requesterId' | 'requesterRole'>): string {
+    return request.conversationType === 'GROUP' && request.requesterRole === 'MEMBER'
+      ? memberScopeId(request.conversationId, request.requesterId)
+      : request.requesterId
+  }
+
+  private personalScopeRules(request: Pick<MemoryReadRequest, 'conversationType' | 'conversationId' | 'requesterId' | 'requesterRole'>): MemoryAccessRule[] {
+    const scopeType = this.personalScope(request.requesterRole)
+    const currentScopeId = this.personalScopeId(request)
+    const rules: MemoryAccessRule[] = [
+      { scopeType, scopeId: currentScopeId, visibility: 'SHARED' },
+    ]
+    // Read old MEMBER records only when their recorded source conversation proves
+    // the same room. They cannot be used as a cross-room fallback.
+    if (scopeType === MEMORY_SCOPE_MEMBER && currentScopeId !== request.requesterId) {
+      rules.push({ scopeType, scopeId: request.requesterId, visibility: 'SHARED' })
+    }
+    return rules
+  }
+
+  private filterRequesterScopedRecords<T extends MemoryRecord>(records: readonly T[], request: Pick<MemoryReadRequest, 'conversationType' | 'conversationId' | 'requesterId' | 'requesterRole'>): T[] {
+    const currentScopeId = this.personalScopeId(request)
+    if (request.conversationType !== 'GROUP' || request.requesterRole !== 'MEMBER') {
+      return [...records]
+    }
+    return records.filter((record) =>
+      record.scopeType !== MEMORY_SCOPE_MEMBER ||
+      isCurrentRequesterPersonalMemory(record, {
+        requesterId: request.requesterId,
+        personalScopeType: MEMORY_SCOPE_MEMBER,
+        personalScopeId: currentScopeId,
+        legacyMemberConversationId: request.conversationId,
+      }))
   }
 
   private rememberMessage(messageId: string): void {

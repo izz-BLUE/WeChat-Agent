@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildSystemPrompt, ChatService, type ChatRequestContext } from './chat.js'
 import { MemoryExtractor } from './memory-extractor.js'
-import { MemoryService } from './memory-service.js'
+import { MemoryService, memberScopeId } from './memory-service.js'
 import { MemoryStore } from './memory-store.js'
 import type { MemoryKind, MemorySubject } from './assistant-identity.js'
 import type { MemoryOrigin, MemoryRecord, MemoryScopeType } from './memory-models.js'
@@ -159,8 +159,9 @@ async function testAutomaticPreferencesNormalizeToRequesterScope(): Promise<void
       )
 
       const personalScope = role === 'OWNER' ? 'OWNER' : 'MEMBER'
+      const personalScopeId = role === 'OWNER' ? 'sig-a' : memberScopeId(roomId, 'sig-a')
       const stored = harness.store.retrieve([
-        { scopeType: personalScope, scopeId: 'sig-a', visibility: 'SHARED' },
+        { scopeType: personalScope, scopeId: personalScopeId, visibility: 'SHARED' },
       ], 10)
       assert(stored.length === 3, `${role} requester preferences were not normalized into personal scope`)
       assert(stored.every((item) => item.subject === 'CURRENT_REQUESTER'), `${role} preference subject changed unexpectedly`)

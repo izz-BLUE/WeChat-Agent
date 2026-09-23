@@ -12,7 +12,7 @@ import { ChatService, buildUserPrompt } from './chat.js'
 import { MENTION_SEPARATOR } from './canonical-user-text.js'
 import { deriveMemberInteractionProfile } from './member-interaction-profile.js'
 import { MemoryExtractor } from './memory-extractor.js'
-import { MemoryService } from './memory-service.js'
+import { MemoryService, memberScopeId } from './memory-service.js'
 import { MemoryStore } from './memory-store.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
@@ -108,7 +108,8 @@ function request(
 }
 
 function readPersonal(store: MemoryStore, scopeType: 'OWNER' | 'MEMBER' | 'GROUP', scopeId: string) {
-  return store.retrieve([{ scopeType, scopeId, visibility: 'SHARED' }], 20)
+  const effectiveScopeId = scopeType === 'MEMBER' ? memberScopeId(ROOM, scopeId) : scopeId
+  return store.retrieve([{ scopeType, scopeId: effectiveScopeId, visibility: 'SHARED' }], 20)
 }
 
 async function testParserAndSafetyBoundary(): Promise<void> {
@@ -331,7 +332,7 @@ async function testRestartAndProductionFastPath(): Promise<void> {
     })
     check(retrieved.length === 1 && retrieved[0]?.content === '饭团', 'restart retrieval lost address preference')
     const persisted = JSON.parse(readFileSync(harness.filePath, 'utf8')) as { records: Array<{ scopeType: string; scopeId: string; content: string }> }
-    check(persisted.records.some((record) => record.scopeType === 'MEMBER' && record.scopeId === MEMBER_A && record.content === '饭团'), 'address preference was not persisted in MEMBER scope')
+    check(persisted.records.some((record) => record.scopeType === 'MEMBER' && record.scopeId === memberScopeId(ROOM, MEMBER_A) && record.content === '饭团'), 'address preference was not persisted in MEMBER scope')
     restarted.close()
 
     const productionHarness = createHarness()

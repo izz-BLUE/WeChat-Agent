@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryExtractor } from './memory-extractor.js'
-import { MemoryService } from './memory-service.js'
+import { MemoryService, memberScopeId } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import type { MemoryRecord } from './memory-models.js'
 
@@ -118,7 +118,8 @@ async function explicit(
 }
 
 function personalRecords(harness: Harness, scopeType: 'OWNER' | 'MEMBER', scopeId: string): MemoryRecord[] {
-  return harness.store.retrieve([{ scopeType, scopeId, visibility: 'SHARED' }], 10)
+  const effectiveScopeId = scopeType === 'MEMBER' ? memberScopeId(ROOM, scopeId) : scopeId
+  return harness.store.retrieve([{ scopeType, scopeId: effectiveScopeId, visibility: 'SHARED' }], 10)
 }
 
 async function automaticMemberRemember(harness: Harness, requesterId: string): Promise<void> {

@@ -21,14 +21,17 @@ import { buildUserPrompt, type ChatRequestContext } from './chat.js'
 import { normalizeRawHookMessage, type InboundMessage, type RawHookMessage } from './message-contract.js'
 import type { GroupMessage } from './context.js'
 import { MemoryExtractor } from './memory-extractor.js'
+import { MAX_WORKING_MEMORIES } from './authorized-memory-working-set.js'
 import {
   MEMORY_AUTO_FLUSH_BATCH_SIZE,
   MEMORY_CHAT_FLUSH_MINIMUM,
   MEMORY_TIMER_INTERVAL_MS,
   MemoryService,
+  memberScopeId,
 } from './memory-service.js'
 import { MemoryStore, isReleaseArtifactPath, memoryFileIn } from './memory-store.js'
-import { MemoryText, type MemoryInputMessage, type MemoryOrigin, type MemoryScopeType, type MemoryVisibility } from './memory-models.js'
+import { MemoryText, type MemoryInputMessage, type MemoryOrigin, type MemoryRecord, type MemoryScopeType, type MemoryVisibility } from './memory-models.js'
+import { evaluateSelfIdentityBridge } from './memory-relevance.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { SpeakerLabelRegistry, isPseudonymousMemberLabel } from './speaker-labels.js'
@@ -321,22 +324,29 @@ function seed(
     scopeType: MemoryScopeType
     scopeId: string
     content: string
+    memoryId?: string
+    kind?: MemoryRecord['kind']
+    subject?: MemoryRecord['subject']
     visibility?: MemoryVisibility
     origin?: MemoryOrigin
     updatedAt?: number
+    sourceConversationId?: string
+    sourceSenderId?: string
   },
 ): void {
   const status = store.add({
-    memoryId: `seed-${options.scopeType}-${options.scopeId}-${options.content.length}`,
+    memoryId: options.memoryId ?? `seed-${options.scopeType}-${options.scopeId}-${options.content.length}`,
     scopeType: options.scopeType,
     scopeId: options.scopeId,
+    kind: options.kind,
+    subject: options.subject,
     content: options.content,
     contentHash: '',
     visibility: options.visibility ?? 'SHARED',
     origin: options.origin ?? (options.scopeType === 'GROUP' ? 'EXPLICIT_OWNER' : 'AUTOMATIC'),
     sourceConversationType: 'GROUP',
-    sourceConversationId: 'room-a@chatroom',
-    sourceSenderId: options.scopeId,
+    sourceConversationId: options.sourceConversationId ?? 'room-a@chatroom',
+    sourceSenderId: options.sourceSenderId ?? options.scopeId,
     createdAt: options.updatedAt ?? 1,
     updatedAt: options.updatedAt ?? 1,
     isDeleted: false,
@@ -419,16 +429,107 @@ async function testCrossRequesterIsolation(): Promise<void> {
   assert(harness.textOf().includes('reason=DIRECT') === false, 'unexpected direct diagnostic')
 }
 
-/** 4. Personal memory follows the requester across conversations. */
+/** 4. Member personal memory is isolated by both room and requester. */
 async function testCrossGroupPersonalContinuity(): Promise<void> {
   const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { signature: 'sig-a', conversationId: 'room-a@chatroom' })
 
   const otherRoom = await retrieve(harness.service, { signature: 'sig-a', conversationId: 'room-b@chatroom' })
-  assert(otherRoom.length === 1, 'personal memory did not follow the requester across rooms')
+  assert(otherRoom.length === 0, 'member personal memory crossed into another room')
 
   const otherRequester = await retrieve(harness.service, { signature: 'sig-b', conversationId: 'room-b@chatroom' })
   assert(otherRequester.length === 0, 'cross-room personal memory leaked to another requester')
+}
+
+/** Legacy MEMBER facts keep their personal priority only for the same requester and room. */
+async function testLegacyMemberPriorityCompatibility(): Promise<void> {
+  const legacy = createHarness()
+  for (let index = 0; index < MAX_WORKING_MEMORIES; index += 1) {
+    seed(legacy.store, {
+      scopeType: 'GROUP',
+      scopeId: 'room-a@chatroom',
+      memoryId: `legacy-budget-${index}`,
+      content: `群内普通记忆 ${index}`,
+    })
+  }
+  seed(legacy.store, {
+    scopeType: 'MEMBER',
+    scopeId: 'sig-a',
+    memoryId: 'legacy-self-identity-sig-a',
+    content: '我叫小明',
+    sourceConversationId: 'room-a@chatroom',
+    sourceSenderId: 'sig-a',
+  })
+  seed(legacy.store, {
+    scopeType: 'MEMBER',
+    scopeId: 'sig-a',
+    memoryId: 'legacy-preference-sig-a',
+    kind: 'SOFT_STYLE_PREFERENCE',
+    subject: 'CURRENT_REQUESTER',
+    content: '回答尽量简短一点',
+    sourceConversationId: 'room-a@chatroom',
+    sourceSenderId: 'sig-a',
+  })
+
+  const legacyItems = await retrieve(legacy.service, { signature: 'sig-a', question: '我叫什么' })
+  assert(legacyItems.length === MAX_WORKING_MEMORIES, 'the legacy case did not exercise the working-set cap')
+  assert(legacyItems[0]?.content === '我叫小明', 'same-requester, same-room legacy self identity lost its personal tier')
+  assert(legacyItems.some((item) => item.content === '回答尽量简短一点'), 'same-requester, same-room legacy preference lost its personal tier')
+  const legacyIdentity = legacy.store.retrieve([
+    { scopeType: 'MEMBER', scopeId: 'sig-a', visibility: 'SHARED' },
+  ], 10).find((record) => record.content === '我叫小明')
+  assert(legacyIdentity !== undefined, 'the legacy self-identity record was not stored')
+  const identityBridge = evaluateSelfIdentityBridge('我叫什么', legacyIdentity, {
+    requesterId: 'sig-a',
+    personalScopeType: 'MEMBER',
+    personalScopeId: memberScopeId('room-a@chatroom', 'sig-a'),
+    legacyMemberConversationId: 'room-a@chatroom',
+  })
+  assert(identityBridge.matched, 'same-requester, same-room legacy self identity lost its identity bridge')
+
+  const current = createHarness()
+  for (let index = 0; index < MAX_WORKING_MEMORIES; index += 1) {
+    seed(current.store, {
+      scopeType: 'GROUP',
+      scopeId: 'room-a@chatroom',
+      memoryId: `current-budget-${index}`,
+      content: `群内普通记忆 ${index}`,
+    })
+  }
+  seed(current.store, {
+    scopeType: 'MEMBER',
+    scopeId: memberScopeId('room-a@chatroom', 'sig-current'),
+    memoryId: 'current-self-identity',
+    content: '我叫小绿',
+    sourceConversationId: 'room-a@chatroom',
+    sourceSenderId: 'sig-current',
+  })
+  const currentItems = await retrieve(current.service, { signature: 'sig-current', question: '我叫什么' })
+  assert(currentItems[0]?.content === '我叫小绿', 'new-format self identity did not retain its personal tier')
+
+  const otherRequester = createHarness()
+  seed(otherRequester.store, {
+    scopeType: 'MEMBER',
+    scopeId: 'sig-b',
+    memoryId: 'legacy-other-requester',
+    content: '我叫小红',
+    sourceConversationId: 'room-a@chatroom',
+    sourceSenderId: 'sig-b',
+  })
+  const otherRequesterItems = await retrieve(otherRequester.service, { signature: 'sig-a', question: '我叫什么' })
+  assert(!otherRequesterItems.some((item) => item.content === '我叫小红'), 'another requester legacy memory entered the personal working set')
+
+  const otherRoom = createHarness()
+  seed(otherRoom.store, {
+    scopeType: 'MEMBER',
+    scopeId: 'sig-a',
+    memoryId: 'legacy-other-room',
+    content: '我叫小蓝',
+    sourceConversationId: 'room-b@chatroom',
+    sourceSenderId: 'sig-a',
+  })
+  const otherRoomItems = await retrieve(otherRoom.service, { signature: 'sig-a', question: '我叫什么' })
+  assert(!otherRoomItems.some((item) => item.content === '我叫小蓝'), 'another room legacy memory entered the personal working set')
 }
 
 /** 5. Group shared memory is visible to every member of that room. */
@@ -473,7 +574,7 @@ async function testMemberPersonalScope(): Promise<void> {
   const harness = createHarness({ extractorResponses: ['[{"scope":"MEMBER","content":"A 的代号是 Alpha","evidenceType":"EXPLICIT_SELF_STATEMENT","evidence":["M1"]}]'] })
   await feed(harness.service, 3, { signature: 'sig-a', role: 'MEMBER' })
 
-  const record = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: 'sig-a', visibility: 'SHARED' }], 10)
+  const record = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId('room-a@chatroom', 'sig-a'), visibility: 'SHARED' }], 10)
   assert(record.length === 1, 'the member candidate was not written to the member scope')
   const ownerScope = harness.store.retrieve([{ scopeType: 'OWNER', scopeId: 'sig-a', visibility: 'SHARED' }], 10)
   assert(ownerScope.length === 0, 'a member write reached the owner scope')
@@ -765,7 +866,7 @@ async function testReasoningNeverPersisted(): Promise<void> {
   })
   await feed(harness.service, 3, { chatTriggered: true })
   assert(harness.service.recordCount === 1, 'the balanced thinking block broke extraction')
-  const stored = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: 'sig-a', visibility: 'SHARED' }], 10)
+  const stored = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId('room-a@chatroom', 'sig-a'), visibility: 'SHARED' }], 10)
   assert(stored[0]?.content === 'A 的代号是 Alpha', 'thinking markup leaked into memory')
   assert(!stored[0]?.content.includes('推理'), 'reasoning text was persisted')
 
@@ -930,9 +1031,9 @@ async function testSpeakerAttributionDoesNotConfusePersonalMemory(): Promise<voi
   // A tells the bot its codename; the automatic batch writes A's personal scope.
   await feed(harness.service, 3, { signature: 'sig-a', text: '我的代号是 Alpha' })
   assert(harness.service.recordCount === 1, 'A personal memory was not written')
-  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: 'sig-a', visibility: 'SHARED' }], 10)
+  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId('room-a@chatroom', 'sig-a'), visibility: 'SHARED' }], 10)
   assert(records.length === 1, 'A personal memory is missing')
-  const bRecords = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: 'sig-b', visibility: 'SHARED' }], 10)
+  const bRecords = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId('room-a@chatroom', 'sig-b'), visibility: 'SHARED' }], 10)
   assert(bRecords.length === 0, 'A personal memory was keyed to B')
 
   // A turn, then B turn in the same room, through one production session.
@@ -1091,6 +1192,7 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ['restart-persistence', testRestartPersistence],
   ['cross-requester-personal-isolation', testCrossRequesterIsolation],
   ['requester-cross-group-continuity', testCrossGroupPersonalContinuity],
+  ['legacy-member-priority-compatibility', testLegacyMemberPriorityCompatibility],
   ['group-shared-same-room-visibility', testGroupSharedSameRoomVisibility],
   ['group-shared-cross-room-isolation', testGroupCrossRoomIsolation],
   ['owner-personal-scope', testOwnerPersonalScope],

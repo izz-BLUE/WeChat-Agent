@@ -52,7 +52,7 @@
  * being included again, and nothing about the model's ability to ignore it
  * depends on a threshold.
  */
-import { evaluateMemoryRelevance, type MemoryRetrievalIdentityContext } from './memory-relevance.js'
+import { evaluateMemoryRelevance, isCurrentRequesterPersonalMemory, type MemoryRetrievalIdentityContext } from './memory-relevance.js'
 import { classifyMemoryKind } from './assistant-identity.js'
 import {
   MEMORY_SCOPE_GROUP,
@@ -223,10 +223,7 @@ function budgetTierOf(record: MemoryRecord, identityContext: MemoryRetrievalIden
   if (record.scopeType === MEMORY_SCOPE_GROUP) {
     return 1
   }
-  return record.scopeType === identityContext.personalScopeType &&
-    record.scopeId === identityContext.requesterId
-    ? 0
-    : 2
+  return isCurrentRequesterPersonalMemory(record, identityContext) ? 0 : 2
 }
 
 /** Negative when `left` must be injected before `right`; a total order. */

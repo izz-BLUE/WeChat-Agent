@@ -22,7 +22,7 @@ import type { ChatRequestContext } from './chat.js'
 import type { GroupMessage } from './context.js'
 import { MemoryExtractor } from './memory-extractor.js'
 import type { MemoryOrigin, MemoryScopeType } from './memory-models.js'
-import { MemoryService, MEMORY_TIMER_INTERVAL_MS } from './memory-service.js'
+import { MemoryService, MEMORY_TIMER_INTERVAL_MS, memberScopeId } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 import { normalizeRawHookMessage, type InboundMessage, type RawHookMessage } from './message-contract.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
@@ -533,8 +533,8 @@ async function testGroupContextIsNotPersistentMemory(): Promise<void> {
 
 /**
  * GROUP-scope isolation through the production agent: a fact stored for room A is
- * never retrieved in room B, and the same requester keeps their personal fact in
- * both rooms.
+ * never retrieved in room B, while same requester/member memory remains room
+ * scoped rather than crossing into the other room.
  */
 async function testGroupScopeNeverLeaksAcrossRooms(): Promise<void> {
   const harness = createHarness({ extractorResponses: ['[]'] })
@@ -543,9 +543,18 @@ async function testGroupScopeNeverLeaksAcrossRooms(): Promise<void> {
 
   seed(harness.store, { memoryId: 'room-a-fact', scopeType: 'GROUP', scopeId: ROOM_A, content: '本群活动时间是周五' })
   seed(harness.store, { memoryId: 'room-b-fact', scopeType: 'GROUP', scopeId: ROOM_B, content: '本群活动时间是周六' })
-  // The personal control carries the question's own vocabulary, so a relevant
-  // personal record is expected in both rooms regardless of which group speaks.
-  seed(harness.store, { memoryId: 'personal-fact', scopeType: 'MEMBER', scopeId: REQUESTER_A, content: '本群活动时间的个人备注是 Alpha' })
+  seed(harness.store, {
+    memoryId: 'personal-fact-a',
+    scopeType: 'MEMBER',
+    scopeId: memberScopeId(ROOM_A, REQUESTER_A),
+    content: '本群活动时间的个人备注是 Alpha-A',
+  })
+  seed(harness.store, {
+    memoryId: 'personal-fact-b',
+    scopeType: 'MEMBER',
+    scopeId: memberScopeId(ROOM_B, REQUESTER_A),
+    content: '本群活动时间的个人备注是 Alpha-B',
+  })
 
   await session.ask({ conversationId: ROOM_A, text: '@椰椰 本群活动时间是什么', msgId: 'room-a-1' })
   await session.ask({ conversationId: ROOM_B, text: '@椰椰 本群活动时间是什么', msgId: 'room-b-1' })
@@ -560,11 +569,13 @@ async function testGroupScopeNeverLeaksAcrossRooms(): Promise<void> {
   assert(contentsB.some((content) => content.includes('周六')), `room B did not see its own group fact: ${contentsB.join('|')}`)
   assert(!contentsB.some((content) => content.includes('周五')), `room B saw room A's group fact: ${contentsB.join('|')}`)
   assert(
-    inA.some((item) => item.scope === 'PERSONAL' && item.content.includes('Alpha')),
+    inA.some((item) => item.scope === 'PERSONAL' && item.content.includes('Alpha-A')) &&
+      !inA.some((item) => item.scope === 'PERSONAL' && item.content.includes('Alpha-B')),
     `the same requester lost their personal fact in room A: ${contentsA.join('|')}`,
   )
   assert(
-    inB.some((item) => item.scope === 'PERSONAL' && item.content.includes('Alpha')),
+    inB.some((item) => item.scope === 'PERSONAL' && item.content.includes('Alpha-B')) &&
+      !inB.some((item) => item.scope === 'PERSONAL' && item.content.includes('Alpha-A')),
     `the same requester lost their personal fact in room B: ${contentsB.join('|')}`,
   )
 }

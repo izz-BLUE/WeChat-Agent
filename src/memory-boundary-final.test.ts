@@ -13,6 +13,7 @@ import { MemoryExtractor } from './memory-extractor.js'
 import type { MemoryKind, MemorySubject } from './assistant-identity.js'
 import {
   MemoryService,
+  memberScopeId,
   type MemoryReadRequest,
 } from './memory-service.js'
 import {
@@ -307,8 +308,11 @@ async function testPersonalAutomaticMemoryStillWorks(): Promise<void> {
     const harness = createHarness(memoryCase.candidate)
     try {
       await feedAutomatic(harness.service, { requesterId: memoryCase.requesterId, requesterRole: memoryCase.role })
+      const scopeId = memoryCase.scopeType === 'MEMBER'
+        ? memberScopeId('room-boundary@chatroom', memoryCase.requesterId)
+        : memoryCase.requesterId
       const records = harness.store.retrieve([
-        { scopeType: memoryCase.scopeType, scopeId: memoryCase.requesterId, visibility: 'SHARED' },
+        { scopeType: memoryCase.scopeType, scopeId, visibility: 'SHARED' },
       ], 10)
       assert(records.length === 1 && records[0]?.origin === 'AUTOMATIC', `${memoryCase.role} personal automatic memory was disabled`)
       assert(records[0]?.subject === 'CURRENT_REQUESTER', `${memoryCase.role} personal memory lost requester subject`)

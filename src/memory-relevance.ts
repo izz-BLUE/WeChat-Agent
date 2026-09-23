@@ -51,6 +51,10 @@ export type MemoryRelevanceReason =
 export interface MemoryRetrievalIdentityContext {
   requesterId: string
   personalScopeType: 'OWNER' | 'MEMBER'
+  /** Encoded (conversationId, requesterId) scope for GROUP MEMBER records. */
+  personalScopeId?: string
+  /** Current room, enabling priority only for same-requester legacy MEMBER records. */
+  legacyMemberConversationId?: string
 }
 
 export interface SelfIdentityBridgeResult {
@@ -260,7 +264,7 @@ export function isCurrentRequesterSelfIdentityMemory(
   record: MemoryRecord,
   context: MemoryRetrievalIdentityContext,
 ): boolean {
-  if (record.scopeType !== context.personalScopeType || record.scopeId !== context.requesterId) {
+  if (!isCurrentRequesterPersonalMemory(record, context)) {
     return false
   }
 
@@ -271,6 +275,23 @@ export function isCurrentRequesterSelfIdentityMemory(
     /^我的(?:代号|名字|姓名|昵称|称呼)(?:叫|是|为)/u.test(text) ||
     /^我叫(?!什么|啥|谁).+/u.test(text)
   )
+}
+
+/** Current personal scope, including only the already-authorized same-room legacy MEMBER form. */
+export function isCurrentRequesterPersonalMemory(
+  record: MemoryRecord,
+  context: MemoryRetrievalIdentityContext,
+): boolean {
+  if (record.scopeType !== context.personalScopeType) {
+    return false
+  }
+  if (record.scopeId === (context.personalScopeId ?? context.requesterId)) {
+    return true
+  }
+  return context.personalScopeType === 'MEMBER' &&
+    context.legacyMemberConversationId !== undefined &&
+    record.scopeId === context.requesterId &&
+    record.sourceConversationId === context.legacyMemberConversationId
 }
 
 export function evaluateSelfIdentityBridge(

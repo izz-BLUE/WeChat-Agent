@@ -27,6 +27,7 @@ import {
 import {
   MEMORY_AUTO_FLUSH_BATCH_SIZE,
   MemoryService,
+  memberScopeId,
   type ExplicitMemoryRequest,
 } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
@@ -379,7 +380,7 @@ async function testAutomaticSelfStatementWritten(): Promise<void> {
   })
   await feed(harness.service, 3)
 
-  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)
+  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)
   assert.equal(records.length, 1, 'the explicit self statement was not written')
   const record = records[0]!
   assert.equal(record.evidenceType, 'EXPLICIT_SELF_STATEMENT')
@@ -405,7 +406,7 @@ async function testAutomaticPreferenceWritten(): Promise<void> {
   })
   await feed(harness.service, 3)
 
-  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)
+  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)
   assert.equal(records.length, 1, 'the explicit preference was not written')
   assert.equal(records[0]?.evidenceType, 'EXPLICIT_PREFERENCE')
   assert.equal(records[0]?.confidence, 0.95)
@@ -462,7 +463,7 @@ async function testRepeatedBehaviorAdmission(): Promise<void> {
     extractorResponses: [`[{"scope":"MEMBER","kind":"SOFT_STYLE_PREFERENCE","content":"他偏好简短","evidenceType":"REPEATED_BEHAVIOR","evidence":["M1","M3"]}]`],
   })
   await feed(repeated.service, 3)
-  const records = repeated.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)
+  const records = repeated.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)
   assert.equal(records.length, 1, 'the two-reference repeated behavior was not written')
   assert.equal(records[0]?.evidenceCount, 2)
   assert.equal(records[0]?.confidence, 0.75)
@@ -658,7 +659,7 @@ async function testSelfAddressEvidence(): Promise<void> {
 
   const first = harness.service.tryHandleSelfAddressPreference(base)
   assert.deepEqual(first, { handled: true, reply: '好，以后叫你静宝。' })
-  const written = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)[0]!
+  const written = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)[0]!
   assert.equal(written.evidenceType, 'EXPLICIT_SELF_ADDRESS')
   assert.equal(written.confidence, 1)
   assert.equal(written.evidenceCount, 1)
@@ -667,7 +668,7 @@ async function testSelfAddressEvidence(): Promise<void> {
   // Repeating the same nickname stays SKIPPED and never downgrades the record.
   const repeat = harness.service.tryHandleSelfAddressPreference(base)
   assert.deepEqual(repeat, { handled: true, reply: '好，以后叫你静宝。' })
-  const unchanged = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)[0]!
+  const unchanged = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)[0]!
   assert.equal(unchanged.evidenceCount, 1, 'a repeated nickname changed the stored evidence count')
   assert.equal(unchanged.firstEvidenceAt, firstEvidenceAt)
 
@@ -677,7 +678,7 @@ async function testSelfAddressEvidence(): Promise<void> {
     question: '以后叫我梨宝',
   })
   assert.deepEqual(update, { handled: true, reply: '好，以后叫你梨宝。' })
-  const upgraded = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)[0]!
+  const upgraded = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)[0]!
   assert.equal(upgraded.content, '梨宝')
   assert.equal(upgraded.evidenceType, 'EXPLICIT_SELF_ADDRESS', 'the nickname update downgraded the evidence')
   assert.equal(upgraded.confidence, 1)
@@ -829,7 +830,7 @@ async function testBatchSizeMatchesReferences(): Promise<void> {
     extractorResponses: [`[{"scope":"MEMBER","content":"${FACT}","evidenceType":"REPEATED_BEHAVIOR","evidence":["M1","M${MEMORY_AUTO_FLUSH_BATCH_SIZE}"]}]`],
   })
   await feed(harness.service, MEMORY_AUTO_FLUSH_BATCH_SIZE)
-  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)
+  const records = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)
   assert.equal(records.length, 1, 'a reference at the batch boundary was wrongly rejected')
   assert.equal(records[0]?.evidenceCount, 2)
 }

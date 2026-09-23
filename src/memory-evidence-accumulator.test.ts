@@ -26,7 +26,7 @@ import {
 } from './memory-evidence-accumulator.js'
 import { REPEATED_EVIDENCE_ADMISSION_THRESHOLD } from './memory-evidence.js'
 import { MemoryExtractor } from './memory-extractor.js'
-import { MemoryService } from './memory-service.js'
+import { MemoryService, memberScopeId } from './memory-service.js'
 import { MemoryStore, memoryFileIn } from './memory-store.js'
 
 const ROOM = 'room-acc@chatroom'
@@ -299,7 +299,7 @@ async function testFirstWaitsSecondWrites(): Promise<void> {
   await feed(harness.service, { text: CAT_PREFERENCE })
   assert.equal(harness.service.recordCount, 0, 'a single pooled contribution must not write memory')
   const pooled = harness.accumulator.getAccumulatedEvidence({
-    candidateKey: expectedKey('MEMBER', REQUESTER, CAT_PREFERENCE),
+    candidateKey: expectedKey('MEMBER', memberScopeId(ROOM, REQUESTER), CAT_PREFERENCE),
   })
   assert.ok(pooled, 'the contribution did not create a pool entry')
   assert.equal(pooled?.evidenceCount, 1)
@@ -312,7 +312,7 @@ async function testFirstWaitsSecondWrites(): Promise<void> {
   // B.
   await feed(harness.service, { text: CAT_PREFERENCE })
   assert.equal(harness.service.recordCount, 1, 'the second contribution did not write memory')
-  const record = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)[0]!
+  const record = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)[0]!
   assert.equal(record.content, CAT_PREFERENCE)
   assert.equal(record.evidenceType, 'REPEATED_BEHAVIOR')
   assert.equal(record.confidence, 0.75, 'the accumulated write lost the REPEATED_BEHAVIOR confidence')
@@ -336,8 +336,8 @@ async function testRequesterIsolation(): Promise<void> {
 
   assert.equal(harness.service.recordCount, 0, 'cross-requester evidence merged into a write')
   assert.equal(harness.accumulator.size, 2, 'the pool merged two requesters into one entry')
-  const a = harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', 'sig-a', CAT_PREFERENCE) })
-  const b = harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', 'sig-b', CAT_PREFERENCE) })
+  const a = harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', memberScopeId(ROOM, 'sig-a'), CAT_PREFERENCE) })
+  const b = harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', memberScopeId(ROOM, 'sig-b'), CAT_PREFERENCE) })
   assert.equal(a?.evidenceCount, 1)
   assert.equal(b?.evidenceCount, 1)
 }
@@ -353,7 +353,7 @@ async function testScopeIsolation(): Promise<void> {
   assert.equal(harness.service.recordCount, 0, 'cross-scope evidence merged into a write')
   assert.equal(harness.accumulator.size, 2, 'the pool merged OWNER and MEMBER scopes')
   const owner = harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('OWNER', 'sig-owner', CAT_PREFERENCE) })
-  const member = harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', 'sig-member', CAT_PREFERENCE) })
+  const member = harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', memberScopeId(ROOM, 'sig-member'), CAT_PREFERENCE) })
   assert.equal(owner?.evidenceCount, 1)
   assert.equal(member?.evidenceCount, 1)
 }
@@ -365,7 +365,7 @@ async function testTtlExpiryIntegration(): Promise<void> {
   const harness = createHarness({ extractorResponses: [REPEATED_FIXTURE, REPEATED_FIXTURE, REPEATED_FIXTURE], accumulator })
 
   await feed(harness.service, { text: CAT_PREFERENCE })
-  assert.equal(harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', REQUESTER, CAT_PREFERENCE) })?.evidenceCount, 1)
+  assert.equal(harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', memberScopeId(ROOM, REQUESTER), CAT_PREFERENCE) })?.evidenceCount, 1)
   assert.equal(harness.service.recordCount, 0)
 
   poolNow += REPEATED_EVIDENCE_TTL_MS + 1
@@ -374,13 +374,13 @@ async function testTtlExpiryIntegration(): Promise<void> {
     accumulatorLines(harness.logs).some((line) => line.includes('result=EXPIRED')),
     'the expired pool was not diagnosed',
   )
-  assert.equal(harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', REQUESTER, CAT_PREFERENCE) })?.evidenceCount, 1,
+  assert.equal(harness.accumulator.getAccumulatedEvidence({ candidateKey: expectedKey('MEMBER', memberScopeId(ROOM, REQUESTER), CAT_PREFERENCE) })?.evidenceCount, 1,
     'the expired pool must restart from the fresh contribution')
   assert.equal(harness.service.recordCount, 0, 'the post-expiry single contribution wrote memory')
 
   await feed(harness.service, { text: CAT_PREFERENCE })
   assert.equal(harness.service.recordCount, 1, 'post-expiry accumulation did not reach the threshold')
-  const record = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: REQUESTER, visibility: 'SHARED' }], 10)[0]!
+  const record = harness.store.retrieve([{ scopeType: 'MEMBER', scopeId: memberScopeId(ROOM, REQUESTER), visibility: 'SHARED' }], 10)[0]!
   assert.equal(record.evidenceCount, 2)
   assert.equal(record.evidenceType, 'REPEATED_BEHAVIOR')
 }
