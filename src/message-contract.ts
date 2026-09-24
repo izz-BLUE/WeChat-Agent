@@ -1,4 +1,6 @@
 export const SUPPORTED_TEXT_MESSAGE_TYPE = 1
+export const SUPPORTED_QUOTED_TEXT_MESSAGE_TYPE = 49
+export const MAX_QUOTED_CONTEXT_CHARACTERS = 4096
 
 import {
   ABSENT_BOT_MENTION_SPANS,
@@ -37,6 +39,8 @@ export interface RawHookMessage {
   wxid: string
   content: string
   signature: string
+  /** Optional, untrusted refermsg body emitted only by the strict Native quote path. */
+  quotedContext?: unknown
   senderName?: string | null
   isMentioned?: boolean | null
   /**
@@ -111,6 +115,8 @@ export interface InboundMessage {
    * is carried rather than reconstructed.
    */
   rawText: string
+  /** Explicitly quoted conversation data; never identity, authority or current text. */
+  quotedContext?: { text: string } | null
   isMentioned: boolean | null
   timestamp: number
   rawMessageType: number
@@ -293,7 +299,7 @@ function resolveIdentity(
 }
 
 export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResult {
-  if (raw.type !== SUPPORTED_TEXT_MESSAGE_TYPE) {
+  if (raw.type !== SUPPORTED_TEXT_MESSAGE_TYPE && raw.type !== SUPPORTED_QUOTED_TEXT_MESSAGE_TYPE) {
     return {
       status: 'UNSUPPORTED',
       reason: 'RAW_MESSAGE_TYPE_NOT_SUPPORTED',
@@ -306,6 +312,9 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
   const conversationType = resolveConversationType(raw, conversationId)
   const rawText = raw.content ?? ''
   const text = normalized(rawText)
+  const quotedContext = raw.type === SUPPORTED_QUOTED_TEXT_MESSAGE_TYPE
+    ? normalizeQuotedContext(raw.quotedContext)
+    : null
   const userContentSpan = resolveUserContentSpan(rawText, raw.userContentSpan)
 
   if (!messageId) {
@@ -349,6 +358,7 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       senderName: normalized(raw.senderName) || null,
       text,
       rawText,
+      quotedContext,
       isMentioned: raw.isMentioned ?? null,
       timestamp: raw.timestamp,
       rawMessageType: raw.type,
@@ -359,6 +369,21 @@ export function normalizeRawHookMessage(raw: RawHookMessage): NormalizationResul
       userContentSpan,
     },
   }
+}
+
+function normalizeQuotedContext(value: unknown): { text: string } | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null
+  }
+  const candidate = (value as Record<string, unknown>).text
+  if (typeof candidate !== 'string' || candidate.length > MAX_QUOTED_CONTEXT_CHARACTERS) {
+    return null
+  }
+  const text = candidate.trim()
+  if (text.length === 0 || text.length > MAX_QUOTED_CONTEXT_CHARACTERS) {
+    return null
+  }
+  return { text }
 }
 
 export function isVerifiedOwnerDirect(message: Pick<InboundMessage,

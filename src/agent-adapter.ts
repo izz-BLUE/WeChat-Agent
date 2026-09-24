@@ -49,6 +49,8 @@ export interface AgentRequest {
    * value, so canonicalization starts from it rather than from `text`.
    */
   rawText?: string
+  /** Explicit quote data for reply comprehension only; excluded from side effects. */
+  quotedContext?: { text: string } | null
   timestamp: number
   mentionState: MentionState
   /**
@@ -230,6 +232,7 @@ export function toAgentRequest(message: InboundMessage): AgentRequest {
     senderName: message.senderName,
     text: message.text,
     rawText: message.rawText,
+    ...(message.quotedContext == null ? {} : { quotedContext: message.quotedContext }),
     timestamp: message.timestamp,
     mentionState: toMentionState(message),
     botMentionSpans: message.botMentionSpans,

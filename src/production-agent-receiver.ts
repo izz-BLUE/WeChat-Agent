@@ -1155,6 +1155,7 @@ export class ProductionChatAgent implements AgentExecutor {
           publicDisplayNameSource: request.publicDisplayNameSource ?? 'NONE',
         },
         mention: mentionFact(request),
+        quotedContext: request.quotedContext ?? null,
         ownerAliasWake: aliasWake,
         requesterRole: request.requesterRole,
         ownerConfigured: request.ownerConfigured,
