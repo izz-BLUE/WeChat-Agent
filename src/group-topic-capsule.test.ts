@@ -88,10 +88,17 @@ function makeFixture(options: { count?: number; recentRawEntries?: number; recen
   return { ambient, store, compactor }
 }
 
-function draft(topic: string, sourceEventIds: readonly string[], speakerTypes: readonly ('MEMBER' | 'ASSISTANT')[] = ['MEMBER']): GroupTopicCapsuleDraft {
+function draft(
+  topic: string,
+  sourceEventIds: readonly string[],
+  speakerTypes: readonly ('MEMBER' | 'ASSISTANT')[] = ['MEMBER'],
+  state: { settledPoints?: readonly string[]; openQuestions?: readonly string[] } = {},
+): GroupTopicCapsuleDraft {
   return {
     topic,
     summary: `${topic} 的公开摘要`,
+    settledPoints: state.settledPoints ?? [],
+    openQuestions: state.openQuestions ?? [],
     keywords: ['方案', '讨论'],
     sourceEventIds,
     sourceStartAt: NOW,
@@ -261,6 +268,137 @@ async function main(): Promise<void> {
     assert(context.topicContext[0]?.summary.includes('群里公开讨论'))
   })
 
+  await check('Thread State is returned by the existing single compactor completion', async () => {
+    const fixture = makeFixture()
+    let calls = 0
+    let system = ''
+    const compactor = new GroupTopicCapsuleCompactor({
+      ambient: fixture.ambient,
+      store: fixture.store,
+      triggerEventCount: 2,
+      recentRawEntries: 2,
+      complete: async (systemPrompt, user) => {
+        calls += 1
+        system = systemPrompt
+        return JSON.stringify({ capsules: [{
+          topic: '晚餐安排',
+          summary: '群里讨论今晚聚餐',
+          settledPoints: ['今晚吃火锅'],
+          openQuestions: ['具体地点还没确定'],
+          keywords: ['晚餐', '火锅'],
+          sourceEventIds: eventsFromUser(user),
+        }] })
+      },
+      now: () => NOW,
+    })
+    const result = await compactor.compactGroup(GROUP_A)
+    const stored = fixture.store.entries(GROUP_A)[0]
+    assert.equal(result.result, 'COMPACTED')
+    assert.equal(calls, 1)
+    assert(system.includes('settledPoints'))
+    assert(system.includes('openQuestions'))
+    assert.deepEqual(stored?.settledPoints, ['今晚吃火锅'])
+    assert.deepEqual(stored?.openQuestions, ['具体地点还没确定'])
+
+    const context = mixedContext(fixture.store, fixture.ambient).assemble({
+      groupConversationId: GROUP_A,
+      requesterIdentity: REQUESTER_A,
+      currentEventId: 'current',
+      currentTurn: currentMessage('current', '火锅地点呢？'),
+      currentSpeakerLabel: 'MEMBER_1',
+    })
+    const prompt = buildUserPrompt([], currentMessage('current', '火锅地点呢？'), {
+      botDisplayName: '椰椰', mention: 'MENTIONED', requesterRole: 'MEMBER', ownerConfigured: false,
+      conversationType: 'GROUP', groupConversationContext: context,
+    })
+    assert(prompt.includes(`snapshotEndAt=${stored?.sourceEndAt}`))
+    assert(prompt.includes('今晚吃火锅'))
+    assert(prompt.includes('具体地点还没确定'))
+    assert(!prompt.includes(stored?.sourceEventIds[0] ?? 'NO_SOURCE_ID'))
+  })
+
+  await check('answered source question is represented as settled and not open', async () => {
+    const ambient = new GroupAmbientContext({ now: () => NOW, maxEntries: 10 })
+    appendAmbient(ambient, GROUP_A, 'question', '几点集合？', NOW)
+    appendAmbient(ambient, GROUP_A, 'answer', '晚上七点集合', NOW + 1)
+    appendAmbient(ambient, GROUP_A, 'later', '收到', NOW + 2)
+    const store = new GroupTopicCapsuleStore({ now: () => NOW })
+    let system = ''
+    const compactor = new GroupTopicCapsuleCompactor({
+      ambient, store, triggerEventCount: 1, recentRawEntries: 1,
+      complete: async (systemPrompt, user) => {
+        system = systemPrompt
+        return JSON.stringify({ capsules: [{
+          topic: '集合时间', summary: '群里确认了集合时间',
+          settledPoints: ['集合时间为晚上七点'], openQuestions: [],
+          keywords: ['集合', '七点'], sourceEventIds: eventsFromUser(user),
+        }] })
+      },
+      now: () => NOW,
+    })
+    await compactor.compactGroup(GROUP_A)
+    assert(system.includes('后续 source event 已回答的问题不得保留'))
+    assert.deepEqual(store.entries(GROUP_A)[0]?.settledPoints, ['集合时间为晚上七点'])
+    assert.deepEqual(store.entries(GROUP_A)[0]?.openQuestions, [])
+  })
+
+  await check('missing and malformed Thread State fields fail soft per Capsule', async () => {
+    const fixture = makeFixture()
+    const compactor = new GroupTopicCapsuleCompactor({
+      ambient: fixture.ambient, store: fixture.store, triggerEventCount: 2, recentRawEntries: 2,
+      complete: async (_system, user) => {
+        const ids = eventsFromUser(user)
+        return JSON.stringify({ capsules: [
+          { topic: 'empty state', summary: 'valid capsule', keywords: ['valid'], sourceEventIds: ids.slice(0, 1) },
+          { topic: 'bad state', summary: 'also valid', settledPoints: 'not-array', openQuestions: [{ text: 'bad' }, 5], keywords: ['valid'], sourceEventIds: ids.slice(1, 2) },
+        ] })
+      },
+      now: () => NOW,
+    })
+    const result = await compactor.compactGroup(GROUP_A)
+    assert.equal(result.capsulesProduced, 2)
+    assert.deepEqual(fixture.store.entries(GROUP_A).map((item) => item.settledPoints), [[], []])
+    assert.deepEqual(fixture.store.entries(GROUP_A).map((item) => item.openQuestions), [[], []])
+  })
+
+  await check('Thread State arrays trim, deduplicate, and enforce item and count bounds', async () => {
+    const fixture = makeFixture()
+    const longValue = '长'.repeat(130)
+    const compactor = new GroupTopicCapsuleCompactor({
+      ambient: fixture.ambient, store: fixture.store, triggerEventCount: 2, recentRawEntries: 2,
+      complete: async (_system, user) => JSON.stringify({ capsules: [{
+        topic: 'bounded', summary: 'valid',
+        settledPoints: ['  已确认  ', '已确认', '', longValue, '第三项', '第四项'],
+        openQuestions: ['  地点未定  ', '地点未定', '时间未定', '人数未定', '状态未定'],
+        keywords: ['valid'], sourceEventIds: eventsFromUser(user),
+      }] }),
+      now: () => NOW,
+    })
+    await compactor.compactGroup(GROUP_A)
+    const stored = fixture.store.entries(GROUP_A)[0]
+    assert.deepEqual(stored?.settledPoints, ['已确认', '长'.repeat(120), '第三项'])
+    assert.deepEqual(stored?.openQuestions, ['地点未定', '时间未定', '人数未定'])
+    for (const item of [...(stored?.settledPoints ?? []), ...(stored?.openQuestions ?? [])]) assert(item.length <= 120)
+  })
+
+  await check('unsafe identity state items are removed without dropping the Capsule', async () => {
+    const fixture = makeFixture()
+    const compactor = new GroupTopicCapsuleCompactor({
+      ambient: fixture.ambient, store: fixture.store, triggerEventCount: 2, recentRawEntries: 2,
+      complete: async (_system, user) => JSON.stringify({ capsules: [{
+        topic: 'public topic', summary: 'valid capsule',
+        settledPoints: ['安全结论', 'wxid_secret', 'senderId=secret', 'requesterId=secret', 'MEMBER_1 承诺请客', 'CURRENT_REQUESTER 已确认', 'scopeId=secret'],
+        openQuestions: ['地点未定', 'conversationId=secret', 'wxid=secret', 'MEMBER_3 的问题', 'CURRENT_REQUESTER', 'senderId=secret'],
+        keywords: ['valid'], sourceEventIds: eventsFromUser(user),
+      }] }),
+      now: () => NOW,
+    })
+    const result = await compactor.compactGroup(GROUP_A)
+    assert.equal(result.capsulesProduced, 1)
+    assert.deepEqual(fixture.store.entries(GROUP_A)[0]?.settledPoints, ['安全结论'])
+    assert.deepEqual(fixture.store.entries(GROUP_A)[0]?.openQuestions, ['地点未定'])
+  })
+
   await check('one batch cannot store more than three topics', async () => {
     const fixture = makeFixture()
     const compactor = new GroupTopicCapsuleCompactor({
@@ -368,6 +506,59 @@ async function main(): Promise<void> {
     assert.equal(result.capsules[0]?.topic, 'FDE 面试')
   })
 
+  await check('Thread State text participates in the existing lexical relevance score', () => {
+    const store = new GroupTopicCapsuleStore({ now: () => NOW, idFactory: (() => { let id = 0; return () => `state-${++id}` })() })
+    store.addMany(GROUP_A, [
+      draft('周末聚餐', [sourceId(20)], ['MEMBER'], { openQuestions: ['集合时间尚未确定'] }),
+      draft('部署方案', [sourceId(21)], ['MEMBER'], { openQuestions: ['服务端口尚未确定'] }),
+    ])
+    const result = store.select(GROUP_A, '集合时间')
+    assert.equal(result.capsules[0]?.topic, '周末聚餐')
+    assert.equal(result.selectedByLexical, 1)
+  })
+
+  await check('newer ambient overlap with Thread State can mark only the matching snapshot stale', () => {
+    const store = new GroupTopicCapsuleStore({ now: () => NOW, idFactory: (() => { let id = 0; return () => `stale-${++id}` })() })
+    store.addMany(GROUP_A, [
+      draft('周末聚餐', [sourceId(22)], ['MEMBER'], { openQuestions: ['集合时间尚未确定'] }),
+      draft('部署端口', [sourceId(23)], ['MEMBER'], { openQuestions: ['服务端口尚未确定'] }),
+    ])
+    const result = store.select(GROUP_A, '无关查询', {
+      recentAmbient: [{ text: '那就晚上七点集合', timestamp: NOW + 10 }],
+    })
+    const staleByTopic = new Map(result.capsules.map((item) => [item.topic, item.potentiallyStale]))
+    assert.equal(staleByTopic.get('周末聚餐'), true)
+    assert.equal(staleByTopic.get('部署端口'), false)
+  })
+
+  await check('newer same-topic snapshot is ordered first and shown with its historical boundary', () => {
+    const ambient = new GroupAmbientContext({ now: () => NOW })
+    const store = new GroupTopicCapsuleStore({ now: () => NOW, idFactory: (() => { let id = 0; return () => `snapshot-${++id}` })() })
+    store.addMany(GROUP_A, [{ ...draft('聚餐安排', [sourceId(24)], ['MEMBER'], { openQuestions: ['集合时间尚未确定'] }), sourceStartAt: 90, sourceEndAt: 100 }])
+    store.addMany(GROUP_A, [{ ...draft('聚餐安排', [sourceId(25)], ['MEMBER'], { settledPoints: ['集合时间确定为晚上七点'] }), sourceStartAt: 190, sourceEndAt: 200 }])
+    const assembler = mixedContext(store, ambient)
+    const context = assembler.assemble({
+      groupConversationId: GROUP_A,
+      requesterIdentity: REQUESTER_A,
+      currentEventId: 'current',
+      currentTurn: currentMessage('current', '聚餐时间呢？'),
+      currentSpeakerLabel: 'MEMBER_1',
+    })
+    const request: ChatRequestContext = {
+      botDisplayName: '椰椰', mention: 'MENTIONED', requesterRole: 'MEMBER', ownerConfigured: false,
+      conversationType: 'GROUP', groupConversationContext: context,
+    }
+    const prompt = buildUserPrompt([], currentMessage('current', '聚餐时间呢？'), request)
+    assert.equal(context.topicContext.length, 2)
+    assert.equal(context.topicContext[0]?.sourceEndAt, 200)
+    assert.equal(context.topicContext[1]?.sourceEndAt, 100)
+    assert(prompt.indexOf('snapshotEndAt=200') < prompt.indexOf('snapshotEndAt=100'))
+    assert(prompt.includes('集合时间确定为晚上七点'))
+    assert(prompt.includes('集合时间尚未确定'))
+    assert(buildSystemPrompt('椰椰').includes('Recent Context 高于所有 Topic Snapshot'))
+    assert(buildSystemPrompt('椰椰').includes('不是可信 Runtime Time'))
+  })
+
   await check('no lexical hit uses deterministic recency fallback', () => {
     const store = new GroupTopicCapsuleStore({ now: () => NOW, idFactory: (() => { let id = 0; return () => `c${++id}` })() })
     store.addMany(GROUP_A, [draft('older', [sourceId(9)])])
@@ -380,8 +571,32 @@ async function main(): Promise<void> {
     const store = new GroupTopicCapsuleStore({ now: () => NOW, maxChars: 100, idFactory: (() => { let id = 0; return () => `c${++id}` })() })
     store.addMany(GROUP_A, [draft('one', [sourceId(11)]), draft('two', [sourceId(12)])])
     const selection = store.select(GROUP_A, '无关', { maxChars: 20 })
-    assert.equal(selection.selectedCount, 1)
+    assert.equal(selection.selectedCount, 0)
     assert.equal(selection.budgetTruncated, true)
+  })
+
+  await check('Thread State text counts toward the bounded Topic Context budget', () => {
+    const store = new GroupTopicCapsuleStore({ now: () => NOW, idFactory: (() => { let id = 0; return () => `budget-${++id}` })() })
+    const longState = (prefix: string) => `${prefix}${'界'.repeat(120 - prefix.length)}`
+    store.addMany(GROUP_A, [1, 2, 3].map((index) => draft(
+      `topic-${index}`,
+      [sourceId(30 + index)],
+      ['MEMBER'],
+      {
+        settledPoints: [1, 2, 3].map((item) => longState(`settled-${index}-${item}-`)),
+        openQuestions: [1, 2, 3].map((item) => longState(`open-${index}-${item}-`)),
+      },
+    )))
+    const selection = store.select(GROUP_A, '无关查询')
+    assert(selection.selectedCount >= 1)
+    assert(selection.selectedCount < 3)
+    assert.equal(selection.budgetTruncated, true)
+    const renderedChars = selection.capsules.map((item) => {
+      const values = (items: readonly string[]) => items.length === 0 ? '（无）' : items.map((value) => `    - ${value}`).join('\n')
+      const keywords = item.keywords.length === 0 ? '（无）' : item.keywords.join('、')
+      return `- topic=${item.topic} speakerType=${item.speakerTypes.join(',')} snapshotEndAt=${item.sourceEndAt} potentiallyStale=${item.potentiallyStale === true}\n  summary=${item.summary}\n  settledPoints:\n${values(item.settledPoints)}\n  openQuestions:\n${values(item.openQuestions)}\n  keywords=${keywords}`.length
+    }).reduce((total, chars, index) => total + chars + (index > 0 ? 1 : 0), 0)
+    assert(renderedChars <= 2_400)
   })
 
   await check('provider failure fails open and preserves source coverage', async () => {

@@ -77,6 +77,8 @@ function draft(
   return {
     topic,
     summary,
+    settledPoints: [],
+    openQuestions: [],
     keywords,
     sourceEventIds: [sourceEventId],
     sourceStartAt: sourceEndAt - 10,
