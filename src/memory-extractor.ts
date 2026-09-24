@@ -30,7 +30,15 @@ import {
   type MemorySubject,
 } from './assistant-identity.js'
 import { AUTOMATIC_MEMORY_EVIDENCE_TYPES, type MemoryEvidenceType } from './memory-evidence.js'
-import { MemoryText, type MemoryCandidate, type MemoryInputMessage, type MemoryScopeType } from './memory-models.js'
+import {
+  isMemorySlot,
+  MEMORY_SLOTS,
+  MemoryText,
+  type MemoryCandidate,
+  type MemoryInputMessage,
+  type MemoryScopeType,
+  type MemorySlot,
+} from './memory-models.js'
 import type { ConversationType } from './message-contract.js'
 import type { RequestDeadline } from './request-deadline.js'
 import type { ProviderPhase } from './provider-cache-usage.js'
@@ -48,7 +56,14 @@ const EXTRACTOR_PROMPT = `你是微信群 AI 的长期记忆候选提取器。
 只输出严格 JSON 数组，不要 Markdown，不要解释，不要输出思考过程。
 输入消息带批内编号 M1、M2…；每项必须声明 evidenceType 和 evidence，evidence 只能引用输入中真实存在的消息编号，至少一条，不得重复，不得编造。
 每项格式为：
-{"subject":"CURRENT_REQUESTER|OTHER_MEMBER|GROUP|ASSISTANT","scope":"OWNER|MEMBER|GROUP","kind":"SELF_FACT|ADDRESS_PREFERENCE|CONTENT_PREFERENCE|SOFT_STYLE_PREFERENCE|THIRD_PARTY_ASSERTION|ASSISTANT_RULE|ASSISTANT_IDENTITY_ASSERTION|ASSISTANT_RELATIONSHIP_ASSERTION|EPHEMERAL_CONVENTION","content":"记忆内容","evidenceType":"EXPLICIT_SELF_STATEMENT|EXPLICIT_PREFERENCE|REPEATED_BEHAVIOR|INFERRED_PATTERN","evidence":["M1","M3"]}
+{"subject":"CURRENT_REQUESTER|OTHER_MEMBER|GROUP|ASSISTANT","scope":"OWNER|MEMBER|GROUP","kind":"SELF_FACT|ADDRESS_PREFERENCE|CONTENT_PREFERENCE|SOFT_STYLE_PREFERENCE|THIRD_PARTY_ASSERTION|ASSISTANT_RULE|ASSISTANT_IDENTITY_ASSERTION|ASSISTANT_RELATIONSHIP_ASSERTION|EPHEMERAL_CONVENTION","content":"记忆内容","evidenceType":"EXPLICIT_SELF_STATEMENT|EXPLICIT_PREFERENCE|REPEATED_BEHAVIOR|INFERRED_PATTERN","evidence":["M1","M3"],"memorySlot":"可选闭集值"}
+memorySlot 仅用于下面闭集中的单一当前值，可省略或输出 null。允许值仅有：${MEMORY_SLOTS.join('|')}。
+CURRENT_PRIMARY_RESIDENCE=当前主要居住地明确发生变化，如“我现在主要住广州”“我已经搬到深圳住了”。老家、出差/临时地点、经常去的地点、父母住址、历史地点，以及广州和深圳两边住等并存住所都不得给 slot；并存或含义不清时省略。
+DEFAULT_RESPONSE_DETAIL=对椰椰的全局默认回答详细程度，如“以后默认回答简短一点”“平时直接说重点”“以后回答详细一点”。带技术问题/闲聊/写代码等场景条件、本轮限定或局部条件的偏好不得给 slot。
+DEFAULT_RESPONSE_TONE=对椰椰的全局默认表达语气，如“以后默认说话随意一点”“平时跟我聊天口语一点”。带技术问题/闲聊/写方案等场景条件或本轮限定的偏好不得给 slot。
+DEFAULT_EMOJI_USAGE=对椰椰的全局默认 emoji 使用偏好，如“以后少用 emoji”“平时可以适当加点表情”。带聊天/技术问题等场景条件、本轮限定或局部条件的偏好不得给 slot。
+工作角色、雇主、求职/就业状态不是单值 slot：如“我做 Java 后端”“我也做 AI Agent 开发”以及“我在 A 公司上班，同时给 B 公司做项目”“我现在还在职，但也在找工作”必须作为可并存的普通 SELF_FACT，不得互相 supersede。
+只有明确陈述当前主要居住地变化，或明确提出全局可复用回答偏好时才给相应 slot；兴趣、技能、项目、历史经历、老家、可并存事实、条件化偏好、一次性或临时状态不得给 slot。不确定时省略。ADDRESS_PREFERENCE 不使用 memorySlot。
 evidenceType 判定（区分事实与推断）：
 EXPLICIT_SELF_STATEMENT=用户明确陈述自己的稳定事实，如“我是 Java 后端”“我叫某名”；
 EXPLICIT_PREFERENCE=用户明确表达长期或可复用的交流/内容偏好，如“以后回答短一点”“别讲太多理论”“以后叫我某名”；
@@ -117,6 +132,7 @@ export class MemoryExtractor {
         content?: unknown
         evidenceType?: unknown
         evidence?: unknown
+        memorySlot?: unknown
       }
       if (typeof candidate.scope !== 'string' || typeof candidate.content !== 'string') {
         continue
@@ -154,6 +170,12 @@ export class MemoryExtractor {
         ? candidate.evidenceType.trim().toUpperCase() as MemoryEvidenceType
         : undefined
       const evidenceRefs = Array.isArray(candidate.evidence) ? candidate.evidence : undefined
+      const normalizedSlot = typeof candidate.memorySlot === 'string'
+        ? candidate.memorySlot.trim().toUpperCase()
+        : undefined
+      const memorySlot: MemorySlot | undefined = normalizedSlot !== undefined && isMemorySlot(normalizedSlot)
+        ? normalizedSlot
+        : undefined
 
       const kind = classifyMemoryKind(content, declaredKind)
       candidates.push({
@@ -161,6 +183,7 @@ export class MemoryExtractor {
         subject: classifyMemorySubject(scope, kind, declaredSubject),
         kind,
         content,
+        ...(memorySlot === undefined ? {} : { memorySlot }),
         ...(evidenceType === undefined ? {} : { evidenceType }),
         ...(evidenceRefs === undefined ? {} : { evidenceRefs }),
       })

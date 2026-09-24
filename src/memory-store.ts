@@ -34,10 +34,12 @@ import {
   type MemorySubject,
 } from './assistant-identity.js'
 import {
+  isMemorySlot,
   MemoryText,
   type MemoryAccessRule,
   type MemoryRecord,
   type MemoryScopeType,
+  type MemorySlot,
   type MemoryVisibility,
   type MemoryWriteStatus,
 } from './memory-models.js'
@@ -62,6 +64,14 @@ export interface MemoryStoreOptions {
   sink?: PersistentRuntimeLogSink
   /** Diagnostics only: where the path came from. */
   pathSource?: string
+}
+
+export interface CurrentSlotWriteResult {
+  status: MemoryWriteStatus
+  /** The operation attempted, including a failed persistence attempt. */
+  action: 'INSERT' | 'SUPERSEDE' | 'SKIP'
+  /** Number of old live records retired by a successful write. */
+  replacedCount: number
 }
 
 const RESERVED_SEGMENTS = ['artifacts', 'freeze', 'manifest', 'candidate']
@@ -145,6 +155,58 @@ export class MemoryStore {
       return 'FAILED'
     }
     return 'WRITTEN'
+  }
+
+  /** Atomically replace the active record(s) for one admitted personal slot. */
+  public upsertCurrentSlot(record: MemoryRecord): CurrentSlotWriteResult {
+    if (!this.enabled) {
+      return { status: 'DISABLED', action: 'SKIP', replacedCount: 0 }
+    }
+    if ((record.scopeType !== 'OWNER' && record.scopeType !== 'MEMBER') ||
+        record.scopeId.trim().length === 0 ||
+        record.subject !== 'CURRENT_REQUESTER' ||
+        record.origin !== 'AUTOMATIC' ||
+        record.kind === 'ADDRESS_PREFERENCE' ||
+        record.isDeleted ||
+        !isMemorySlot(record.memorySlot) ||
+        (record.evidenceType !== 'EXPLICIT_SELF_STATEMENT' && record.evidenceType !== 'EXPLICIT_PREFERENCE')) {
+      return { status: 'INVALID', action: 'SKIP', replacedCount: 0 }
+    }
+
+    const content = MemoryText.normalize(record.content)
+    if (content.length === 0) {
+      return { status: 'INVALID', action: 'SKIP', replacedCount: 0 }
+    }
+
+    const hash = MemoryText.hash(content)
+    const matches = this.records
+      .map((existing, index) => ({ existing, index }))
+      .filter(({ existing }) =>
+        !existing.isDeleted &&
+        existing.scopeType === record.scopeType &&
+        existing.scopeId === record.scopeId &&
+        existing.subject === 'CURRENT_REQUESTER' &&
+        existing.memorySlot === record.memorySlot,
+      )
+
+    if (matches.length === 1 && matches[0]?.existing.contentHash === hash) {
+      return { status: 'SKIPPED', action: 'SKIP', replacedCount: 0 }
+    }
+
+    const action = matches.length === 0 ? 'INSERT' : 'SUPERSEDE'
+    const previous = this.records
+    const matchingIndexes = new Set(matches.map(({ index }) => index))
+    const retired = this.records.map((existing, index) => matchingIndexes.has(index)
+      ? { ...existing, isDeleted: true, updatedAt: record.updatedAt }
+      : existing)
+    const stored: MemoryRecord = { ...record, content, contentHash: hash }
+    this.records = [...retired, stored]
+
+    if (!this.save()) {
+      this.records = previous
+      return { status: 'FAILED', action, replacedCount: 0 }
+    }
+    return { status: 'WRITTEN', action, replacedCount: matches.length }
   }
 
   /**
@@ -512,6 +574,7 @@ function parseRecord(value: unknown): MemoryRecord | null {
       (typeof record.kind !== 'string' || !MEMORY_KINDS.includes(record.kind as MemoryKind))) return null
   if (record.subject !== undefined &&
       (typeof record.subject !== 'string' || !MEMORY_SUBJECTS.includes(record.subject as MemorySubject))) return null
+  if (record.memorySlot !== undefined && !isMemorySlot(record.memorySlot)) return null
   if (record.sourceConversationType !== null && record.sourceConversationType !== 'GROUP' && record.sourceConversationType !== 'DIRECT') return null
   if (record.sourceConversationId !== null && typeof record.sourceConversationId !== 'string') return null
   if (record.sourceSenderId !== null && typeof record.sourceSenderId !== 'string') return null
@@ -528,6 +591,7 @@ function parseRecord(value: unknown): MemoryRecord | null {
     scopeType: scopeType as MemoryScopeType,
     kind: record.kind as MemoryKind | undefined,
     subject: record.subject as MemorySubject | undefined,
+    ...(record.memorySlot === undefined ? {} : { memorySlot: record.memorySlot as MemorySlot }),
     scopeId: record.scopeId,
     content: record.content,
     contentHash: record.contentHash,

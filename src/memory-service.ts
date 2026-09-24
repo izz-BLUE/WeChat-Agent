@@ -61,6 +61,7 @@ import {
   type MemoryInputMessage,
   type MemoryRecord,
   type MemoryScopeType,
+  type MemorySlot,
   type MemoryWriteStatus,
 } from './memory-models.js'
 import { isCurrentRequesterPersonalMemory, isCurrentSelfIdentityQuery } from './memory-relevance.js'
@@ -480,6 +481,15 @@ export class MemoryService {
    */
   private emit(event: 'MEMORY_TRIGGER' | 'MEMORY_READ' | 'MEMORY_WRITE', fields: DiagnosticFields): void {
     emitDiagnostic(this.log, this.sink, event, fields)
+  }
+
+  private emitTemporalUpdate(fields: {
+    slot: MemorySlot
+    action: 'INSERT' | 'SUPERSEDE' | 'SKIP'
+    replacedCount: number
+    result: 'PASS' | 'FAIL'
+  }): void {
+    emitDiagnostic(this.log, this.sink, 'MEMORY_TEMPORAL_UPDATE', fields)
   }
 
   /**
@@ -1153,7 +1163,19 @@ export class MemoryService {
           continue
         }
 
-        const status = this.store.add(built.record)
+        const temporalSlot = isEligibleCurrentSlotRecord(built.record)
+        const slotWrite = temporalSlot
+          ? this.store.upsertCurrentSlot(built.record)
+          : undefined
+        const status = slotWrite?.status ?? this.store.add(built.record)
+        if (slotWrite !== undefined) {
+          this.emitTemporalUpdate({
+            slot: built.record.memorySlot!,
+            action: slotWrite.action,
+            replacedCount: slotWrite.replacedCount,
+            result: status === 'WRITTEN' || status === 'SKIPPED' ? 'PASS' : 'FAIL',
+          })
+        }
         this.emit('MEMORY_WRITE', { scope: built.record.scopeType, visibility: 'SHARED', result: status })
         if (status === 'WRITTEN') {
           // ADMITTED means the evidence metadata above reached a durable record.
@@ -1275,6 +1297,14 @@ export class MemoryService {
       createdAt: now,
       updatedAt: now,
       isDeleted: false,
+      ...(candidate.memorySlot !== undefined &&
+          isCurrentSlotKindCompatible(candidate.memorySlot, kind) &&
+          subject === 'CURRENT_REQUESTER' &&
+          (scopeType === MEMORY_SCOPE_OWNER || scopeType === MEMORY_SCOPE_MEMBER) &&
+          kind !== 'ADDRESS_PREFERENCE' &&
+          (metadata.evidenceType === 'EXPLICIT_SELF_STATEMENT' || metadata.evidenceType === 'EXPLICIT_PREFERENCE')
+        ? { memorySlot: candidate.memorySlot }
+        : {}),
       ...metadata,
     })
 
@@ -1482,6 +1512,22 @@ function isDirtyRequesterLocalPreference(record: MemoryRecord): boolean {
 
 function isHistoricalAutomaticGroupRecord(record: MemoryRecord): boolean {
   return record.origin === 'AUTOMATIC' && record.scopeType === MEMORY_SCOPE_GROUP
+}
+
+function isEligibleCurrentSlotRecord(record: MemoryRecord): boolean {
+  return record.origin === 'AUTOMATIC' &&
+    (record.scopeType === MEMORY_SCOPE_OWNER || record.scopeType === MEMORY_SCOPE_MEMBER) &&
+    record.subject === 'CURRENT_REQUESTER' &&
+    record.kind !== 'ADDRESS_PREFERENCE' &&
+    record.memorySlot !== undefined &&
+    (record.evidenceType === 'EXPLICIT_SELF_STATEMENT' || record.evidenceType === 'EXPLICIT_PREFERENCE')
+}
+
+function isCurrentSlotKindCompatible(slot: MemorySlot, kind: MemoryKind): boolean {
+  if (slot === 'CURRENT_PRIMARY_RESIDENCE') {
+    return kind === 'SELF_FACT'
+  }
+  return kind === 'CONTENT_PREFERENCE' || kind === 'SOFT_STYLE_PREFERENCE'
 }
 
 function explicitAddReply(status: MemoryWriteStatus): string {

@@ -41,6 +41,20 @@ export type MemoryOrigin = 'AUTOMATIC' | 'EXPLICIT_OWNER' | 'EXPLICIT_SELF_ADDRE
 
 export type MemoryWriteStatus = 'WRITTEN' | 'SKIPPED' | 'FAILED' | 'DISABLED' | 'INVALID'
 
+/** Runtime-owned closed set of mutable current-value memory slots. */
+export const MEMORY_SLOTS = [
+  'CURRENT_PRIMARY_RESIDENCE',
+  'DEFAULT_RESPONSE_DETAIL',
+  'DEFAULT_RESPONSE_TONE',
+  'DEFAULT_EMOJI_USAGE',
+] as const
+
+export type MemorySlot = typeof MEMORY_SLOTS[number]
+
+export function isMemorySlot(value: unknown): value is MemorySlot {
+  return typeof value === 'string' && MEMORY_SLOTS.includes(value as MemorySlot)
+}
+
 export interface MemoryRecord {
   memoryId: string
   scopeType: MemoryScopeType
@@ -48,6 +62,8 @@ export interface MemoryRecord {
   kind?: MemoryKind
   /** Semantic subject for the memory policy; absent only on legacy records. */
   subject?: MemorySubject
+  /** Optional runtime-closed current-value key; absent on legacy records. */
+  memorySlot?: MemorySlot
   /** OWNER/MEMBER: canonical requester id. GROUP: conversation id. */
   scopeId: string
   content: string
@@ -106,6 +122,8 @@ export interface MemoryCandidate {
   subject: MemorySubject
   kind: MemoryKind
   content: string
+  /** Optional runtime-closed current-value key from the automatic extractor. */
+  memorySlot?: MemorySlot
   /**
    * The extractor's declared evidence class (automatic subset only). The
    * runtime validates it against the closed set — a provider declaring a
