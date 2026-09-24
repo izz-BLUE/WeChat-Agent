@@ -5,6 +5,7 @@ import { memoryFileIn } from './memory-store.js'
 import { validateRuntimeTimeZone } from './runtime-time.js'
 
 export type BotMode = 'smoke' | 'chat'
+export type SearchProviderName = 'degoog' | 'searxng' | 'tavily'
 
 function positiveInteger(name: string, fallback: number): number {
   const value = Number.parseInt(process.env[name] ?? '', 10)
@@ -50,6 +51,9 @@ export function resolveMemoryFilePath(): { filePath: string; source: string } {
 }
 
 const memoryPath = resolveMemoryFilePath()
+const configuredSearchProvider = process.env.SEARCH_PROVIDER?.trim()
+  || process.env.WEB_SEARCH_PROVIDER?.trim()
+  || 'degoog'
 
 export const config = {
   puppet: process.env.WECHATY_PUPPET ?? 'xp',
@@ -88,7 +92,10 @@ export const config = {
   memoryFilePath: memoryPath.filePath,
   memoryPathSource: memoryPath.source,
   webSearchEnabled: (process.env.WEB_SEARCH_ENABLED ?? '0').trim() === '1',
-  webSearchProvider: process.env.WEB_SEARCH_PROVIDER?.trim() || 'tavily',
+  searchProvider: configuredSearchProvider,
+  /** Legacy alias retained for callers that still read the old config key. */
+  webSearchProvider: configuredSearchProvider,
+  degoogApiBase: process.env.DEGOOG_API_BASE?.trim() || 'http://127.0.0.1:4444',
   tavilyApiBase: process.env.TAVILY_API_BASE?.trim() ?? '',
   tavilyApiKey: process.env.TAVILY_API_KEY ?? '',
   searxngEnabled: (process.env.SEARXNG_ENABLED ?? '0').trim() === '1',
@@ -126,12 +133,14 @@ export function validateChatConfig(): void {
   validateRuntimeTimeZone(config.agentTimeZone)
 
   if (config.webSearchEnabled) {
-    if (config.webSearchProvider !== 'tavily') {
-      throw new Error(`Unsupported WEB_SEARCH_PROVIDER: ${config.webSearchProvider}`)
+    if (config.searchProvider !== 'degoog' && config.searchProvider !== 'searxng' && config.searchProvider !== 'tavily') {
+      throw new Error(`Unsupported SEARCH_PROVIDER: ${config.searchProvider}`)
     }
+    // Degoog and SearXNG are fail-soft local/optional Providers. Keep the
+    // historical Tavily startup check only for the legacy explicit selection.
     const tavilyConfigured = Boolean(config.tavilyApiBase && config.tavilyApiKey)
     const searxngConfigured = config.searxngEnabled && Boolean(config.searxngApiBase)
-    if (!tavilyConfigured && !searxngConfigured) {
+    if (config.searchProvider === 'tavily' && !tavilyConfigured && !searxngConfigured) {
       const webSearchMissing = [
         ['TAVILY_API_BASE', config.tavilyApiBase],
         ['TAVILY_API_KEY', config.tavilyApiKey],

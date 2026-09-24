@@ -68,10 +68,12 @@ Memory 文件是单个 JSON 文档，代码使用原子临时文件写入与 ren
 | 变量 | 必填 | 默认值 | 作用 | 敏感性 | 备注 |
 | --- | --- | --- | --- | --- | --- |
 | `WEB_SEARCH_ENABLED` | 否 | `0` | Search 总开关 | 普通 | 默认关闭 |
-| `WEB_SEARCH_PROVIDER` | 否 | `tavily` | provider 配置名 | 普通 | 当前校验只接受 `tavily` |
-| `TAVILY_API_BASE` | 条件 | 空 | Tavily API 地址 | 地址 | 启用 Search 且无可用 SearXNG 时需要 |
+| `SEARCH_PROVIDER` | 否 | `degoog` | provider 配置名 | 普通 | `degoog`、`searxng`，或兼容旧 Tavily 的 `tavily`；Degoog 为默认 |
+| `DEGOOG_API_BASE` | 否 | `http://127.0.0.1:4444` | Degoog API 地址 | 地址 | 本机 Degoog 服务地址；服务不可用时 fail-soft |
+| `WEB_SEARCH_PROVIDER` | 否 | 空 | 旧 provider 配置名 | 普通 | 兼容旧配置；仅支持 `tavily` |
+| `TAVILY_API_BASE` | 条件 | 空 | Tavily API 地址 | 地址 | 仅在选择旧 Tavily 路线时需要 |
 | `TAVILY_API_KEY` | 条件 | 空 | Tavily credential | Secret | 只从环境变量提供 |
-| `SEARXNG_ENABLED` | 条件 | `0` | 启用 SearXNG 路线 | 普通 | 需要配合地址 |
+| `SEARXNG_ENABLED` | 条件 | `0` | 启用 SearXNG 路线 | 普通 | Degoog 的可选 fallback，需配合地址 |
 | `SEARXNG_API_BASE` | 条件 | `http://127.0.0.1:8088` | SearXNG 地址 | 地址 | 示例地址；仓库不会启动服务 |
 | `SEARXNG_ENGINES` | 否 | `360search,sogou` | SearXNG engines | 普通 | 逗号分隔 |
 | `WEB_SEARCH_MAX_RESULTS` | 否 | `5` | provider 结果上限 | 普通 | 正整数 |
@@ -83,7 +85,7 @@ Memory 文件是单个 JSON 文档，代码使用原子临时文件写入与 ren
 | `WEB_PAGE_FETCH_MAX_CHARS_PER_PAGE` | 否 | `4000` | 单页文本预算 | 普通 | 字符 |
 | `WEB_PAGE_FETCH_MAX_TOTAL_CHARS` | 否 | `6000` | 全部网页证据预算 | 普通 | 字符 |
 
-启用 Search 时必须提供可用的 Tavily 配置，或同时启用并配置 SearXNG。搜索结果属于不可信外部内容，不能改变身份、owner、Memory 可见性或发送授权。详见 [docs/web-search.md](web-search.md)。
+启用 Search 时默认使用 Degoog，不要求 Tavily 凭据；选择 SearXNG 路线需设置 `SEARXNG_ENABLED=1` 并提供可用地址。选择 Tavily 时需提供地址和密钥，或配置 SearXNG 作为可用 fallback。`SEARCH_PROVIDER` 优先于旧配置 `WEB_SEARCH_PROVIDER`。搜索结果属于不可信外部内容，不能改变身份、owner、Memory 可见性或发送授权。详见 [docs/web-search.md](web-search.md)。
 
 ## Logging
 

@@ -65,6 +65,19 @@ export interface MemoryPromptItem {
   kind?: import('./assistant-identity.js').MemoryKind
 }
 
+export interface ChatWebSearchContext {
+  used: boolean
+  status: 'PASS' | 'FAILED'
+  results: readonly WebSearchResult[]
+  maxContextChars?: number
+  mode?: WebSearchMode
+  window?: WebSearchWindow
+}
+
+export interface AdaptiveSearchRecoveryHandler {
+  recover(draft: string, deadline?: RequestDeadline): Promise<ChatWebSearchContext | undefined>
+}
+
 /** Provider-facing active-context shape; raw sender identity is intentionally absent. */
 export type ChatPromptMessage = GroupConversationPromptMessage
 
@@ -126,14 +139,9 @@ export interface ChatRequestContext {
   /** Deterministic, transient pressure fact derived from conversation dynamics. */
   groupReplyPressure?: GroupReplyPressure
   /** One bounded external-search result set, or a failed search status. */
-  webSearch?: {
-    used: boolean
-    status: 'PASS' | 'FAILED'
-    results: readonly WebSearchResult[]
-    maxContextChars?: number
-    mode?: WebSearchMode
-    window?: WebSearchWindow
-  }
+  webSearch?: ChatWebSearchContext
+  /** One request-local recovery attempt after a direct final draft. */
+  adaptiveSearchRecovery?: AdaptiveSearchRecoveryHandler
 }
 
 /** Everything needed to render a speaker label. No raw identity may be rendered. */
@@ -1223,19 +1231,60 @@ export class ChatService {
       }
     }
 
+    let effectiveRequest = request
+    if (request.webSearch === undefined && request.adaptiveSearchRecovery !== undefined) {
+      try {
+        const recovered = await request.adaptiveSearchRecovery.recover(draft, deadline)
+        if (recovered?.status === 'PASS' && recovered.results.length > 0) {
+          const recoveryRequest = { ...request, webSearch: recovered }
+          try {
+            draft = await this.requestFinalAnswer(
+              buildSystemPrompt(recoveryRequest.botDisplayName, assistantRuntime, recoveryRequest.requesterRuntime),
+              buildUserPrompt(context, question, recoveryRequest, presentation),
+              persistentSink,
+              messageId,
+              deadline,
+              'ADAPTIVE_SEARCH_FINAL_ANSWER',
+            )
+            effectiveRequest = recoveryRequest
+          } catch (error) {
+            if (isRequestDeadlineExceeded(error)) {
+              throw error
+            }
+            emitDiagnostic(
+              (line: string) => console.log(line),
+              persistentSink,
+              'ADAPTIVE_SEARCH_RECOVERY',
+              { candidate: true, decision: 'SEARCH', result: 'FAILED', reason: 'FINAL_REGENERATION', msgIdToken },
+            )
+          }
+        }
+      } catch (error) {
+        if (isRequestDeadlineExceeded(error)) {
+          throw error
+        }
+        emitDiagnostic(
+          (line: string) => console.log(line),
+          persistentSink,
+          'ADAPTIVE_SEARCH_RECOVERY',
+          { candidate: true, decision: 'SEARCH', result: 'FAILED', reason: 'RECOVERY_EXCEPTION', msgIdToken },
+        )
+      }
+    }
+
     const guardFacts = {
-      currentSpeakerLabel: request.currentSpeakerLabel,
-      speakerLabels: internalSpeakerLabels(context, question, request),
+      currentSpeakerLabel: effectiveRequest.currentSpeakerLabel,
+      speakerLabels: internalSpeakerLabels(context, question, effectiveRequest),
       internalValues,
       selfIdentityQuery: isCurrentSelfIdentityQuery(question.text),
-      retrievedPersonalMemoryCount: (request.memory ?? []).filter((item) => item.scope === 'PERSONAL').length,
+      retrievedPersonalMemoryCount: (effectiveRequest.memory ?? []).filter((item) => item.scope === 'PERSONAL').length,
       assistantRuntime,
-      assistantIdentityQuery: isAssistantIdentityQuery(question.text, request.botDisplayName),
-      requesterAddressPreference: (request.memory ?? []).find(
+      assistantIdentityQuery: isAssistantIdentityQuery(question.text, effectiveRequest.botDisplayName),
+      requesterAddressPreference: (effectiveRequest.memory ?? []).find(
         (item) => item.scope === 'PERSONAL' && item.kind === 'ADDRESS_PREFERENCE',
       )?.content,
       publicDisplayAliases: presentation.aliases,
-      memoryMutationThisTurn: request.memoryMutationThisTurn,
+      memoryMutationThisTurn: effectiveRequest.memoryMutationThisTurn,
     }
 
     let guard = guardFinalAnswer(draft, guardFacts)
@@ -1268,8 +1317,8 @@ export class ChatService {
       } else {
         try {
           const rewritten = await this.requestFinalAnswer(
-            buildRewriteSystemPrompt(assistantRuntime, request.requesterRuntime),
-            rewriteUserPrompt(context, question, request, draft, presentation),
+            buildRewriteSystemPrompt(assistantRuntime, effectiveRequest.requesterRuntime),
+            rewriteUserPrompt(context, question, effectiveRequest, draft, presentation),
             persistentSink,
             messageId,
             deadline,
@@ -1363,12 +1412,12 @@ export class ChatService {
       throw new Error('Chat API returned an answer that carries internal runtime labels')
     }
 
-    const groupReplyPressure = resolveGroupReplyPressure(request)
-    const profileResponseDepth = request.memberInteractionProfile?.responseDepth
-    const groupRestraint = request.conversationType === 'GROUP'
+    const groupReplyPressure = resolveGroupReplyPressure(effectiveRequest)
+    const profileResponseDepth = effectiveRequest.memberInteractionProfile?.responseDepth
+    const groupRestraint = effectiveRequest.conversationType === 'GROUP'
       ? resolveGroupConversationalRestraint({
           questionText: question.text,
-          recentContextTexts: groupRestraintContextTexts(context, request),
+          recentContextTexts: groupRestraintContextTexts(context, effectiveRequest),
         })
       : undefined
     // One depth decision per GROUP turn: the current-turn restraint mode
@@ -1425,7 +1474,7 @@ export class ChatService {
       )
     }
     const applyGroupReplyBoundary = (answer: string) => {
-      const bound = request.conversationType === 'GROUP'
+      const bound = effectiveRequest.conversationType === 'GROUP'
         ? boundGroupReply(answer, {
             responseDepth,
             groupReplyPressure: groupReplyPressure ?? 'MEDIUM',
@@ -1443,7 +1492,7 @@ export class ChatService {
         'GROUP_REPLY_LENGTH',
         {
           responseDepth,
-          groupReplyPressure: request.conversationType === 'GROUP' ? groupReplyPressure ?? 'MEDIUM' : 'NONE',
+          groupReplyPressure: effectiveRequest.conversationType === 'GROUP' ? groupReplyPressure ?? 'MEDIUM' : 'NONE',
           beforeChars: bound.beforeChars,
           afterChars: bound.afterChars,
           bounded: bound.bounded,
@@ -1479,7 +1528,7 @@ export class ChatService {
     // the social hard cap after grounding, rendering and cleanup, with the
     // deterministic reply-signature footprint already reserved.
     const finalizeGroupSocialOutput = (text: string, protectedSuffix?: string): string => {
-      if (request.conversationType !== 'GROUP') return text
+      if (effectiveRequest.conversationType !== 'GROUP') return text
       // A light interaction must not go out carrying a proactive CTA tail. The
       // strip is the one deterministic restraint backstop; the social boundary
       // below stays the final hard cap.
@@ -1543,14 +1592,14 @@ export class ChatService {
       )
     }
 
-    if (request.webSearch?.status === 'FAILED') {
-      if (request.webSearch.mode === 'NEWS_RECENT') {
+    if (effectiveRequest.webSearch?.status === 'FAILED') {
+      if (effectiveRequest.webSearch.mode === 'NEWS_RECENT') {
         return finalizeGroupSocialOutput('当前没有查到足够近期信息，无法可靠确认最新情况。')
       }
       return finalizeGroupSocialOutput(discloseWebSearchFailure(rendered), WEB_SEARCH_FAILURE_DISCLOSURE)
     }
-    if (request.webSearch?.status === 'PASS' && request.webSearch.results.length > 0) {
-      const initialUsage = inspectGroundedSources(rendered, request.webSearch.results, internalValues)
+    if (effectiveRequest.webSearch?.status === 'PASS' && effectiveRequest.webSearch.results.length > 0) {
+      const initialUsage = inspectGroundedSources(rendered, effectiveRequest.webSearch.results, internalValues)
       reportGroundingGate(
         'INITIAL',
         initialUsage,
@@ -1585,15 +1634,15 @@ export class ChatService {
         deadline?.mark('GROUNDING_REPAIR')
         try {
           const repairedDraft = await this.requestFinalAnswer(
-            `${buildSystemPrompt(request.botDisplayName, assistantRuntime, request.requesterRuntime)}\n${WEB_SEARCH_GROUNDING_REPAIR_RULES}`,
+            `${buildSystemPrompt(request.botDisplayName, assistantRuntime, effectiveRequest.requesterRuntime)}\n${WEB_SEARCH_GROUNDING_REPAIR_RULES}`,
             buildWebGroundingRepairUserPrompt(
               question,
-              request.webSearch,
-              request.runtimeTime,
+              effectiveRequest.webSearch,
+              effectiveRequest.runtimeTime,
               groupReplyPressure,
               rendered,
               internalValues,
-              request.conversationType === 'GROUP' ? responseDepth : undefined,
+              effectiveRequest.conversationType === 'GROUP' ? responseDepth : undefined,
             ),
             persistentSink,
             messageId,
@@ -1608,7 +1657,7 @@ export class ChatService {
               bulkBlockedRepairFallback = candidate
             } else if (candidate.length > 0) {
               repairedRendered = candidate
-              repairedUsage = inspectGroundedSources(candidate, request.webSearch.results, internalValues)
+              repairedUsage = inspectGroundedSources(candidate, effectiveRequest.webSearch.results, internalValues)
             }
           }
         } catch (error) {
@@ -1642,7 +1691,7 @@ export class ChatService {
         return finalizeGroupSocialOutput(
           appendGroundedSources(
             repairedRendered,
-            request.webSearch.results,
+            effectiveRequest.webSearch.results,
             internalValues,
             reportSourceUsage,
           ),
@@ -1652,7 +1701,7 @@ export class ChatService {
       return finalizeGroupSocialOutput(
         appendGroundedSources(
           rendered,
-          request.webSearch.results,
+          effectiveRequest.webSearch.results,
           internalValues,
           reportSourceUsage,
         ),
@@ -1675,7 +1724,7 @@ export class ChatService {
     phase: ProviderPhase = 'STRUCTURED_PROVIDER',
   ): Promise<string> {
     const startedAt = Date.now()
-    deadline?.mark('STRUCTURED_PROVIDER')
+    deadline?.mark(phase)
     const execute = async (signal?: AbortSignal): Promise<ChatCompletionResponse> => {
       const response = await fetch(`${this.apiBase}/chat/completions`, {
         method: 'POST',
@@ -1724,7 +1773,7 @@ export class ChatService {
       }
       emitDiagnostic((line: string) => console.log(line), this.structuredSink, 'PROVIDER_CALL', {
         result: 'CLEAN',
-        phase: 'STRUCTURED_PROVIDER',
+        phase,
         latencyMs: elapsedMs,
         msgIdToken,
       })
@@ -1733,7 +1782,7 @@ export class ChatService {
       const elapsedMs = Date.now() - startedAt
       emitDiagnostic((line: string) => console.log(line), this.structuredSink, 'PROVIDER_CALL', {
         result: isRequestDeadlineExceeded(error) ? 'DEADLINE' : 'EXCEPTION',
-        phase: 'STRUCTURED_PROVIDER',
+        phase,
         latencyMs: elapsedMs,
         errorCode: isRequestDeadlineExceeded(error) ? 'REQUEST_DEADLINE' : 'CHAT_EXCEPTION',
         msgIdToken,

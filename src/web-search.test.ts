@@ -7,6 +7,7 @@ import { calculateSearchProviderFallbackBudget, MIN_ALT_QUERY_SEARCH_BUDGET_MS, 
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { mapAgentResponse, type AgentRequest } from './agent-adapter.js'
 import { extractFinalAnswer, ProviderControlMarkupError } from './final-answer.js'
+import type { RetrievalQualityGateLike } from './retrieval-quality.js'
 import { type RuntimeTimeFacts } from './runtime-time.js'
 import { RequestDeadline, RequestDeadlineExceededError } from './request-deadline.js'
 
@@ -167,6 +168,26 @@ function scriptedFinalChatResponses(responses: readonly (string | Error)[]): { c
   }
 }
 
+function answerableRetrievalQualityGate(onDecide?: () => void): RetrievalQualityGateLike {
+  return {
+    decide: async () => {
+      onDecide?.()
+      return {
+        result: 'PASS' as const,
+        decision: {
+          decision: 'ANSWERABLE' as const,
+          reason: 'TEST_FIXTURE_ANSWERABLE',
+          missingEvidence: '',
+          retryQuery: null,
+          retryAlternateQuery: null,
+          mode: 'GENERAL' as const,
+          window: 'GENERAL' as const,
+        },
+      }
+    },
+  }
+}
+
 function plannerFrom(raw: string): WebSearchPlannerLike {
   return new WebSearchPlanner(async () => raw)
 }
@@ -310,6 +331,11 @@ async function main(): Promise<void> {
     const rawUrl = appendGroundedSources('结论[S1] https://evil.example/fabricated', results)
     check(!rawUrl.includes('https://evil.example/fabricated'), 'model-created URL survived grounding')
     check(!/\[S\d+\]/u.test(rawUrl), 'valid source marker remained in answer body')
+
+    const exactSourceUrl = appendGroundedSources('来源 https://example.com/one[S1]', results)
+    check(exactSourceUrl.includes('https://example.com/one'), 'exact trusted result URL was removed beside its citation marker')
+    const sameHostDifferentPath = appendGroundedSources('来源 https://example.com[S1]', results)
+    check(!sameHostDifferentPath.includes('https://example.com'), 'same-host URL absent from the trusted result URL survived grounding')
 
     const spacing = appendGroundedSources('结论 。  [S1]  另外还有一个变化。[]', results)
     check(spacing.startsWith('结论。另外还有一个变化。'), 'citation cleanup left unnatural spacing or brackets')
@@ -616,6 +642,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
       runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
       runtimeTimeZone: 'Asia/Shanghai',
     })
@@ -633,6 +660,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
       runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
       runtimeTimeZone: 'Asia/Shanghai',
     })
@@ -730,6 +758,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: planner,
       webSearchProvider: provider.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
       runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
       runtimeTimeZone: 'Asia/Shanghai',
     })
@@ -758,6 +787,7 @@ async function main(): Promise<void> {
     const generalAgent = new ProductionChatAgent(generalFinal.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=Java 21 release\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: generalProvider.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
       runtimeClock: { now: () => new Date('2026-09-11T07:40:00.000Z') },
       runtimeTimeZone: 'Asia/Shanghai',
     })
@@ -940,6 +970,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=上海公共信息\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
       webSearchMaxContextChars: 500,
     })
     const answer = await agent.complete(request())
@@ -962,6 +993,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news\nSEARCH_MODE=NEWS_RECENT\nRECENCY_WINDOW=DAY_1'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
     })
     const answer = await agent.complete(request({
       text: '@椰椰 OpenAI 今天有什么新闻？',
@@ -1002,6 +1034,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI recent news\nSEARCH_MODE=NEWS_RECENT\nRECENCY_WINDOW=DAY_3'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
     })
     try {
       await agent.complete(request({
@@ -1039,6 +1072,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=FRESH_INFORMATION\nQUERY=OpenAI latest news\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
     })
     const ask = (text: string): AgentRequest => request({
       text,
@@ -1074,6 +1108,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
     })
     try {
       const answer = await agent.complete(request())
@@ -1248,6 +1283,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
     })
     try {
       const answer = await agent.complete(request())
@@ -1264,6 +1300,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: fake.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
     })
     try {
       const answer = await agent.complete(request())
@@ -1281,6 +1318,7 @@ async function main(): Promise<void> {
       const agent = new ProductionChatAgent(final.chat, {
         webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXPLICIT_SEARCH_REQUEST\nQUERY=一次查询\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
         webSearchProvider: fake.provider,
+        retrievalQualityGate: answerableRetrievalQualityGate(),
       })
       try {
         const answer = await agent.complete(request())
@@ -1614,6 +1652,7 @@ async function main(): Promise<void> {
     const agent = new ProductionChatAgent(final.chat, {
       webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=目标\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
       webSearchProvider: provider.provider,
+      retrievalQualityGate: answerableRetrievalQualityGate(),
       webPageFetchEnabled: true,
       webPageFetchMaxResults: 2,
       webPageFetchImplementation: async (input) => {
@@ -2312,6 +2351,7 @@ async function main(): Promise<void> {
       const agent = new ProductionChatAgent(final.chat, {
         webSearchPlanner: plannerFrom('ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'),
         webSearchProvider: provider.provider,
+        retrievalQualityGate: answerableRetrievalQualityGate(),
       })
       await agent.complete(request())
       const context = final.calls[0]?.user ?? ''
@@ -2373,8 +2413,9 @@ async function main(): Promise<void> {
     }
   })
 
-  await test('P2.6 Planner and Final Chat remain the only LLM calls', async () => {
+  await test('P2.6 Planner, Retrieval Quality Gate, and Final Chat calls remain bounded', async () => {
     let plannerCalls = 0
+    let retrievalQualityGateCalls = 0
     const final = fakeFinalChat('one final answer[S1]')
     const provider = scriptedSearchProvider([[result('S1', 'source one')], [result('S2', 'source two')]])
     const planner = new WebSearchPlanner(async () => {
@@ -2382,9 +2423,14 @@ async function main(): Promise<void> {
       return 'ACTION=SEARCH\nREASON=EXTERNAL_VERIFICATION\nQUERY=primary facts\nALT_QUERY=alternate facts\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'
     })
     try {
-      const agent = new ProductionChatAgent(final.chat, { webSearchPlanner: planner, webSearchProvider: provider.provider })
+      const agent = new ProductionChatAgent(final.chat, {
+        webSearchPlanner: planner,
+        webSearchProvider: provider.provider,
+        retrievalQualityGate: answerableRetrievalQualityGate(() => { retrievalQualityGateCalls += 1 }),
+      })
       await agent.complete(request())
-      check(plannerCalls === 1 && final.calls.length === 1, 'multi-query search added an LLM call')
+      check(plannerCalls === 1 && retrievalQualityGateCalls === 1 && final.calls.length === 1, 'search stages were not bounded')
+      check(provider.requests.length === 2, 'multi-query search changed its two-query bound')
     } finally {
       final.restore()
     }

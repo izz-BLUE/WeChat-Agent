@@ -4,8 +4,22 @@ import {
   REQUEST_DEADLINE_FALLBACK_REPLY,
   type ChatMentionFact,
   type ChatPromptMessage,
+  type ChatWebSearchContext,
   type MemoryPromptItem,
 } from './chat.js'
+import {
+  AdaptiveSearchRecoveryGate,
+  isAdaptiveSearchCandidate,
+} from './adaptive-search.js'
+import {
+  assessRetrievalQuality,
+  RetrievalQualityGate,
+  type RetrievalQualityGateInput,
+  type RetrievalQualityGateLike,
+  type RetrievalQualityGateDecision,
+  type RetrievalQualityDecision,
+  type RetrievalQualitySignals,
+} from './retrieval-quality.js'
 import { sanitizeFinalAnswer } from './final-answer.js'
 import { decorateYeyeReplySignatureWithDiagnostics } from './chat-renderer.js'
 import {
@@ -51,7 +65,6 @@ import {
   enrichWebSearchResultsWithPageEvidence,
   normalizeWebSearchResults,
   rankWebSearchResults,
-  SearXNGWebSearchProvider,
   TavilyWebSearchProvider,
   WebSearchError,
   type WebSearchMode,
@@ -64,9 +77,17 @@ import {
   type WebPageFetchImplementation,
 } from './web-search.js'
 import {
+  adaptSearchProvider,
+  SearchProviderError,
+  type SearchProvider,
+} from './search-provider.js'
+import { DegoogSearchProvider } from './providers/degoog-provider.js'
+import { SearXNGSearchProvider } from './providers/searxng-provider.js'
+import {
   formatWebSearchDecisionProtocol,
   WebSearchPlanner,
   parseWebSearchDecisionProtocol,
+  type WebSearchDecision,
   type WebSearchRecencyWindow,
   type WebSearchPlannerLike,
 } from './web-search-planner.js'
@@ -164,6 +185,9 @@ function toOwnerAliasPresentationRequest(context: OwnerAliasWakeContext): AgentR
 export const MIN_SEARCH_FALLBACK_BUDGET_MS = 3_000
 export const MIN_ALT_QUERY_SEARCH_BUDGET_MS = 3_000
 export const MIN_PAGE_FETCH_BUDGET_MS = 2_500
+export const MIN_ADAPTIVE_SEARCH_RECOVERY_BUDGET_MS = MIN_FINAL_ANSWER_BUDGET_MS * 3
+export const MIN_RETRIEVAL_QUALITY_GATE_BUDGET_MS = 2_500
+export const MIN_RETRIEVAL_RETRY_BUDGET_MS = 3_000
 
 export interface SearchProviderFallbackBudget {
   remainingMs: number
@@ -340,8 +364,14 @@ export interface ProductionChatAgentOptions {
   persistentLog?: PersistentRuntimeLog
   /** Optional autonomous web-search seam. Absent means zero planner/provider calls. */
   webSearchPlanner?: WebSearchPlannerLike | null
+  /** Optional structured retrieval-quality seam; production uses the ChatService boundary. */
+  retrievalQualityGate?: RetrievalQualityGateLike | null
   /** Backwards-compatible single-provider seam used by existing tests/callers. */
   webSearchProvider?: WebSearchProvider | null
+  /** New provider-neutral seam used by production configuration. */
+  searchProvider?: SearchProvider | null
+  /** Optional provider-neutral fallback, normally SearXNG for Degoog. */
+  searchFallbackProvider?: SearchProvider | null
   tavilyWebSearchProvider?: WebSearchProvider | null
   searxngWebSearchProvider?: WebSearchProvider | null
   webSearchMaxResults?: number
@@ -378,6 +408,11 @@ interface RequestDeadlineDiagnostics {
   preFinalRemainingMs?: number
 }
 
+interface WebSearchResolution {
+  context?: ChatWebSearchContext
+  plannerAction: 'DIRECT' | 'SEARCH' | 'UNAVAILABLE'
+}
+
 export class ProductionChatAgent implements AgentExecutor {
   private readonly context: GroupContext
   private readonly ambient: GroupAmbientContext
@@ -389,6 +424,10 @@ export class ProductionChatAgent implements AgentExecutor {
   private readonly memory: MemoryService | null
   private readonly persistentLog: PersistentRuntimeLog | null
   private readonly webSearchPlanner: WebSearchPlannerLike | null
+  private readonly adaptiveSearchGate: AdaptiveSearchRecoveryGate
+  private readonly retrievalQualityGate: RetrievalQualityGateLike
+  private readonly configuredSearchProvider: (WebSearchProvider & { readonly providerName: string }) | null
+  private readonly configuredSearchFallbackProvider: (WebSearchProvider & { readonly providerName: string }) | null
   private readonly tavilyWebSearchProvider: WebSearchProvider | null
   private readonly searxngWebSearchProvider: WebSearchProvider | null
   private readonly webSearchMaxResults: number
@@ -420,7 +459,31 @@ export class ProductionChatAgent implements AgentExecutor {
     this.memory = options.memory ?? null
     this.persistentLog = options.persistentLog ?? null
     this.webSearchPlanner = options.webSearchPlanner ?? null
+    this.adaptiveSearchGate = new AdaptiveSearchRecoveryGate(
+      (systemPrompt, userContent, deadline, msgIdToken, phase) => this.chatService.completeStructured(
+        systemPrompt,
+        userContent,
+        deadline,
+        msgIdToken,
+        phase,
+      ),
+    )
+    this.retrievalQualityGate = options.retrievalQualityGate ?? new RetrievalQualityGate(
+      (systemPrompt, userContent, deadline, msgIdToken, phase) => this.chatService.completeStructured(
+        systemPrompt,
+        userContent,
+        deadline,
+        msgIdToken,
+        phase,
+      ),
+    )
     const legacyWebSearchProvider = options.webSearchProvider ?? null
+    this.configuredSearchProvider = options.searchProvider === undefined || options.searchProvider === null
+      ? null
+      : adaptSearchProvider(options.searchProvider)
+    this.configuredSearchFallbackProvider = options.searchFallbackProvider === undefined || options.searchFallbackProvider === null
+      ? null
+      : adaptSearchProvider(options.searchFallbackProvider)
     this.tavilyWebSearchProvider = options.tavilyWebSearchProvider ?? legacyWebSearchProvider
     this.searxngWebSearchProvider = options.searxngWebSearchProvider ?? legacyWebSearchProvider
     this.webSearchMaxResults = options.webSearchMaxResults ?? config.webSearchMaxResults
@@ -1033,19 +1096,20 @@ export class ProductionChatAgent implements AgentExecutor {
         })
       : undefined
 
-    const webSearch = aliasWake
-      ? undefined
+    const searchActiveContext = mixedGroupContext === undefined
+      ? activeContext
+      : {
+          currentRequester: [...mixedGroupContext.requesterLocalContext],
+          otherMembers: [],
+        }
+    const webSearchResolution = aliasWake
+      ? { plannerAction: 'UNAVAILABLE' as const }
       : await this.resolveWebSearch(
           question.text,
           window.messages,
           ambient,
           memory,
-          mixedGroupContext === undefined
-            ? activeContext
-            : {
-                currentRequester: [...mixedGroupContext.requesterLocalContext],
-                otherMembers: [],
-              },
+          searchActiveContext,
           conversationDynamics,
           request,
           runtimeTime,
@@ -1053,6 +1117,25 @@ export class ProductionChatAgent implements AgentExecutor {
           msgIdToken,
           mixedGroupContext,
         )
+    const webSearch = webSearchResolution.context
+    const adaptiveSearchRecovery = webSearchResolution.plannerAction === 'DIRECT'
+      ? {
+          recover: (draft: string, recoveryDeadline?: RequestDeadline) => this.recoverAdaptiveSearch(
+            question.text,
+            draft,
+            memory,
+            request,
+            runtimeTime,
+            recoveryDeadline ?? deadline,
+            msgIdToken,
+            window.messages,
+            ambient,
+            mixedGroupContext,
+            conversationDynamics,
+            searchActiveContext,
+          ),
+        }
+      : undefined
 
     deadlineDiagnostics.preFinalRemainingMs = deadline.remainingMs()
     const answer = await this.chatService.reply(
@@ -1101,6 +1184,7 @@ export class ProductionChatAgent implements AgentExecutor {
           : undefined,
         groupConversationContext: mixedGroupContext,
         webSearch,
+        adaptiveSearchRecovery,
       },
       guardValues(request),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-chat') : undefined,
@@ -1315,6 +1399,120 @@ export class ProductionChatAgent implements AgentExecutor {
     )
   }
 
+  private async recoverAdaptiveSearch(
+    question: string,
+    draft: string,
+    authorizedMemory: readonly MemoryPromptItem[],
+    request: AgentRequest,
+    runtimeTime: RuntimeTimeFacts,
+    deadline: RequestDeadline,
+    msgIdToken: string,
+    recentContext: readonly GroupMessage[],
+    ambient: readonly AmbientLine[],
+    mixedGroupContext: GroupConversationContext | undefined,
+    conversationDynamics: ReturnType<typeof observeConversationDynamics> | undefined,
+    activeContext: ActiveContextSplit,
+  ): Promise<ChatWebSearchContext | undefined> {
+    const candidate = isAdaptiveSearchCandidate(draft)
+    const logRecovery = (fields: Record<string, string | number | boolean | null | undefined>): void => {
+      emitDiagnostic(
+        (line: string) => console.log(line),
+        this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+        'ADAPTIVE_SEARCH_RECOVERY',
+        {
+          candidate,
+          plannerOriginally: 'DIRECT',
+          searchAlreadyUsed: false,
+          attempt: 0,
+          remainingMs: Math.max(0, deadline.remainingMs()),
+          msgIdToken,
+          ...fields,
+        },
+      )
+    }
+
+    if (!candidate) {
+      logRecovery({ decision: 'SKIPPED', reason: 'NO_KNOWLEDGE_GAP', searchMode: 'NONE' })
+      return undefined
+    }
+    if (deadline.remainingMs() < MIN_ADAPTIVE_SEARCH_RECOVERY_BUDGET_MS) {
+      logRecovery({ decision: 'SKIPPED', reason: 'INSUFFICIENT_DEADLINE_BUDGET', searchMode: 'NONE' })
+      return undefined
+    }
+
+    const forbiddenValues = guardValues(request)
+    const redact = (value: string): string => {
+      let safe = value
+      for (const forbidden of forbiddenValues.filter((item) => item.length > 0).sort((left, right) => right.length - left.length)) {
+        safe = safe.split(forbidden).join('[REDACTED_INTERNAL_VALUE]')
+      }
+      return safe
+    }
+    const gate = await this.adaptiveSearchGate.decide(
+      {
+        question: redact(question),
+        draft: redact(draft),
+        authorizedMemory: authorizedMemory.map((item) => ({ ...item, content: redact(item.content) })),
+      },
+      forbiddenValues,
+      deadline,
+      msgIdToken,
+    )
+    if (gate.result !== 'PASS') {
+      logRecovery({ decision: 'KEEP_DIRECT', reason: `GATE_${gate.failureReason ?? 'FAIL_CLOSED'}`, searchMode: 'NONE' })
+      return undefined
+    }
+    if (gate.decision.action !== 'SEARCH_RECOVERY' || gate.decision.query === null) {
+      logRecovery({ decision: 'KEEP_DIRECT', reason: gate.decision.reasonCode, searchMode: 'NONE' })
+      return undefined
+    }
+
+    logRecovery({
+      decision: 'SEARCH',
+      reason: gate.decision.reasonCode,
+      searchMode: gate.decision.mode,
+      queryChars: gate.decision.query.length,
+    })
+    const decision: WebSearchDecision = {
+      action: 'SEARCH',
+      reasonCode: 'KNOWLEDGE_UNCERTAIN',
+      query: gate.decision.query,
+      alternateQuery: null,
+      mode: gate.decision.mode,
+      recencyWindow: gate.decision.recencyWindow,
+    }
+    const result = await this.resolveWebSearch(
+      question,
+      recentContext,
+      ambient,
+      authorizedMemory,
+      activeContext,
+      conversationDynamics,
+      request,
+      runtimeTime,
+      deadline,
+      msgIdToken,
+      mixedGroupContext,
+      decision,
+    )
+    const passed = result.context?.status === 'PASS' && result.context.results.length > 0
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'ADAPTIVE_SEARCH_RECOVERY',
+      {
+        candidate: true,
+        plannerOriginally: 'DIRECT',
+        searchAlreadyUsed: false,
+        attempt: 1,
+        result: passed ? 'PASS' : 'FAILED',
+        providerResultCount: result.context?.results.length ?? 0,
+        msgIdToken,
+      },
+    )
+    return passed ? result.context : undefined
+  }
+
   private async resolveWebSearch(
     question: string,
     recentContext: readonly GroupMessage[],
@@ -1327,51 +1525,54 @@ export class ProductionChatAgent implements AgentExecutor {
     deadline: RequestDeadline,
     msgIdToken: string,
     mixedGroupContext?: GroupConversationContext,
-  ): Promise<{
-    used: boolean
-    status: 'PASS' | 'FAILED'
-    results: readonly WebSearchResult[]
-    maxContextChars: number
-    mode: WebSearchMode
-    window: WebSearchWindow
-  } | undefined> {
-    if (this.webSearchPlanner === null) {
-      return undefined
+    forcedDecision?: WebSearchDecision,
+  ): Promise<WebSearchResolution> {
+    if (this.webSearchPlanner === null && forcedDecision === undefined) {
+      return { plannerAction: 'UNAVAILABLE' }
     }
 
-    deadline.mark('WEB_SEARCH_PLANNER')
-    const planner = await this.webSearchPlanner.plan(
-      {
-        question,
-        recentContext,
-        ambient,
-        authorizedMemory,
-        runtimeTime,
-        currentRequesterActiveContext: request.conversationType === 'GROUP'
-          ? activeContext.currentRequester
-          : undefined,
-        otherMemberActiveContext: request.conversationType === 'GROUP'
-          ? activeContext.otherMembers
-          : undefined,
-        groupConversationContext: mixedGroupContext,
-        conversationDynamics,
-      },
-      guardValues(request),
-      deadline,
-      msgIdToken,
-    )
-    deadline.throwIfExpired()
-    const revalidated = parseWebSearchDecisionProtocol(
-      formatWebSearchDecisionProtocol(planner.decision),
-      guardValues(request),
-    )
-    const decision = planner.result === 'PASS' && revalidated.valid
-      ? revalidated.decision
-      : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const, mode: 'GENERAL' as const, recencyWindow: 'NONE' as const }
-    const decisionResult = planner.result === 'PASS' && revalidated.valid ? 'PASS' : 'FAIL'
-    const failureReason = planner.result === 'PASS' && !revalidated.valid
-      ? revalidated.failureReason
-      : planner.failureReason ?? 'NONE'
+    let decision: WebSearchDecision
+    let decisionResult: 'PASS' | 'FAIL' = 'PASS'
+    let failureReason: string = 'NONE'
+    let plannerAttempts = 0
+    if (forcedDecision !== undefined) {
+      decision = forcedDecision
+    } else {
+      deadline.mark('WEB_SEARCH_PLANNER')
+      const planner = await this.webSearchPlanner!.plan(
+        {
+          question,
+          recentContext,
+          ambient,
+          authorizedMemory,
+          runtimeTime,
+          currentRequesterActiveContext: request.conversationType === 'GROUP'
+            ? activeContext.currentRequester
+            : undefined,
+          otherMemberActiveContext: request.conversationType === 'GROUP'
+            ? activeContext.otherMembers
+            : undefined,
+          groupConversationContext: mixedGroupContext,
+          conversationDynamics,
+        },
+        guardValues(request),
+        deadline,
+        msgIdToken,
+      )
+      deadline.throwIfExpired()
+      const revalidated = parseWebSearchDecisionProtocol(
+        formatWebSearchDecisionProtocol(planner.decision),
+        guardValues(request),
+      )
+      decision = planner.result === 'PASS' && revalidated.valid
+        ? revalidated.decision
+        : { action: 'DIRECT' as const, query: null, reasonCode: 'DIRECT_SUFFICIENT' as const, mode: 'GENERAL' as const, recencyWindow: 'NONE' as const }
+      decisionResult = planner.result === 'PASS' && revalidated.valid ? 'PASS' : 'FAIL'
+      failureReason = planner.result === 'PASS' && !revalidated.valid
+        ? revalidated.failureReason
+        : planner.failureReason ?? 'NONE'
+      plannerAttempts = planner.attempts ?? 1
+    }
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
@@ -1381,14 +1582,16 @@ export class ProductionChatAgent implements AgentExecutor {
         result: decisionResult,
         reasonCode: decision.reasonCode,
         queryChars: decision.query?.length ?? 0,
-        plannerAttempts: planner.attempts ?? 1,
+        plannerAttempts,
         failureReason,
         msgIdToken,
       },
     )
 
     if (decision.action !== 'SEARCH' || decision.query === null) {
-      return undefined
+      return {
+        plannerAction: forcedDecision === undefined && decisionResult === 'PASS' ? 'DIRECT' : 'UNAVAILABLE',
+      }
     }
 
     const mode = decision.mode
@@ -1404,9 +1607,11 @@ export class ProductionChatAgent implements AgentExecutor {
     // the alternate query. The two logical queries must keep identical mode,
     // recency, and provider-routing semantics.
     const preferSearXng = mode === 'GENERAL' && /\p{Script=Han}/u.test(decision.query)
-    const providerCandidates = preferSearXng
-      ? [this.searxngWebSearchProvider, this.tavilyWebSearchProvider]
-      : [this.tavilyWebSearchProvider, this.searxngWebSearchProvider]
+    const providerCandidates = this.configuredSearchProvider !== null
+      ? [this.configuredSearchProvider, this.configuredSearchFallbackProvider]
+      : preferSearXng
+        ? [this.searxngWebSearchProvider, this.tavilyWebSearchProvider]
+        : [this.tavilyWebSearchProvider, this.searxngWebSearchProvider]
     const providers: WebSearchProvider[] = []
     for (const candidate of providerCandidates) {
       if (candidate !== null && !providers.includes(candidate)) {
@@ -1437,7 +1642,7 @@ export class ProductionChatAgent implements AgentExecutor {
       this.logWebSearchExecution(mode, primaryWindow, 1, 'FAILED', 0, msgIdToken)
       this.logWebSearch('FAIL', 0, 'DISABLED', msgIdToken)
       this.logWebSearchContext(0, 0, false, msgIdToken)
-      return failed(primaryWindow)
+      return { context: failed(primaryWindow), plannerAction: 'SEARCH' as const }
     }
 
     // Preserve the existing primary-search behavior. Only the optional
@@ -1513,7 +1718,7 @@ export class ProductionChatAgent implements AgentExecutor {
         dedupedResultCount: 0,
         result: skippedQueryCount > 0 ? 'SKIPPED' : 'PARTIAL',
       }, msgIdToken)
-      return failed(alternate.window ?? primary.window)
+      return { context: failed(alternate.window ?? primary.window), plannerAction: 'SEARCH' as const }
     }
 
     // Each provider response is normalized before this merge. Normalize once
@@ -1540,25 +1745,228 @@ export class ProductionChatAgent implements AgentExecutor {
       dedupedResultCount: ranked.report.dedupedCount,
       result: multiQueryResult,
     }, msgIdToken)
-    const enriched = await this.enrichPageEvidence(ranked.results, deadline, msgIdToken)
-    const bounded = buildWebSearchContext(enriched, this.webSearchMaxContextChars)
+    const enrichedRoundOne = await this.enrichPageEvidence(ranked.results, deadline, msgIdToken)
+    const quality = await this.evaluateRetrievalQuality(
+      question,
+      decision.query,
+      alternateQuery,
+      mode,
+      primary.window,
+      enrichedRoundOne,
+      ranked.report.datedResultCount,
+      deadline,
+      msgIdToken,
+      guardValues(request),
+    )
+    let finalRanked = ranked
+    let finalResults = enrichedRoundOne
+    let finalMode = mode
+    let finalWindow = primary.window
+    if (quality.decision === 'RETRY' && quality.gateDecision?.retryQuery !== null && quality.gateDecision?.retryQuery !== undefined) {
+      const retry = await this.executeRetrievalRetry(
+        quality.gateDecision,
+        primaryWindow,
+        providers,
+        runtimeTime,
+        deadline,
+        msgIdToken,
+      )
+      const mergedRoundTwo = [...enrichedRoundOne, ...retry.results]
+      const normalizedRoundTwo = normalizeWebSearchResults(mergedRoundTwo, { preserveInternalEvidence: true })
+      finalRanked = rankWebSearchResults(normalizedRoundTwo, {
+        query: decision.query,
+        alternateQuery,
+        additionalQueries: [quality.gateDecision.retryQuery, quality.gateDecision.retryAlternateQuery].filter((query): query is string => query !== null),
+        mode: quality.gateDecision.mode,
+        window: retry.window,
+        runtimeLocalDate: runtimeTime.localDate,
+        runtimeUtcIso: runtimeTime.utcIso,
+        runtimeTimeZone: runtimeTime.timeZone,
+      })
+      finalMode = quality.gateDecision.mode
+      finalWindow = retry.window
+      finalResults = await this.enrichPageEvidence(finalRanked.results, deadline, msgIdToken)
+      this.logRetrievalRetry({
+        round: 2,
+        reason: quality.gateDecision.reason,
+        queryChars: quality.gateDecision.retryQuery.length,
+        alternateQueryChars: quality.gateDecision.retryAlternateQuery?.length ?? 0,
+        result: retry.status,
+        resultCount: retry.results.length,
+        mergedResultCount: mergedRoundTwo.length,
+        dedupedResultCount: finalRanked.report.dedupedCount,
+        remainingMs: Math.max(0, deadline.remainingMs()),
+      }, msgIdToken)
+    }
+    const bounded = buildWebSearchContext(finalResults, this.webSearchMaxContextChars)
     this.logWebSearchQuality({
-      ...ranked.report,
+      ...finalRanked.report,
       selectedCount: bounded.results.length,
     }, msgIdToken)
     this.logWebSearch('PASS', bounded.results.length, 'NONE', msgIdToken)
     this.logWebSearchContext(bounded.results.length, bounded.chars, bounded.truncated, msgIdToken)
     if (bounded.results.length === 0) {
-      return failed(primary.window)
+      return { context: failed(primary.window), plannerAction: 'SEARCH' as const }
     }
     return {
-      used: true,
-      status: 'PASS',
-      results: bounded.results,
-      maxContextChars: this.webSearchMaxContextChars,
+      context: {
+        used: true,
+        status: 'PASS',
+        results: bounded.results,
+        maxContextChars: this.webSearchMaxContextChars,
+        mode: finalMode,
+        window: finalWindow,
+      },
+      plannerAction: 'SEARCH',
+    }
+  }
+
+  private async evaluateRetrievalQuality(
+    question: string,
+    primaryQuery: string,
+    alternateQuery: string | null,
+    mode: WebSearchMode,
+    window: WebSearchWindow,
+    results: readonly WebSearchResult[],
+    datedResultCount: number,
+    deadline: RequestDeadline,
+    msgIdToken: string,
+    forbiddenValues: readonly string[],
+  ): Promise<{
+    decision: RetrievalQualityDecision | 'SKIPPED'
+    gateDecision?: RetrievalQualityGateDecision
+    signals: RetrievalQualitySignals
+  }> {
+    const signals = assessRetrievalQuality(question, results, { mode, window, datedResultCount })
+    const logQuality = (decision: RetrievalQualityDecision | 'SKIPPED', reason: string): void => {
+      this.logRetrievalQuality({
+        round: 1,
+        decision,
+        reason,
+        resultCount: signals.resultCount,
+        fetchedCount: signals.fetchedCount,
+        uniqueHostCount: signals.uniqueHostCount,
+        authorityHighCount: signals.authorityHighCount,
+        authorityLowCount: signals.authorityLowCount,
+        missingEvidencePresent: signals.missingEvidencePresent,
+        cheapEligible: signals.cheapEligible,
+        cheapBlocker: signals.cheapBlocker,
+        remainingMs: Math.max(0, deadline.remainingMs()),
+      }, msgIdToken)
+    }
+
+    if (!signals.shouldRunGate) {
+      logQuality('ANSWERABLE', 'CHEAP_SUFFICIENT')
+      return { decision: 'ANSWERABLE', signals }
+    }
+
+    const availableGateBudgetMs = Math.max(0, deadline.remainingMs() - MIN_FINAL_ANSWER_BUDGET_MS)
+    if (availableGateBudgetMs < MIN_RETRIEVAL_QUALITY_GATE_BUDGET_MS) {
+      logQuality('SKIPPED', 'INSUFFICIENT_DEADLINE_BUDGET')
+      return { decision: 'SKIPPED', signals }
+    }
+
+    const gateInput: RetrievalQualityGateInput = {
+      question: this.redactRetrievalQualityValue(question, forbiddenValues),
+      round: 1,
       mode,
+      primaryQuery: this.redactRetrievalQualityValue(primaryQuery, forbiddenValues),
+      alternateQuery: alternateQuery === null ? null : this.redactRetrievalQualityValue(alternateQuery, forbiddenValues),
+      results: results.slice(0, 8).map((result) => ({
+        title: result.title,
+        hostname: this.webSearchHostname(result.url),
+        snippet: result.snippet,
+        publishedAt: result.publishedAt,
+        pageFetchStatus: result.pageFetchStatus,
+        pageEvidence: result.pageText,
+      })),
+    }
+    deadline.mark('RETRIEVAL_QUALITY_GATE')
+    const stageDeadline = new RequestDeadline(Math.max(1, availableGateBudgetMs))
+    const gate = await this.retrievalQualityGate.decide(gateInput, forbiddenValues, stageDeadline, msgIdToken)
+    const decision = gate.result === 'PASS' ? gate.decision.decision : 'STOP'
+    const reason = gate.result === 'PASS' ? gate.decision.reason : `GATE_${gate.failureReason ?? 'FAIL_CLOSED'}`
+    logQuality(decision, reason)
+    return {
+      decision,
+      ...(gate.result === 'PASS' ? { gateDecision: gate.decision } : {}),
+      signals,
+    }
+  }
+
+  private async executeRetrievalRetry(
+    gateDecision: RetrievalQualityGateDecision,
+    originalWindow: WebSearchWindow,
+    providers: readonly WebSearchProvider[],
+    runtimeTime: RuntimeTimeFacts,
+    deadline: RequestDeadline,
+    msgIdToken: string,
+  ): Promise<{ status: 'PASS' | 'FAILED'; results: WebSearchResult[]; window: WebSearchWindow }> {
+    const mode = gateDecision.mode
+    const primaryWindow: WebSearchWindow = gateDecision.window === 'DAY_1'
+      ? 'DAY_1'
+      : gateDecision.window === 'DAY_3'
+        ? 'DAY_3'
+        : originalWindow
+    const windows = primaryWindow === 'DAY_1' ? ['DAY_1', 'DAY_3'] as const : [primaryWindow] as const
+    const availableRetryBudgetMs = Math.max(0, deadline.remainingMs() - MIN_FINAL_ANSWER_BUDGET_MS)
+    if (availableRetryBudgetMs < MIN_RETRIEVAL_RETRY_BUDGET_MS) {
+      return { status: 'FAILED', results: [], window: primaryWindow }
+    }
+    const retryStageDeadlineAt = deadline.deadlineAt - MIN_FINAL_ANSWER_BUDGET_MS
+    const primary = await this.executeWebSearchQuery(
+      gateDecision.retryQuery!,
+      'PRIMARY',
+      mode,
+      primaryWindow,
+      windows,
+      providers,
+      runtimeTime,
+      deadline,
+      retryStageDeadlineAt,
+      msgIdToken,
+      2,
+    )
+    let alternate: { status: 'PASS' | 'FAILED' | 'SKIPPED'; results: WebSearchResult[]; window: WebSearchWindow } = {
+      status: 'SKIPPED',
+      results: [],
       window: primary.window,
     }
+    if (gateDecision.retryAlternateQuery !== null) {
+      const availableAlternateBudgetMs = Math.max(0, deadline.remainingMs() - MIN_FINAL_ANSWER_BUDGET_MS)
+      if (availableAlternateBudgetMs >= MIN_ALT_QUERY_SEARCH_BUDGET_MS) {
+        alternate = await this.executeWebSearchQuery(
+          gateDecision.retryAlternateQuery,
+          'ALTERNATE',
+          mode,
+          primaryWindow,
+          windows,
+          providers,
+          runtimeTime,
+          deadline,
+          retryStageDeadlineAt,
+          msgIdToken,
+          2,
+        )
+      }
+    }
+    const results = [...primary.results, ...alternate.results]
+    return { status: results.length > 0 ? 'PASS' : 'FAILED', results, window: alternate.window ?? primary.window }
+  }
+
+  private webSearchHostname(url: string): string {
+    try {
+      return new URL(url).hostname.toLocaleLowerCase()
+    } catch {
+      return ''
+    }
+  }
+
+  private redactRetrievalQualityValue(value: string, forbiddenValues: readonly string[]): string {
+    return forbiddenValues
+      .filter((forbidden) => forbidden.length > 0)
+      .sort((left, right) => right.length - left.length)
+      .reduce((current, forbidden) => current.split(forbidden).join('[REDACTED_INTERNAL_VALUE]'), value)
   }
 
   private async executeWebSearchQuery(
@@ -1572,6 +1980,7 @@ export class ProductionChatAgent implements AgentExecutor {
     deadline: RequestDeadline,
     searchStageDeadlineAt: number,
     msgIdToken: string,
+    retrievalRound: 1 | 2 = 1,
   ): Promise<{ status: 'PASS' | 'FAILED'; results: WebSearchResult[]; window: WebSearchWindow }> {
     let attempt = 0
     let fallbackTimeoutMs: number | null = null
@@ -1587,6 +1996,7 @@ export class ProductionChatAgent implements AgentExecutor {
         if (availableSearchBudgetMs < 1) {
           return { status: 'FAILED', results: [], window }
         }
+        const providerStartedAt = Date.now()
         try {
           const days = window === 'DAY_1' ? 1 : window === 'DAY_3' ? 3 : undefined
           deadline.mark('WEB_SEARCH')
@@ -1608,8 +2018,10 @@ export class ProductionChatAgent implements AgentExecutor {
           const normalized = normalizeWebSearchResults(response.results).map((item) => ({
             ...item,
             queryOrigin,
+            retrievalRound,
           }))
           if (normalized.length === 0) {
+            this.logSearchProvider(provider, 0, Date.now() - providerStartedAt, 'FAIL', 'NO_RESULTS', msgIdToken)
             this.logWebSearchExecution(mode, window, attempt, 'NO_RESULTS', 0, msgIdToken)
             this.logWebSearch('FAIL', 0, 'NO_RESULTS', msgIdToken)
             this.logWebSearchContext(0, 0, false, msgIdToken)
@@ -1626,13 +2038,24 @@ export class ProductionChatAgent implements AgentExecutor {
             return { status: 'FAILED', results: [], window }
           }
 
+          this.logSearchProvider(provider, normalized.length, Date.now() - providerStartedAt, 'PASS', undefined, msgIdToken)
           this.logWebSearchExecution(mode, window, attempt, 'PASS', normalized.length, msgIdToken)
           return { status: 'PASS', results: normalized, window }
         } catch (error) {
-          if (isRequestDeadlineExceeded(error)) throw error
           const reason: WebSearchFailureReason = error instanceof WebSearchError
             ? error.reason
+            : error instanceof SearchProviderError
+              ? error.reason
             : 'HTTP_ERROR'
+          this.logSearchProvider(
+            provider,
+            0,
+            Date.now() - providerStartedAt,
+            'FAIL',
+            reason,
+            msgIdToken,
+          )
+          if (isRequestDeadlineExceeded(error)) throw error
           this.logWebSearchExecution(mode, window, attempt, 'FAILED', 0, msgIdToken)
           this.logWebSearch('FAIL', 0, reason, msgIdToken)
           this.logWebSearchContext(0, 0, false, msgIdToken)
@@ -1786,6 +2209,80 @@ export class ProductionChatAgent implements AgentExecutor {
     )
   }
 
+  private logSearchProvider(
+    provider: WebSearchProvider,
+    resultCount: number,
+    latencyMs: number,
+    status: 'PASS' | 'FAIL',
+    errorCode: string | undefined,
+    msgIdToken: string,
+  ): void {
+    const named = provider as WebSearchProvider & { readonly providerName?: unknown }
+    const providerName = typeof named.providerName === 'string' && named.providerName.length > 0
+      ? named.providerName
+      : 'unknown'
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'SEARCH_PROVIDER',
+      {
+        provider: providerName,
+        resultCount,
+        latencyMs: Math.max(0, Math.round(latencyMs)),
+        status,
+        ...(status === 'FAIL' ? { errorCode: errorCode ?? 'HTTP_ERROR' } : {}),
+        msgIdToken,
+      },
+    )
+  }
+
+  private logRetrievalQuality(
+    report: {
+      round: 1
+      decision: RetrievalQualityDecision | 'SKIPPED'
+      reason: string
+      resultCount: number
+      fetchedCount: number
+      uniqueHostCount: number
+      authorityHighCount: number
+      authorityLowCount: number
+      missingEvidencePresent: boolean
+      cheapEligible: boolean
+      cheapBlocker: RetrievalQualitySignals['cheapBlocker']
+      remainingMs: number
+    },
+    msgIdToken: string,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'RETRIEVAL_QUALITY',
+      { ...report, msgIdToken },
+    )
+  }
+
+  private logRetrievalRetry(
+    report: {
+      round: 2
+      reason: string
+      queryChars: number
+      alternateQueryChars: number
+      result: 'PASS' | 'FAILED'
+      resultCount: number
+      mergedResultCount: number
+      dedupedResultCount: number
+      remainingMs: number
+    },
+    msgIdToken: string,
+  ): void {
+    emitDiagnostic(
+      (line: string) => console.log(line),
+      this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-web-search') : undefined,
+      'RETRIEVAL_RETRY',
+      { ...report, msgIdToken },
+    )
+  }
+
   private logWebSearchQuality(
     report: ReturnType<typeof rankWebSearchResults>['report'],
     msgIdToken: string,
@@ -1864,18 +2361,28 @@ export function createProductionAgent(options: ProductionReceiverOptions): Agent
   const webSearchPlanner = config.webSearchEnabled
     ? new WebSearchPlanner((system, user, deadline, msgIdToken, phase) => chatService.completeStructured(system, user, deadline, msgIdToken, phase))
     : null
-  const webSearchProvider = config.webSearchEnabled
+  const tavilyWebSearchProvider = config.webSearchEnabled && config.searchProvider === 'tavily'
     ? new TavilyWebSearchProvider(config.tavilyApiBase, config.tavilyApiKey)
     : null
-  const searxngWebSearchProvider = config.webSearchEnabled && config.searxngEnabled
-    ? new SearXNGWebSearchProvider(config.searxngApiBase, config.searxngEngines)
+  const searxngSearchProvider = config.webSearchEnabled && config.searxngEnabled
+    ? new SearXNGSearchProvider(config.searxngApiBase, config.searxngEngines)
     : null
+  let searchProvider: SearchProvider | null = null
+  let searchFallbackProvider: SearchProvider | null = null
+  if (config.webSearchEnabled && config.searchProvider === 'degoog') {
+    searchProvider = new DegoogSearchProvider(config.degoogApiBase)
+    searchFallbackProvider = searxngSearchProvider
+  } else if (config.webSearchEnabled && config.searchProvider === 'searxng') {
+    searchProvider = searxngSearchProvider
+  }
   return new ProductionChatAgent(chatService, {
     memory: createMemoryService(chatService, options.persistentLog),
     persistentLog: options.persistentLog,
     webSearchPlanner,
-    tavilyWebSearchProvider: webSearchProvider,
-    searxngWebSearchProvider,
+    searchProvider,
+    searchFallbackProvider,
+    tavilyWebSearchProvider,
+    searxngWebSearchProvider: searxngSearchProvider === null ? null : adaptSearchProvider(searxngSearchProvider),
     webSearchMaxResults: config.webSearchMaxResults,
     webSearchTimeoutMs: config.webSearchTimeoutMs,
     webSearchMaxContextChars: config.webSearchMaxContextChars,

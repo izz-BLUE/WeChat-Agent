@@ -236,22 +236,36 @@ async function testAnswerGuardRegenerationBudgetGate(): Promise<void> {
 
 async function testSearchAndFinalWithinDeadline(): Promise<void> {
   let calls = 0
+  const logs: string[] = []
   const provider: WebSearchProvider = {
     async search() {
       return { results: [SEARCH_RESULT] }
     },
   }
-  await withMockFetch(async () => {
+  const originalLog = console.log
+  console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '))
+  await withMockFetch(async (init) => {
     calls += 1
-    return completionResponse('搜索结论 [S1]')
+    const body = JSON.parse(String(init?.body ?? '{}')) as { messages?: Array<{ content?: string }> }
+    const system = body.messages?.[0]?.content ?? ''
+    return completionResponse(system.includes('Retrieval Quality Gate')
+      ? 'DECISION=ANSWERABLE\nREASON=ROUND1_SUFFICIENT\nMISSING_EVIDENCE=\nRETRY_QUERY=\nRETRY_ALT_QUERY=\nSEARCH_MODE=GENERAL\nRECENCY_WINDOW=NONE'
+      : '搜索结论 [S1]')
   }, async () => {
-    const result = await searchAgent(
-      new ChatService('https://provider.invalid/v1', 'test-key', 'test-model'),
-      provider,
-      20_000,
-    ).complete(REQUEST)
-    assert.match(result, /搜索结论/u)
-    assert.equal(calls, 1)
+    try {
+      const result = await searchAgent(
+        new ChatService('https://provider.invalid/v1', 'test-key', 'test-model'),
+        provider,
+        50_000,
+      ).complete(REQUEST)
+      assert.match(result, /搜索结论/u)
+      assert.ok(logs.some((line) => line.includes('phase=RETRIEVAL_QUALITY_GATE')), 'Quality Gate phase was not observed')
+      assert.ok(logs.some((line) => line.includes('phase=FINAL_ANSWER')), 'Final Answer phase was not observed')
+      assert.ok(logs.some((line) => line.includes('budgetMs=50000') && line.includes('result=COMPLETED')), '50s deadline did not complete')
+      assert.ok(calls >= 2, 'Quality Gate and Final Answer did not both reach the provider')
+    } finally {
+      console.log = originalLog
+    }
   })
 }
 

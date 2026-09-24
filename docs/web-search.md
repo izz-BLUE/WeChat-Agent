@@ -19,13 +19,12 @@ RECENCY_WINDOW=NONE|DAY_1|DAY_3
 
 ## Provider 路由
 
-- 中文 `GENERAL` 倾向 SearXNG，然后 Tavily。
-- 英文 `GENERAL` 倾向 Tavily，然后 SearXNG。
-- `NEWS_RECENT` 以 Tavily 为主，并按 `DAY_1` 或 `DAY_3` 传递新鲜度语义。
+- `SEARCH_PROVIDER=degoog`（默认）使用本机 Degoog；启用且配置了 SearXNG 时，Degoog 失败或返回空结果会按现有预算尝试一次 SearXNG fallback。
+- `SEARCH_PROVIDER=searxng` 直接选择 SearXNG；未启用或未配置时 fail-soft。
+- `WEB_SEARCH_PROVIDER=tavily` 作为旧配置保留，继续使用原有 Tavily/SearXNG 路由。
 - provider 失败或返回空结果时，在期限预算允许时尝试受限 fallback。
-- 当前配置校验的 `WEB_SEARCH_PROVIDER` 只有 `tavily`；SearXNG 是否参与由 `SEARXNG_ENABLED` 和地址配置决定，不要把它写成可任意填写的 provider 名称。
 
-Tavily 使用 `/search` 和有限的 basic search 参数；SearXNG 使用 JSON search 接口、配置的 engines，并在近期搜索时设置时间范围。API key 只从环境变量读取，provider 原始 payload 不进入持久日志或模型 prompt。
+Degoog 使用本机 `/api/search?q=...&lang=zh` 接口；Tavily 使用 `/search` 和有限的 basic search 参数；SearXNG 使用 JSON search 接口、配置的 engines，并在近期搜索时设置时间范围。API key 只从环境变量读取，provider 原始 payload 不进入持久日志或模型 prompt。
 
 ## 结果处理与网页证据
 
@@ -39,12 +38,11 @@ Tavily 使用 `/search` 和有限的 basic search 参数；SearXNG 使用 JSON s
 
 ```dotenv
 WEB_SEARCH_ENABLED=1
-WEB_SEARCH_PROVIDER=tavily
-TAVILY_API_BASE=<your-tavily-endpoint>
-TAVILY_API_KEY=<your-tavily-key>
+SEARCH_PROVIDER=degoog
+DEGOOG_API_BASE=http://127.0.0.1:4444
 SEARXNG_ENABLED=0
 ```
 
-也可以在本地配置 SearXNG 作为可用路线，但必须自行运行并保护该服务。示例中的 `http://127.0.0.1:8088` 只是默认地址，不是本仓库提供的服务。
+也可以设置 `SEARXNG_ENABLED=1` 作为 Degoog 的可用 fallback，但必须自行运行并保护该服务。示例中的 `http://127.0.0.1:8088` 只是默认地址，不是本仓库提供的服务。若需要使用 Tavily，优先设置 `SEARCH_PROVIDER=tavily` 并提供地址与密钥；旧配置 `WEB_SEARCH_PROVIDER=tavily` 仅在未设置 `SEARCH_PROVIDER` 时生效。
 
 启用前请确认：搜索内容可以被发送给所选 provider、密钥不会进入 Git、内部身份值不会拼入 query、以及回答中的搜索事实只保留经过 grounding 的内容。若这些条件不能满足，应保持关闭。

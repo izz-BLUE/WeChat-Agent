@@ -1,5 +1,8 @@
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
+import { SearXNGSearchProvider } from './providers/searxng-provider.js'
+import { TavilySearchProvider } from './providers/tavily-provider.js'
+import { SearchProviderError } from './search-provider.js'
 
 export interface WebSearchRequest {
   query: string
@@ -26,6 +29,8 @@ export interface WebSearchResult {
   queryOrigin?: WebSearchQueryOrigin
   pageText?: string
   pageFetchStatus?: 'PASS' | 'FAILED' | 'SKIPPED'
+  /** Internal request-local metadata used only while merging retrieval rounds. */
+  retrievalRound?: 1 | 2
 }
 
 export interface WebSearchResponse {
@@ -144,7 +149,10 @@ function cleanUrl(value: unknown): string | null {
 }
 
 /** Normalize provider-shaped data before it can enter a prompt or final source list. */
-export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchResult[] {
+export function normalizeWebSearchResults(
+  input: readonly unknown[],
+  options: { preserveInternalEvidence?: boolean } = {},
+): WebSearchResult[] {
   const results: WebSearchResult[] = []
   const seen = new Set<string>()
   for (const item of input) {
@@ -167,6 +175,18 @@ export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchR
     if (typeof publishedValue === 'string') {
       normalized.publishedAt = publishedValue.slice(0, 80)
     }
+    if (options.preserveInternalEvidence && record.sourceId !== undefined) {
+      if (typeof record.pageText === 'string' && record.pageFetchStatus === 'PASS') {
+        normalized.pageText = record.pageText.slice(0, 8_000)
+        normalized.pageFetchStatus = 'PASS'
+      }
+      if (record.pageFetchStatus === 'FAILED' || record.pageFetchStatus === 'SKIPPED') {
+        normalized.pageFetchStatus = record.pageFetchStatus
+      }
+      if (record.retrievalRound === 1 || record.retrievalRound === 2) {
+        normalized.retrievalRound = record.retrievalRound
+      }
+    }
     results.push(normalized)
   }
   return results
@@ -175,6 +195,7 @@ export function normalizeWebSearchResults(input: readonly unknown[]): WebSearchR
 export interface WebSearchQualityOptions {
   query: string
   alternateQuery?: string | null
+  additionalQueries?: readonly string[]
   mode: WebSearchMode
   window?: WebSearchWindow
   runtimeLocalDate?: string
@@ -286,7 +307,11 @@ function combinedRelevanceScore(options: WebSearchQualityOptions, item: WebSearc
   const alternateScore = options.alternateQuery === undefined || options.alternateQuery === null
     ? 0
     : relevanceScore(options.alternateQuery, item)
-  return Math.max(primaryScore, alternateScore)
+  const additionalScore = (options.additionalQueries ?? []).reduce(
+    (score, query) => Math.max(score, relevanceScore(query, item)),
+    0,
+  )
+  return Math.max(primaryScore, alternateScore, additionalScore)
 }
 
 interface ParsedPublishedAt {
@@ -830,8 +855,20 @@ export async function enrichWebSearchResultsWithPageEvidence(
   options: WebPageEvidenceOptions,
 ): Promise<EnrichedWebSearchResults> {
   const maxResults = Math.min(3, Math.max(0, Math.floor(options.maxResults)))
-  const candidateCount = Math.min(maxResults, results.length)
-  const baseResults = results.map((item) => ({ ...item, pageText: undefined, pageFetchStatus: 'SKIPPED' as const }))
+  const candidateIndices = results
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.pageFetchStatus !== 'PASS' || (item.pageText?.length ?? 0) === 0)
+    .sort((left, right) => {
+      const leftRound = left.item.retrievalRound === 2 ? 0 : 1
+      const rightRound = right.item.retrievalRound === 2 ? 0 : 1
+      return leftRound - rightRound || left.index - right.index
+    })
+    .slice(0, maxResults)
+    .map(({ index }) => index)
+  const candidateCount = candidateIndices.length
+  const baseResults = results.map((item) => item.pageFetchStatus === 'PASS' && (item.pageText?.length ?? 0) > 0
+    ? { ...item }
+    : { ...item, pageText: undefined, pageFetchStatus: 'SKIPPED' as const })
   const skippedReport = (budgetMs: number): EnrichedWebSearchResults => ({
     results: baseResults,
     report: {
@@ -859,9 +896,11 @@ export async function enrichWebSearchResultsWithPageEvidence(
     while (true) {
       const index = nextIndex
       nextIndex += 1
-      if (index >= candidateCount || controller.signal.aborted) return
-      states[index]!.attempted = true
-      states[index]!.result = await fetchWebPage(results[index]!.url, {
+       if (index >= candidateCount || controller.signal.aborted) return
+       const resultIndex = candidateIndices[index]
+       if (resultIndex === undefined) return
+       states[index]!.attempted = true
+       states[index]!.result = await fetchWebPage(results[resultIndex]!.url, {
         ...options,
         signal: controller.signal,
       })
@@ -874,10 +913,11 @@ export async function enrichWebSearchResultsWithPageEvidence(
     options.signal?.removeEventListener('abort', abortExternal)
   }
 
-  let remainingChars = Math.max(0, options.maxTotalChars)
+  let remainingChars = Math.max(0, options.maxTotalChars - baseResults.reduce((sum, item) => sum + (item.pageText?.length ?? 0), 0))
   let totalEvidenceChars = 0
-  const enriched = baseResults.map((item, index) => {
-    const state = states[index]
+  const enriched = baseResults.map((item, resultIndex) => {
+    const candidateIndex = candidateIndices.indexOf(resultIndex)
+    const state = candidateIndex >= 0 ? states[candidateIndex] : undefined
     if (state === undefined) return item
     if (!state.attempted) return item
     if (state.result?.status !== 'PASS' || state.result.pageText === undefined) {
@@ -977,7 +1017,7 @@ export function appendGroundedSources(
   let removedDanglingMarkerCount = 0
 
   const groundedAnswer = cleanupCitationPresentation(answer
-    .replace(/https?:\/\/[^\s)\]}>]+/gu, (url) => {
+    .replace(/https?:\/\/[^\s\[)\]}>]+/gu, (url) => {
       return safeResults.some((item) => item.url === url) ? url : ''
     })
     .replace(/\[(S\d+)\]/gu, (marker, sourceId: string) => {
@@ -1004,170 +1044,82 @@ export function appendGroundedSources(
   return groundedAnswer
 }
 
+/** Compatibility seam for callers that still use the legacy request shape. */
 export class TavilyWebSearchProvider implements WebSearchProvider {
-  public constructor(
-    private readonly apiBase: string,
-    private readonly apiKey: string,
-  ) {}
+  public readonly providerName = 'tavily'
+  private readonly provider: TavilySearchProvider
+
+  public constructor(apiBase: string, apiKey: string) {
+    this.provider = new TavilySearchProvider(apiBase, apiKey)
+  }
 
   public async search(request: WebSearchRequest): Promise<WebSearchResponse> {
-    if (!this.apiBase || !this.apiKey) {
-      throw new WebSearchError('DISABLED')
-    }
-
-    const endpoint = this.apiBase.replace(/\/$/u, '').endsWith('/search')
-      ? this.apiBase
-      : `${this.apiBase.replace(/\/$/u, '')}/search`
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), Math.max(1, request.timeoutMs))
-    const abortExternal = (): void => controller.abort()
-    request.signal?.addEventListener('abort', abortExternal, { once: true })
     try {
-      let response: Response
-      try {
-        const body: Record<string, unknown> = {
-          query: request.query,
-          search_depth: 'basic',
-          max_results: request.maxResults,
-          include_answer: false,
-          include_raw_content: false,
-          include_images: false,
-        }
-        if (request.mode === 'NEWS_RECENT') {
-          body.topic = 'news'
-          body.include_published_date = true
-          body.filter_by_published_date = true
-          if (request.startDate !== undefined) body.start_date = request.startDate
-          if (request.endDate !== undefined) body.end_date = request.endDate
-        }
-        response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${this.apiKey}`,
-          },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        })
-      } catch (error) {
-        if (controller.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
-          throw new WebSearchError('TIMEOUT')
-        }
-        throw new WebSearchError('HTTP_ERROR')
+      const response = await this.provider.search(request.query, {
+        maxResults: request.maxResults,
+        timeoutMs: request.timeoutMs,
+        mode: request.mode,
+        days: request.days,
+        startDate: request.startDate,
+        endDate: request.endDate,
+        signal: request.signal,
+      })
+      return {
+        results: response.results.map((result, index) => ({
+          sourceId: `S${index + 1}`,
+          title: result.title,
+          url: result.url,
+          snippet: result.snippet,
+          ...(result.publishedAt === undefined ? {} : { publishedAt: result.publishedAt }),
+        })),
       }
-
-      if (!response.ok) {
-        throw new WebSearchError('HTTP_ERROR')
+    } catch (error) {
+      if (error instanceof SearchProviderError) {
+        throw new WebSearchError(error.reason)
       }
-
-      let data: unknown
-      try {
-        data = await response.json()
-      } catch {
-        throw new WebSearchError('INVALID_RESPONSE')
-      }
-      const record = asRecord(data)
-      if (!record || !Array.isArray(record.results)) {
-        throw new WebSearchError('INVALID_RESPONSE')
-      }
-      return { results: normalizeWebSearchResults(record.results).slice(0, request.maxResults) }
-    } finally {
-      clearTimeout(timeout)
-      request.signal?.removeEventListener('abort', abortExternal)
+      throw error
     }
   }
 }
 
+/**
+ * Compatibility seam for existing callers. The SearXNG HTTP implementation
+ * lives in `providers/searxng-provider.ts`; this wrapper only preserves the
+ * legacy WebSearchProvider request/response shape used by older tests.
+ */
 export class SearXNGWebSearchProvider implements WebSearchProvider {
-  private readonly engines: readonly string[]
+  public readonly providerName = 'searxng'
+  private readonly provider: SearXNGSearchProvider
 
-  public constructor(
-    private readonly apiBase: string,
-    engines: readonly string[] = ['360search', 'sogou'],
-  ) {
-    this.engines = engines.map((engine) => engine.trim()).filter((engine) => engine.length > 0)
+  public constructor(apiBase: string, engines: readonly string[] = ['360search', 'sogou']) {
+    this.provider = new SearXNGSearchProvider(apiBase, engines)
   }
 
   public async search(request: WebSearchRequest): Promise<WebSearchResponse> {
-    if (!this.apiBase) {
-      throw new WebSearchError('DISABLED')
-    }
-
-    const base = this.apiBase.replace(/\/+$/u, '')
-    const endpoint = base.endsWith('/search') ? base : `${base}/search`
-    let url: URL
     try {
-      url = new URL(endpoint)
-    } catch {
-      throw new WebSearchError('HTTP_ERROR')
-    }
-    url.searchParams.set('q', request.query)
-    url.searchParams.set('format', 'json')
-    url.searchParams.set('language', 'zh-CN')
-    if (this.engines.length > 0) {
-      url.searchParams.set('engines', this.engines.join(','))
-    }
-    if (request.mode === 'NEWS_RECENT' && request.days !== undefined) {
-      // SearXNG exposes a day-level range, not the exact three-day bounds used
-      // by Tavily. Keep the window bounded and let NEWS_RECENT prefer Tavily.
-      url.searchParams.set('time_range', 'day')
-    }
-
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), Math.max(1, request.timeoutMs))
-    const abortExternal = (): void => controller.abort()
-    if (request.signal?.aborted) {
-      controller.abort()
-    }
-    request.signal?.addEventListener('abort', abortExternal, { once: true })
-    try {
-      let response: Response
-      try {
-        response = await fetch(url, {
-          method: 'GET',
-          signal: controller.signal,
-        })
-      } catch (error) {
-        if (controller.signal.aborted || (error instanceof Error && error.name === 'AbortError')) {
-          throw new WebSearchError('TIMEOUT')
-        }
-        throw new WebSearchError('HTTP_ERROR')
-      }
-
-      if (!response.ok) {
-        throw new WebSearchError('HTTP_ERROR')
-      }
-
-      let data: unknown
-      try {
-        data = await response.json()
-      } catch {
-        throw new WebSearchError('INVALID_RESPONSE')
-      }
-      const record = asRecord(data)
-      if (!record || !Array.isArray(record.results)) {
-        throw new WebSearchError('INVALID_RESPONSE')
-      }
-
-      const mappedResults = record.results.map((item) => {
-        const result = asRecord(item)
-        if (!result) {
-          return item
-        }
-        const mapped: Record<string, unknown> = {
+      const response = await this.provider.search(request.query, {
+        maxResults: request.maxResults,
+        timeoutMs: request.timeoutMs,
+        mode: request.mode,
+        days: request.days,
+        startDate: request.startDate,
+        endDate: request.endDate,
+        signal: request.signal,
+      })
+      return {
+        results: response.results.map((result, index) => ({
+          sourceId: `S${index + 1}`,
           title: result.title,
           url: result.url,
-          snippet: result.content,
-        }
-        if (Object.prototype.hasOwnProperty.call(result, 'publishedDate')) {
-          mapped.publishedAt = result.publishedDate
-        }
-        return mapped
-      })
-      return { results: normalizeWebSearchResults(mappedResults).slice(0, request.maxResults) }
-    } finally {
-      clearTimeout(timeout)
-      request.signal?.removeEventListener('abort', abortExternal)
+          snippet: result.snippet,
+          ...(result.publishedAt === undefined ? {} : { publishedAt: result.publishedAt }),
+        })),
+      }
+    } catch (error) {
+      if (error instanceof SearchProviderError) {
+        throw new WebSearchError(error.reason)
+      }
+      throw error
     }
   }
 }
