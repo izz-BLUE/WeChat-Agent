@@ -17,7 +17,7 @@ import { RequesterLocalContext } from './requester-local-context.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
-import { ProactiveGroupQueue } from './proactive-group-queue.js'
+import { AMBIENT_NAME_TRIGGERED_REPLY, ProactiveGroupQueue } from './proactive-group-queue.js'
 
 const GROUP = 'owner-alias@chatroom'
 const MEMBER = 'member-owner-alias'
@@ -726,7 +726,7 @@ async function main(): Promise<void> {
   await check('alias-queue-full-fails-closed', async () => {
     const provider = stubProvider()
     const queue = new ProactiveGroupQueue({ maxEntries: 1 })
-    queue.enqueue({ conversationType: 'GROUP', conversationId: GROUP, text: 'already queued' })
+    queue.enqueue({ conversationType: 'GROUP', conversationId: GROUP, text: 'already queued', intent: AMBIENT_NAME_TRIGGERED_REPLY })
     try {
       const agent = makeAgent({ provider, proactiveQueue: queue })
       await captureThenAliasWake(agent, realPassiveWire('辞老师呢', { msgId: 'case-queue-full' }))

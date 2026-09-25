@@ -122,9 +122,12 @@ import {
   OwnerAliasWakeGate,
 } from './owner-alias-wake.js'
 import {
+  AMBIENT_NAME_TRIGGERED_REPLY,
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
+  PROACTIVE_MESSAGE,
   ProactiveGroupQueue,
+  type ProactiveOutboundIntent,
 } from './proactive-group-queue.js'
 
 function finalizeYeyeReply(
@@ -666,15 +669,18 @@ export class ProductionChatAgent implements AgentExecutor {
         conversationType: 'GROUP',
         conversationId: context.conversationId,
         text: finalAnswer,
+        // The deterministic alias match already happened before generation;
+        // the intent records that fact, it is not a model decision.
+        intent: AMBIENT_NAME_TRIGGERED_REPLY,
       })
       if (!queued.accepted) {
         result = 'GENERATION_FAILED'
         this.logOwnerAliasWake(context, 'QUEUE_FULL', true, true, 'FAIL')
-        this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size)
+        this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size, 'AMBIENT_NAME')
         return
       }
       this.logOwnerAliasWake(context, 'QUEUED', true, true, 'PASS')
-      this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
+      this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size, 'AMBIENT_NAME')
     } catch {
       result = 'GENERATION_FAILED'
       this.logOwnerAliasWake(context, 'GENERATION_FAILED', true, true, 'FAIL')
@@ -734,6 +740,7 @@ export class ProductionChatAgent implements AgentExecutor {
         conversationType: item.conversationType,
         conversationId: item.conversationId,
         text: item.text,
+        outboundIntent: item.intent,
       }
     } catch {
       this.proactiveQueue.finalize(item.taskId)
@@ -1289,16 +1296,19 @@ export class ProductionChatAgent implements AgentExecutor {
       conversationType: 'GROUP',
       conversationId: request.conversationId,
       text: plan.decision.message,
+      // Owner-commanded dispatch: a real user message triggered it, but it is
+      // not a deterministic name trigger, so it keeps the proactive semantics.
+      intent: PROACTIVE_MESSAGE,
     })
     if (!queued.accepted) {
       this.logOwnerDispatch('DISPATCH_NOW', 'FAIL', queued.reason, true)
-      this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size)
+      this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size, 'OWNER_DISPATCH')
       // A dispatch decision is still a handled command. Do not turn a full or
       // invalid queue into a second normal bot reply in the same inbound turn.
       return true
     }
     this.logOwnerDispatch('DISPATCH_NOW', 'PASS', 'ENQUEUED', true)
-    this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
+    this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size, 'OWNER_DISPATCH')
     return true
   }
 
@@ -1353,14 +1363,15 @@ export class ProductionChatAgent implements AgentExecutor {
       conversationType: 'GROUP',
       conversationId: target,
       text: parsed.decision.message ?? '',
+      intent: PROACTIVE_MESSAGE,
     })
     if (!queued.accepted) {
       this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', queued.reason)
-      this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size)
+      this.logProactiveQueue('ENQUEUE', 'DROP', this.proactiveQueue.size, 'OWNER_DISPATCH')
       return ''
     }
     this.logOwnerPrivateDispatch('DISPATCH', 'PASS', 'ENQUEUED')
-    this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size)
+    this.logProactiveQueue('ENQUEUE', 'PASS', this.proactiveQueue.size, 'OWNER_DISPATCH')
     return ''
   }
 
@@ -1391,12 +1402,22 @@ export class ProductionChatAgent implements AgentExecutor {
     )
   }
 
-  private logProactiveQueue(operation: 'ENQUEUE' | 'CLAIM' | 'FINALIZE' | 'EXPIRE', result: 'PASS' | 'DROP', queueSize: number): void {
+  /**
+   * Queue diagnostics carry only the trigger class — an enum-like token that
+   * says how the enqueued answer came to exist. The matched trigger word, the
+   * group message body and any raw identity never appear here.
+   */
+  private logProactiveQueue(
+    operation: 'ENQUEUE' | 'CLAIM' | 'FINALIZE' | 'EXPIRE',
+    result: 'PASS' | 'DROP',
+    queueSize: number,
+    triggerClass?: 'AMBIENT_NAME' | 'OWNER_DISPATCH',
+  ): void {
     emitDiagnostic(
       (line: string) => console.log(line),
       this.persistentLog ? new PersistentRuntimeLogSink(this.persistentLog, 'agent-receiver') : undefined,
       'PROACTIVE_QUEUE',
-      { operation, result, queueSize },
+      { operation, result, queueSize, ...(triggerClass === undefined ? {} : { triggerClass }) },
     )
   }
 

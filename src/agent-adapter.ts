@@ -16,6 +16,7 @@ import {
 } from './message-contract.js'
 import { sha256Utf8, type OutboundDeliveryAck, type OutboundIdentity, type DeliveryAckResult } from './outbound-delivery.js'
 import type { OwnerAliasClass } from './owner-alias-wake.js'
+import type { ProactiveOutboundIntent } from './proactive-group-queue.js'
 
 /** Runtime-decided mention fact; the Agent must never re-derive it from text. */
 export type MentionState = 'MENTIONED' | 'NOT_MENTIONED' | 'UNKNOWN'
@@ -72,6 +73,13 @@ export interface OutboundCommand {
   conversationType: ConversationType
   conversationId: string
   text: string
+  /**
+   * Declared send intent for the proactive poll path only. The normal inbound
+   * reply path never sets it: the runtime assigns UserTriggeredReply there by
+   * transport path, so no reply can ever be re-branded by the Agent. The value
+   * is enum semantics only — never the trigger text or any message content.
+   */
+  outboundIntent?: ProactiveOutboundIntent
 }
 
 export type MentionPolicyResult =

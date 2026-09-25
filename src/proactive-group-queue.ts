@@ -3,12 +3,33 @@ import { randomUUID } from 'node:crypto'
 export const DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES = 64
 export const DEFAULT_PROACTIVE_QUEUE_TTL_MS = 60_000
 
+/**
+ * Why one proactive outbound exists. The value is the only thing that crosses
+ * the runtime wire — never the trigger text, never the message body, never a
+ * raw identity. The C# runtime resolves the send budget from this declaration
+ * together with the transport path; it cannot be widened there.
+ *
+ *  - AMBIENT_NAME_TRIGGERED_REPLY: a real GROUP message was present and the
+ *    deterministic name trigger (`detectOwnerAliasWake`) matched it.
+ *  - PROACTIVE_MESSAGE: no deterministic name trigger fired. Today the
+ *    owner-commanded dispatch producers; reserved for genuine autonomous
+ *    speech.
+ */
+export const PROACTIVE_OUTBOUND_INTENTS = ['AMBIENT_NAME_TRIGGERED_REPLY', 'PROACTIVE_MESSAGE'] as const
+
+export type ProactiveOutboundIntent = (typeof PROACTIVE_OUTBOUND_INTENTS)[number]
+
+export const AMBIENT_NAME_TRIGGERED_REPLY: ProactiveOutboundIntent = 'AMBIENT_NAME_TRIGGERED_REPLY'
+export const PROACTIVE_MESSAGE: ProactiveOutboundIntent = 'PROACTIVE_MESSAGE'
+
 export interface ProactiveGroupQueueItem {
   taskId: string
   conversationType: 'GROUP'
   conversationId: string
   text: string
   createdAt: number
+  /** Declared send intent; stamped by the producer, never by the model. */
+  intent: ProactiveOutboundIntent
 }
 
 export type ProactiveQueueEnqueueResult =
@@ -64,6 +85,9 @@ export class ProactiveGroupQueue {
     if (input.conversationType !== 'GROUP' || !input.conversationId.trim() || !input.text.trim()) {
       return { accepted: false, reason: 'INVALID_TASK' }
     }
+    if (!PROACTIVE_OUTBOUND_INTENTS.includes(input.intent)) {
+      return { accepted: false, reason: 'INVALID_TASK' }
+    }
     if (this.items.size >= this.maxEntries) {
       return { accepted: false, reason: 'QUEUE_FULL' }
     }
@@ -76,6 +100,7 @@ export class ProactiveGroupQueue {
       conversationId: input.conversationId,
       text: input.text,
       createdAt: input.createdAt ?? this.clock(),
+      intent: input.intent,
     }
     this.items.set(taskId, { ...item, status: 'READY' })
     this.ready.push(taskId)

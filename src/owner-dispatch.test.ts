@@ -12,7 +12,7 @@ import {
 } from './owner-dispatch-planner.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
-import { ProactiveGroupQueue } from './proactive-group-queue.js'
+import { ProactiveGroupQueue, PROACTIVE_MESSAGE } from './proactive-group-queue.js'
 import { YEYE_REPLY_SIGNATURE } from './chat-renderer.js'
 
 const ROOM = 'owner-dispatch@chatroom'
@@ -381,16 +381,16 @@ async function main(): Promise<void> {
 
   let now = 1_000
   const queue = new ProactiveGroupQueue({ maxEntries: 2, ttlMs: 10, now: () => now, idFactory: (() => { let n = 0; return () => `task-${++n}` })() })
-  assert.equal(queue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'one' }).accepted, true)
-  assert.equal(queue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'two' }).accepted, true)
-  assert.equal(queue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'three' }).accepted, false)
+  assert.equal(queue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'one', intent: PROACTIVE_MESSAGE }).accepted, true)
+  assert.equal(queue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'two', intent: PROACTIVE_MESSAGE }).accepted, true)
+  assert.equal(queue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'three', intent: PROACTIVE_MESSAGE }).accepted, false)
   const first = queue.claimReady()
   assert(first)
   assert.equal(queue.claimReady()?.text, 'two')
   assert.equal(queue.claimReady(), null)
   assert.equal(queue.finalize(first.taskId), true)
   const expiredQueue = new ProactiveGroupQueue({ ttlMs: 10, now: () => now })
-  expiredQueue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'expire' })
+  expiredQueue.enqueue({ conversationType: 'GROUP', conversationId: ROOM, text: 'expire', intent: PROACTIVE_MESSAGE })
   now += 11
   assert.equal(expiredQueue.claimReady(), null)
 
