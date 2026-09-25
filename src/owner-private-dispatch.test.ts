@@ -20,6 +20,7 @@ import {
 import type { OwnerDispatchPlannerLike } from './owner-dispatch-planner.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { ProductionChatAgent } from './production-agent-receiver.js'
+import { OWNER_COMMANDED_DISPATCH } from './proactive-group-queue.js'
 import { sha256Utf8 } from './outbound-delivery.js'
 
 const OWNER = 'owner-private'
@@ -285,6 +286,7 @@ async function main(): Promise<void> {
   assert.equal(command.conversationType, 'GROUP')
   assert.equal(command.conversationId, ROOM_A)
   assert.equal(command.contentSha256, sha256Utf8(command.text))
+  assert.equal(command.outboundIntent, OWNER_COMMANDED_DISPATCH)
   assert.equal(dispatchAgent.pollProactiveOutbound(), null)
   assert.equal(dispatchAgent.observeOutboundDelivery({
     outboundId: command.outboundId,

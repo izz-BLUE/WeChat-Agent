@@ -11,15 +11,22 @@ export const DEFAULT_PROACTIVE_QUEUE_TTL_MS = 60_000
  *
  *  - AMBIENT_NAME_TRIGGERED_REPLY: a real GROUP message was present and the
  *    deterministic name trigger (`detectOwnerAliasWake`) matched it.
- *  - PROACTIVE_MESSAGE: no deterministic name trigger fired. Today the
- *    owner-commanded dispatch producers; reserved for genuine autonomous
- *    speech.
+ *  - OWNER_COMMANDED_DISPATCH: the current Owner command directly caused a
+ *    cross-conversation or dispatched send.
+ *  - PROACTIVE_MESSAGE: no current user message directly triggered the send —
+ *    genuinely autonomous speech. No producer exists today; the value is
+ *    reserved.
  */
-export const PROACTIVE_OUTBOUND_INTENTS = ['AMBIENT_NAME_TRIGGERED_REPLY', 'PROACTIVE_MESSAGE'] as const
+export const PROACTIVE_OUTBOUND_INTENTS = [
+  'AMBIENT_NAME_TRIGGERED_REPLY',
+  'OWNER_COMMANDED_DISPATCH',
+  'PROACTIVE_MESSAGE',
+] as const
 
 export type ProactiveOutboundIntent = (typeof PROACTIVE_OUTBOUND_INTENTS)[number]
 
 export const AMBIENT_NAME_TRIGGERED_REPLY: ProactiveOutboundIntent = 'AMBIENT_NAME_TRIGGERED_REPLY'
+export const OWNER_COMMANDED_DISPATCH: ProactiveOutboundIntent = 'OWNER_COMMANDED_DISPATCH'
 export const PROACTIVE_MESSAGE: ProactiveOutboundIntent = 'PROACTIVE_MESSAGE'
 
 export interface ProactiveGroupQueueItem {

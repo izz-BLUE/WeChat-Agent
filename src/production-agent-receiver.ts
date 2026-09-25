@@ -125,7 +125,7 @@ import {
   AMBIENT_NAME_TRIGGERED_REPLY,
   DEFAULT_PROACTIVE_QUEUE_MAX_ENTRIES,
   DEFAULT_PROACTIVE_QUEUE_TTL_MS,
-  PROACTIVE_MESSAGE,
+  OWNER_COMMANDED_DISPATCH,
   ProactiveGroupQueue,
   type ProactiveOutboundIntent,
 } from './proactive-group-queue.js'
@@ -1296,9 +1296,9 @@ export class ProductionChatAgent implements AgentExecutor {
       conversationType: 'GROUP',
       conversationId: request.conversationId,
       text: plan.decision.message,
-      // Owner-commanded dispatch: a real user message triggered it, but it is
-      // not a deterministic name trigger, so it keeps the proactive semantics.
-      intent: PROACTIVE_MESSAGE,
+      // The current Owner command directly caused this send: a proactive-class
+      // intent of its own, neither a reply nor an ambient interjection.
+      intent: OWNER_COMMANDED_DISPATCH,
     })
     if (!queued.accepted) {
       this.logOwnerDispatch('DISPATCH_NOW', 'FAIL', queued.reason, true)
@@ -1363,7 +1363,7 @@ export class ProductionChatAgent implements AgentExecutor {
       conversationType: 'GROUP',
       conversationId: target,
       text: parsed.decision.message ?? '',
-      intent: PROACTIVE_MESSAGE,
+      intent: OWNER_COMMANDED_DISPATCH,
     })
     if (!queued.accepted) {
       this.logOwnerPrivateDispatch('DISPATCH', 'FAIL', queued.reason)

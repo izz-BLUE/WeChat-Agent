@@ -19,10 +19,12 @@ import { ProductionChatAgent } from './production-agent-receiver.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import {
   AMBIENT_NAME_TRIGGERED_REPLY,
+  OWNER_COMMANDED_DISPATCH,
   PROACTIVE_MESSAGE,
   PROACTIVE_OUTBOUND_INTENTS,
   ProactiveGroupQueue,
 } from './proactive-group-queue.js'
+import { readFileSync } from 'node:fs'
 
 const GROUP = 'ambient-intent@chatroom'
 const MEMBER = 'member-ambient-intent'
@@ -359,7 +361,7 @@ async function main(): Promise<void> {
       conversationType: 'GROUP',
       conversationId: GROUP,
       text: 'text',
-      intent: PROACTIVE_MESSAGE,
+      intent: OWNER_COMMANDED_DISPATCH,
     }).accepted, true)
     const forged = queue.enqueue({
       conversationType: 'GROUP',
@@ -368,7 +370,34 @@ async function main(): Promise<void> {
       intent: 'USER_TRIGGERED_REPLY' as never,
     })
     assert.equal(forged.accepted, false)
-    assert.deepEqual([...PROACTIVE_OUTBOUND_INTENTS], ['AMBIENT_NAME_TRIGGERED_REPLY', 'PROACTIVE_MESSAGE'])
+    const reserved = queue.enqueue({
+      conversationType: 'GROUP',
+      conversationId: GROUP,
+      text: 'text',
+      intent: PROACTIVE_MESSAGE,
+    })
+    // The wire contract still carries the reserved value; no production
+    // producer may use it (see the producer census below).
+    assert.equal(reserved.accepted, true)
+    assert.deepEqual([...PROACTIVE_OUTBOUND_INTENTS], [
+      'AMBIENT_NAME_TRIGGERED_REPLY',
+      'OWNER_COMMANDED_DISPATCH',
+      'PROACTIVE_MESSAGE',
+    ])
+  })
+
+  await check('no-producer-emits-proactive-message', () => {
+    // Structural census over the production sources. PROACTIVE_MESSAGE is a
+    // reserved contract value, so the only legitimate occurrence is the closed
+    // enum definition in the queue module. Every producer stamps its own
+    // intent; none may claim the autonomous semantics. Paths run from the
+    // compiled dist back to the sibling src tree of the repository layout.
+    for (const file of ['production-agent-receiver.ts', 'production-agent-transport.ts', 'agent-adapter.ts']) {
+      const source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8')
+      assert.equal(!source.includes('PROACTIVE_MESSAGE'), true, `${file} must not reference the reserved intent`)
+    }
+    const queueSource = readFileSync(new URL('../src/proactive-group-queue.ts', import.meta.url), 'utf8')
+    assert.equal(queueSource.includes("export const PROACTIVE_MESSAGE: ProactiveOutboundIntent = 'PROACTIVE_MESSAGE'"), true)
   })
 
   await check('poll-wire-serializes-the-declared-intent', async () => {
@@ -400,17 +429,17 @@ async function main(): Promise<void> {
       const secondPoll = await readLine(socket)
       assert.equal(secondPoll.kind, 'NO_PROACTIVE_OUTBOUND')
 
-      // A proactive-class declaration for the owner dispatch producers.
+      // The owner dispatch producers declare their own proactive-class intent.
       queue.enqueue({
         conversationType: 'GROUP',
         conversationId: GROUP,
         text: 'dispatch text',
-        intent: PROACTIVE_MESSAGE,
+        intent: OWNER_COMMANDED_DISPATCH,
       })
       socket.write('{"kind":"PROACTIVE_OUTBOUND_POLL","pollId":"poll-3"}\n')
       const dispatch = await readLine(socket)
       assert.equal(dispatch.kind, 'PROACTIVE_OUTBOUND_COMMAND')
-      assert.equal(dispatch.outboundIntent, PROACTIVE_MESSAGE)
+      assert.equal(dispatch.outboundIntent, OWNER_COMMANDED_DISPATCH)
     } finally {
       socket?.destroy()
       await server.stop()
