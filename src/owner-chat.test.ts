@@ -5,6 +5,7 @@ import { ChatService, buildSystemPrompt, buildUserPrompt } from './chat.js'
 import { createTrustedAssistantRuntimeFacts } from './assistant-identity.js'
 import { ProductionAgentTransportServer } from './production-agent-transport.js'
 import { OwnerChatHandler } from './owner-chat-handler.js'
+import type { PersistentRuntimeLogSink } from './persistent-runtime-log.js'
 import {
   OWNER_CHAT_CONVERSATION_ID,
   OWNER_CHAT_REQUEST_KIND,
@@ -211,6 +212,146 @@ async function testOwnerChatPromptGuardAndGroupIsolation(): Promise<void> {
   }
 }
 
+async function testOwnerChatSkipsGroupFinalizationAndGroupStillUsesIt(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const payloads: Array<{ messages: Array<{ role: string; content: string }> }> = []
+  const ownerEvents: string[] = []
+  const groupEvents: string[] = []
+  const answer = `\`\`\`ts\n${Array.from({ length: 30 }, (_, index) =>
+    `const sample${index} = "${'x'.repeat(36)}";`,
+  ).join('\n')}\n\`\`\``
+  const sinkFor = (events: string[]): PersistentRuntimeLogSink => ({
+    writeStructured: (event: string) => events.push(event),
+  } as unknown as PersistentRuntimeLogSink)
+
+  globalThis.fetch = async (_input, init) => {
+    payloads.push(JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> })
+    return new Response(JSON.stringify({ choices: [{ message: { content: answer } }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  try {
+    const assistantRuntime = createTrustedAssistantRuntimeFacts('椰椰', true, 'Owner', 'Creator')
+    const ownerService = new ChatService('http://owner-chat.test/v1', 'test-key', 'test-model', sinkFor(ownerEvents))
+    const ownerResult = await ownerService.reply(
+      [],
+      {
+        senderId: '',
+        senderName: 'OWNER_CHAT_OPERATOR',
+        text: '请解释这段代码。',
+        timestamp: Date.now(),
+        messageId: randomUUID(),
+      },
+      {
+        surface: 'OWNER_CHAT',
+        conversationType: 'GROUP',
+        botDisplayName: '椰椰',
+        assistantRuntime,
+        mention: 'NOT_APPLICABLE',
+        requesterRole: 'OWNER',
+        ownerConfigured: true,
+        groupReplyPressure: 'HIGH',
+        memory: [],
+        persistentMemoryAvailable: false,
+        memoryMutationThisTurn: 'NONE',
+        ownerChatRecentContext: [],
+      },
+      [],
+      sinkFor(ownerEvents),
+      randomUUID(),
+    )
+    assert.equal(ownerResult, answer, 'Owner Chat must preserve a long structured answer')
+    const ownerGroupStages = [
+      'GROUP_REPLY_LENGTH',
+      'GROUP_CONVERSATIONAL_RESTRAINT',
+      'GROUP_SOCIAL_OUTPUT_BOUNDARY',
+      'GROUP_BULK_OUTPUT_BOUNDARY',
+    ]
+    for (const stage of ownerGroupStages) {
+      assert.equal(ownerEvents.includes(stage), false, `Owner Chat invoked ${stage}`)
+    }
+    assert(ownerEvents.includes('ANSWER_GUARD'), 'generic Answer Guard was skipped')
+    assert(ownerEvents.includes('CHAT_RENDERER'), 'surface-neutral chat renderer was skipped')
+    const ownerPrompt = payloads[0]?.messages.map((message) => message.content).join('\n') ?? ''
+    assert.doesNotMatch(ownerPrompt, /GROUP_REPLY_PRESSURE|GROUP_CONVERSATIONAL_RESTRAINT|GROUP_SOCIAL_OUTPUT_BOUNDARY|GROUP_BULK_OUTPUT_BOUNDARY/)
+
+    const groupService = new ChatService('http://owner-chat.test/v1', 'test-key', 'test-model', sinkFor(groupEvents))
+    const groupResult = await groupService.reply(
+      [],
+      {
+        senderId: 'member-1',
+        senderName: 'Member',
+        text: '请解释这段代码。',
+        timestamp: Date.now(),
+        messageId: randomUUID(),
+      },
+      {
+        surface: 'GROUP',
+        conversationType: 'GROUP',
+        botDisplayName: '椰椰',
+        assistantRuntime,
+        mention: 'NOT_MENTIONED',
+        requesterRole: 'MEMBER',
+        ownerConfigured: false,
+        groupReplyPressure: 'HIGH',
+        memory: [],
+      },
+      [],
+      sinkFor(groupEvents),
+      randomUUID(),
+    )
+    assert.notEqual(groupResult, answer, 'GROUP bulk boundary no longer bounds the original path')
+    for (const stage of [
+      'GROUP_REPLY_LENGTH',
+      'GROUP_CONVERSATIONAL_RESTRAINT',
+      'GROUP_SOCIAL_OUTPUT_BOUNDARY',
+      'GROUP_BULK_OUTPUT_BOUNDARY',
+    ]) {
+      assert(groupEvents.includes(stage), `GROUP request skipped ${stage}`)
+    }
+    const groupPrompt = payloads[1]?.messages.map((message) => message.content).join('\n') ?? ''
+    assert.match(groupPrompt, /GROUP_REPLY_PRESSURE=HIGH/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
+async function testOwnerChatProviderControlRepairIsRetained(): Promise<void> {
+  const originalFetch = globalThis.fetch
+  const payloads: Array<{ messages: Array<{ role: string; content: string }> }> = []
+  const events: string[] = []
+  let calls = 0
+  globalThis.fetch = async (_input, init) => {
+    payloads.push(JSON.parse(String(init?.body)) as { messages: Array<{ role: string; content: string }> })
+    const content = calls++ === 0 ? '<|minimax|>tool_call' : '修复后的安全答复。'
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  try {
+    const sink = {
+      writeStructured: (event: string) => events.push(event),
+    } as unknown as PersistentRuntimeLogSink
+    const service = new ChatService('http://owner-chat.test/v1', 'test-key', 'test-model', sink)
+    const answer = await service.replyOwnerChat(
+      '测试 provider repair',
+      [],
+      createTrustedAssistantRuntimeFacts('椰椰', true, 'Owner', 'Creator'),
+      randomUUID(),
+    )
+    assert.equal(answer, '修复后的安全答复。')
+    assert.equal(calls, 2, 'provider-control repair must remain enabled for Owner Chat')
+    assert(events.includes('PROVIDER_CONTROL_BOUNDARY'))
+    const repairSystem = payloads[1]?.messages.find((message) => message.role === 'system')?.content ?? ''
+    assert.match(repairSystem, /Owner Chat/)
+    assert.doesNotMatch(repairSystem, /GROUP_REPLY_PRESSURE|GROUP_CONVERSATIONAL_RESTRAINT|GROUP_SOCIAL_OUTPUT_BOUNDARY|GROUP_BULK_OUTPUT_BOUNDARY/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
 async function testOwnerChatPromptCarriesTrustedRelationshipQueryFact(): Promise<void> {
   const assistantRuntime = createTrustedAssistantRuntimeFacts('椰椰', true, 'Owner', 'Creator')
   const prompt = buildUserPrompt(
@@ -244,8 +385,10 @@ async function main(): Promise<void> {
   await testTransportErrorsFailClosed()
   await testOwnerChatHandlerUsesTrustedFactsAndNoMemoryService()
   await testOwnerChatPromptGuardAndGroupIsolation()
+  await testOwnerChatSkipsGroupFinalizationAndGroupStillUsesIt()
+  await testOwnerChatProviderControlRepairIsRetained()
   await testOwnerChatPromptCarriesTrustedRelationshipQueryFact()
-  console.log('OWNER_CHAT_TESTS=PASS cases=6')
+  console.log('OWNER_CHAT_TESTS=PASS cases=8')
 }
 
 void main().catch((error: unknown) => {

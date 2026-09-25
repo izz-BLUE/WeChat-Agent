@@ -1536,9 +1536,10 @@ export class ChatService {
       throw new Error('Chat API returned an answer that carries internal runtime labels')
     }
 
-    const groupReplyPressure = resolveGroupReplyPressure(effectiveRequest)
+    const ownerChatSurface = effectiveRequest.surface === 'OWNER_CHAT'
+    const groupReplyPressure = ownerChatSurface ? undefined : resolveGroupReplyPressure(effectiveRequest)
     const profileResponseDepth = effectiveRequest.memberInteractionProfile?.responseDepth
-    const groupRestraint = effectiveRequest.conversationType === 'GROUP'
+    const groupRestraint = !ownerChatSurface && effectiveRequest.conversationType === 'GROUP'
       ? resolveGroupConversationalRestraint({
           questionText: question.text,
           recentContextTexts: groupRestraintContextTexts(context, effectiveRequest),
@@ -1597,6 +1598,13 @@ export class ChatService {
         groupRestraintDiagnostic,
       )
     }
+    const unboundedFinalAnswer = (answer: string): ReturnType<typeof boundGroupReply> => ({
+      text: answer,
+      beforeChars: answer.length,
+      afterChars: answer.length,
+      bounded: false,
+      boundaryType: 'NONE',
+    })
     const applyGroupReplyBoundary = (answer: string) => {
       const bound = effectiveRequest.conversationType === 'GROUP'
         ? boundGroupReply(answer, {
@@ -1652,7 +1660,7 @@ export class ChatService {
     // the social hard cap after grounding, rendering and cleanup, with the
     // deterministic reply-signature footprint already reserved.
     const finalizeGroupSocialOutput = (text: string, protectedSuffix?: string): string => {
-      if (effectiveRequest.conversationType !== 'GROUP') return text
+      if (ownerChatSurface || effectiveRequest.conversationType !== 'GROUP') return text
       // A light interaction must not go out carrying a proactive CTA tail. The
       // strip is the one deterministic restraint backstop; the social boundary
       // below stays the final hard cap.
@@ -1664,7 +1672,13 @@ export class ChatService {
       emitSocialBoundaryDiagnostic('FINAL_OUTBOUND', social)
       return social.text
     }
-    const bound = applyGroupReplyBoundary(guard.text)
+    const finalizeAnswer = (text: string, protectedSuffix?: string): string =>
+      ownerChatSurface ? text : finalizeGroupSocialOutput(text, protectedSuffix)
+    // OWNER_CHAT must not enter the GROUP-only bulk, length or social pipeline.
+    // Keep the existing boundary path intact for every other surface.
+    const bound = ownerChatSurface
+      ? unboundedFinalAnswer(guard.text)
+      : applyGroupReplyBoundary(guard.text)
     const rendered = renderHumanChat(bound.text)
     emitDiagnostic(
       (line: string) => console.log(line),
@@ -1685,7 +1699,7 @@ export class ChatService {
     // Do not send that fallback through Web Search grounding repair: repair is
     // another provider generation and must never recreate the blocked payload.
     if (bound.bulkOutput?.result === 'BLOCKED') {
-      return finalizeGroupSocialOutput(rendered)
+      return finalizeAnswer(rendered)
     }
 
     const reportSourceUsage = (usage: ReturnType<typeof inspectGroundedSources>): void => {
@@ -1718,9 +1732,9 @@ export class ChatService {
 
     if (effectiveRequest.webSearch?.status === 'FAILED') {
       if (effectiveRequest.webSearch.mode === 'NEWS_RECENT') {
-        return finalizeGroupSocialOutput('当前没有查到足够近期信息，无法可靠确认最新情况。')
+        return finalizeAnswer('当前没有查到足够近期信息，无法可靠确认最新情况。')
       }
-      return finalizeGroupSocialOutput(discloseWebSearchFailure(rendered), WEB_SEARCH_FAILURE_DISCLOSURE)
+      return finalizeAnswer(discloseWebSearchFailure(rendered), WEB_SEARCH_FAILURE_DISCLOSURE)
     }
     if (effectiveRequest.webSearch?.status === 'PASS' && effectiveRequest.webSearch.results.length > 0) {
       const initialUsage = inspectGroundedSources(rendered, effectiveRequest.webSearch.results, internalValues)
@@ -1749,7 +1763,7 @@ export class ChatService {
             },
           )
           reportGroundingGate('REPAIR', initialUsage, 'FAIL_CLOSED')
-          return finalizeGroupSocialOutput(WEB_SEARCH_GROUNDING_FAILURE_REPLY)
+          return finalizeAnswer(WEB_SEARCH_GROUNDING_FAILURE_REPLY)
         }
 
         let repairedRendered: string | undefined
@@ -1775,7 +1789,9 @@ export class ChatService {
           )
           const repairedGuard = guardFinalAnswer(repairedDraft, guardFacts)
           if (repairedGuard.outcome !== 'BLOCKED') {
-            const repairedBound = applyGroupReplyBoundary(repairedGuard.text)
+            const repairedBound = ownerChatSurface
+              ? unboundedFinalAnswer(repairedGuard.text)
+              : applyGroupReplyBoundary(repairedGuard.text)
             const candidate = renderHumanChat(repairedBound.text)
             if (repairedBound.bulkOutput?.result === 'BLOCKED') {
               bulkBlockedRepairFallback = candidate
@@ -1806,13 +1822,13 @@ export class ChatService {
         )
         reportGroundingGate('REPAIR', repairedUsage, repairPassed ? 'PASS' : 'FAIL_CLOSED')
         if (bulkBlockedRepairFallback !== undefined) {
-          return finalizeGroupSocialOutput(bulkBlockedRepairFallback)
+          return finalizeAnswer(bulkBlockedRepairFallback)
         }
         if (!repairPassed || repairedRendered === undefined) {
-          return finalizeGroupSocialOutput(WEB_SEARCH_GROUNDING_FAILURE_REPLY)
+          return finalizeAnswer(WEB_SEARCH_GROUNDING_FAILURE_REPLY)
         }
 
-        return finalizeGroupSocialOutput(
+        return finalizeAnswer(
           appendGroundedSources(
             repairedRendered,
             effectiveRequest.webSearch.results,
@@ -1822,7 +1838,7 @@ export class ChatService {
         )
       }
 
-      return finalizeGroupSocialOutput(
+      return finalizeAnswer(
         appendGroundedSources(
           rendered,
           effectiveRequest.webSearch.results,
@@ -1831,7 +1847,7 @@ export class ChatService {
         ),
       )
     }
-    return finalizeGroupSocialOutput(rendered)
+    return finalizeAnswer(rendered)
   }
 
   /**
