@@ -18,6 +18,13 @@ import {
   type DeliveryAckRejectReason,
 } from './outbound-delivery.js'
 import { PASSIVE_CONTEXT_KIND, type RawHookMessage } from './message-contract.js'
+import {
+  OWNER_CHAT_REQUEST_KIND,
+  OWNER_CHAT_RESPONSE_KIND,
+  parseOwnerChatEnvelope,
+  type OwnerChatResponse,
+  type ParsedOwnerChatEnvelope,
+} from './owner-chat-contract.js'
 import { detectOwnerAliasWake } from './owner-alias-wake.js'
 import {
   identityToken,
@@ -34,6 +41,7 @@ import {
 export interface ProductionAgentTransportOptions {
   pipeName: string
   agent: AgentExecutor
+  ownerChatHandler?: NonNullable<AgentExecutor['ownerChatHandler']>
   summaryPath?: string
   maxMessages?: number
   invalidOutboundMessageId?: string
@@ -63,6 +71,7 @@ export interface ProductionTransportSummaryEntry {
  * not know the kind rejects it instead of treating group chatter as requested.
  */
 type InboundEnvelope =
+  | ParsedOwnerChatEnvelope
   | { kind: 'INBOUND_MESSAGE'; message: RawHookMessage }
   | { kind: typeof PASSIVE_CONTEXT_KIND; message: RawHookMessage }
   | { kind: typeof PROACTIVE_OUTBOUND_POLL_KIND; pollId: string }
@@ -77,6 +86,7 @@ type AgentResponse =
   | ({ kind: 'PROACTIVE_OUTBOUND_COMMAND' } & OutboundCommand)
   | { kind: 'DELIVERY_ACK_ACCEPTED'; reason: 'SENT_COMMITTED' | 'FAILED_DISCARDED' }
   | { kind: 'DELIVERY_ACK_REJECTED'; reason: DeliveryAckRejectReason }
+  | OwnerChatResponse
   | ({ kind: 'OUTBOUND_COMMAND' } & OutboundCommand)
 
 /**
@@ -265,6 +275,11 @@ export class ProductionAgentTransportServer {
       return
     }
 
+    if (envelope.kind === OWNER_CHAT_REQUEST_KIND) {
+      await this.processOwnerChat(socket, envelope)
+      return
+    }
+
     if (envelope.kind === OUTBOUND_DELIVERY_ACK_KIND) {
       await this.processDeliveryAck(socket, envelope.payload)
       return
@@ -350,6 +365,46 @@ export class ProductionAgentTransportServer {
       socket.end()
       await this.stop()
     }
+  }
+
+  private async processOwnerChat(socket: Socket, envelope: ParsedOwnerChatEnvelope): Promise<void> {
+    let response: OwnerChatResponse
+    if ('errorCode' in envelope) {
+      response = {
+        kind: OWNER_CHAT_RESPONSE_KIND,
+        requestId: envelope.requestId,
+        status: 'ERROR',
+        errorCode: envelope.errorCode,
+      }
+    } else if (!this.options.ownerChatHandler) {
+      response = {
+        kind: OWNER_CHAT_RESPONSE_KIND,
+        requestId: envelope.requestId,
+        status: 'ERROR',
+        errorCode: 'UNAVAILABLE',
+      }
+    } else {
+      try {
+        const text = await this.options.ownerChatHandler.handle(envelope.request)
+        if (typeof text !== 'string' || text.trim().length === 0) {
+          throw new Error('Owner Chat returned an empty answer')
+        }
+        response = {
+          kind: OWNER_CHAT_RESPONSE_KIND,
+          requestId: envelope.requestId,
+          status: 'OK',
+          text,
+        }
+      } catch {
+        response = {
+          kind: OWNER_CHAT_RESPONSE_KIND,
+          requestId: envelope.requestId,
+          status: 'ERROR',
+          errorCode: 'PROVIDER_ERROR',
+        }
+      }
+    }
+    await this.writeResponse(socket, response, this.messageIdToken(envelope.requestId || 'invalid-owner-chat-request'))
   }
 
   private async processDeliveryAck(socket: Socket, ack: OutboundDeliveryAck): Promise<void> {
@@ -545,6 +600,9 @@ function parseInboundEnvelope(value: unknown): InboundEnvelope {
     throw new Error('Inbound kind is invalid')
   }
   const kind = value.kind
+  if (kind === OWNER_CHAT_REQUEST_KIND) {
+    return parseOwnerChatEnvelope(value)
+  }
   if (kind === PROACTIVE_OUTBOUND_POLL_KIND) {
     if (typeof value.pollId !== 'string' || value.pollId.trim().length === 0 || value.pollId.length > 128) {
       throw new Error('Proactive poll id is invalid')

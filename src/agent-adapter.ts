@@ -17,6 +17,7 @@ import {
 import { sha256Utf8, type OutboundDeliveryAck, type OutboundIdentity, type DeliveryAckResult } from './outbound-delivery.js'
 import type { OwnerAliasClass } from './owner-alias-wake.js'
 import type { ProactiveOutboundIntent } from './proactive-group-queue.js'
+import type { OwnerChatHandlerLike } from './owner-chat-contract.js'
 
 /** Runtime-decided mention fact; the Agent must never re-derive it from text. */
 export type MentionState = 'MENTIONED' | 'NOT_MENTIONED' | 'UNKNOWN'
@@ -122,6 +123,8 @@ export interface OwnerAliasWakeContext extends AgentPassiveContext {
 
 export interface AgentExecutor {
   complete(request: AgentRequest): Promise<string | null | undefined>
+  /** Dedicated local UI path; it must not return or stage a WeChat outbound. */
+  ownerChatHandler?: OwnerChatHandlerLike
 
   /** Drain one already-authorized proactive command without entering any chat path. */
   pollProactiveOutbound?(): OutboundCommand | null

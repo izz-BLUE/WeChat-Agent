@@ -19,6 +19,9 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test:owner-chat": "npm run build && node dist/owner-chat.test.js",
+    "pretest": "npm run test:owner-chat",
+    "pretest:contract": "npm run test:owner-chat",
     "test:contract": "npm run build && node dist/message-contract.test.js",
     "test:reasoning": "npm run build && node dist/reasoning-boundary.test.js",
     "test:identity-observe": "npm run build && node dist/identity-observer.test.js",

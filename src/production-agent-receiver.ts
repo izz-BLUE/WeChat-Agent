@@ -7,6 +7,7 @@ import {
   type ChatWebSearchContext,
   type MemoryPromptItem,
 } from './chat.js'
+import { OwnerChatHandler } from './owner-chat-handler.js'
 import {
   AdaptiveSearchRecoveryGate,
   isAdaptiveSearchCandidate,
@@ -417,6 +418,8 @@ interface WebSearchResolution {
 }
 
 export class ProductionChatAgent implements AgentExecutor {
+  public readonly ownerChatHandler: OwnerChatHandler
+
   private readonly context: GroupContext
   private readonly ambient: GroupAmbientContext
   private readonly requesterLocal: RequesterLocalContext
@@ -458,6 +461,7 @@ export class ProductionChatAgent implements AgentExecutor {
     private readonly chatService: ChatService,
     options: ProductionChatAgentOptions = {},
   ) {
+    this.ownerChatHandler = new OwnerChatHandler(this.chatService, config.botDisplayName)
     this.speakerLabels = options.speakerLabels ?? new SpeakerLabelRegistry()
     this.memory = options.memory ?? null
     this.persistentLog = options.persistentLog ?? null
@@ -2496,6 +2500,7 @@ export async function runProductionReceiver(options: ProductionReceiverOptions):
   const transport = new ProductionAgentTransportServer({
     pipeName: options.pipeName,
     agent,
+    ownerChatHandler: agent.ownerChatHandler,
     summaryPath: options.summaryPath,
     maxMessages: options.maxMessages,
     invalidOutboundMessageId: options.invalidOutboundMessageId,
